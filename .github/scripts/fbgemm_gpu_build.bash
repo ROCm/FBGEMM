@@ -92,7 +92,6 @@ __configure_fbgemm_gpu_build_rocm () {
   echo "[BUILD] Setting ROCm build args ..."
   build_args=(
     --package_variant=rocm
-    -DTORCH_USE_HIP_DSA=1
   )
 }
 
@@ -446,7 +445,7 @@ build_fbgemm_gpu_develop () {
   echo "[BUILD] Building (develop) FBGEMM-GPU (VARIANT=${fbgemm_variant}) ..."
   # shellcheck disable=SC2086
   print_exec conda run --no-capture-output ${env_prefix} \
-    python setup.py build develop "${build_args[@]}"
+    python setup.py build develop "${build_args[@]}" 
 
   # Run checks on the built libraries
   (run_fbgemm_gpu_postbuild_checks "${fbgemm_variant}") || return 1
