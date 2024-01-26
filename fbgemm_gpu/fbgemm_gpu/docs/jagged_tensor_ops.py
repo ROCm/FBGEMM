@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [fbgemm-gpu.autogen.docs.examples.docstring.start]
 import torch
 
 from .common import add_docs
+
 
 add_docs(
     torch.ops.fbgemm.jagged_2d_to_dense,
@@ -38,6 +40,7 @@ Example:
 
 """,
 )
+# [fbgemm-gpu.autogen.docs.examples.docstring.end]
 
 add_docs(
     torch.ops.fbgemm.jagged_1d_to_dense,

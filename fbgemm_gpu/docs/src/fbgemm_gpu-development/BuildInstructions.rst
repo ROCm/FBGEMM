@@ -109,7 +109,8 @@ Install the full CUDA package through Conda, which includes
 
 .. code:: sh
 
-  cuda_version=11.7.1
+  # See https://anaconda.org/nvidia/cuda for all available versions of CUDA
+  cuda_version=12.1.0
 
   # Install the full CUDA package
   conda install -n "${env_name}" -y cuda -c "nvidia/label/cuda-${cuda_version}"
@@ -119,6 +120,7 @@ Verify that ``cuda_runtime.h`` and ``libnvidia-ml.so`` are found:
 .. code:: sh
 
   conda_prefix=$(conda run -n "${env_name}" printenv CONDA_PREFIX)
+
   find "${conda_prefix}" -name cuda_runtime.h
   find "${conda_prefix}" -name libnvidia-ml.so
 
@@ -133,7 +135,7 @@ cuDNN package for the given CUDA version:
 
   # cuDNN package URLs for each platform and CUDA version can be found in:
   # https://github.com/pytorch/builder/blob/main/common/install_cuda.sh
-  cudnn_url=https://developer.download.nvidia.com/compute/redist/cudnn/v8.7.0/local_installers/11.8/cudnn-linux-x86_64-8.7.0.84_cuda11-archive.tar.xz
+  cudnn_url=https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-8.9.2.26_cuda12-archive.tar.xz
 
   # Download and unpack cuDNN
   wget -q "${cudnn_url}" -O cudnn.tar.xz
@@ -186,10 +188,10 @@ guide <https://rocm.docs.amd.com/en/latest/>`__:
   apt update
 
   # Download the installer
-  wget https://repo.radeon.com/amdgpu-install/5.6.1/ubuntu/focal/amdgpu-install_5.4.50403-1_all.deb
+  wget -q https://repo.radeon.com/amdgpu-install/5.6.1/ubuntu/focal/amdgpu-install_5.6.50601-1_all.deb -O amdgpu-install.deb
 
   # Run the installer
-  apt install ./amdgpu-install_5.4.50403-1_all.deb
+  apt install ./amdgpu-install.deb
 
   # Install ROCm
   amdgpu-install -y --usecase=hiplibsdk,rocm --no-dkms
@@ -356,7 +358,7 @@ Clone the repo along with its submodules, and install the
   # !! Run inside the Conda environment !!
 
   # Select a version tag
-  FBGEMM_VERSION=v0.4.0
+  FBGEMM_VERSION=v0.6.0
 
   # Clone the repo along with its submodules
   git clone --recursive -b ${FBGEMM_VERSION} https://github.com/pytorch/FBGEMM.git fbgemm_${FBGEMM_VERSION}
@@ -380,6 +382,55 @@ build cache:
 
   python setup.py clean
 
+Set Wheel Build Variables
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When building out the Python wheel, the package name, Python version tag, and
+Python platform name must first be properly set:
+
+.. code:: sh
+
+  # Set the package name depending on the build variant
+  export package_name=fbgemm_gpu_{cpu, cuda, rocm}
+
+  # Set the Python version tag.  It should follow the convention `py<major><minor>`,
+  # e.g. Python 3.12 -> py312
+  export python_tag=py312
+
+  # Determine the processor architecture
+  export ARCH=$(uname -m)
+
+  # Set the Python platform name for the Linux case
+  export python_plat_name="manylinux2014_${ARCH}"
+  # For the macOS (x86_64) case
+  export python_plat_name="macosx_10_9_${ARCH}"
+  # For the macOS (arm64) case
+  export python_plat_name="macosx_11_0_${ARCH}"
+  # For the Windows case
+  export python_plat_name="win_${ARCH}"
+
+.. _fbgemm-gpu.build.process.cpu:
+
+CPU-Only Build
+~~~~~~~~~~~~~~
+
+For CPU-only builds, the ``--cpu_only`` flag needs to be specified.
+
+.. code:: sh
+
+  # !! Run in fbgemm_gpu/ directory inside the Conda environment !!
+
+  # Build the wheel artifact only
+  python setup.py bdist_wheel \
+      --package_variant=cpu \
+      --package_name="${package_name}" \
+      --python-tag="${python_tag}" \
+      --plat-name="${python_plat_name}"
+
+  # Build and install the library into the Conda environment
+  python setup.py install \
+      --package_variant=cpu
+
 .. _fbgemm-gpu.build.process.cuda:
 
 CUDA Build
@@ -392,9 +443,6 @@ CUDA device, however, is not required for building the package.
 .. code:: sh
 
   # !! Run in fbgemm_gpu/ directory inside the Conda environment !!
-
-  # Determine the processor architecture
-  export ARCH=$(uname -m)
 
   # [OPTIONAL] Specify the CUDA installation paths
   # This may be required if CMake is unable to find nvcc
@@ -411,10 +459,6 @@ CUDA device, however, is not required for building the package.
   # Specify NVML path
   export NVML_LIB_PATH=/path/to/libnvidia-ml.so
 
-  # Update to reflect the version of Python in the Conda environment
-  python_tag=py310
-  package_name=fbgemm_gpu
-
   # Build for SM70/80 (V100/A100 GPU); update as needed
   # If not specified, only the CUDA architecture supported by current system will be targeted
   # If not specified and no CUDA device is present either, all CUDA architectures will be targeted
@@ -426,10 +470,10 @@ CUDA device, however, is not required for building the package.
 
   # Build the wheel artifact only
   python setup.py bdist_wheel \
-      --package_name="${package_name}" \
       --package_variant=cuda \
+      --package_name="${package_name}" \
       --python-tag="${python_tag}" \
-      --plat-name="manylinux1_${ARCH}" \
+      --plat-name="${python_plat_name}" \
       --nvml_lib_path=${NVML_LIB_PATH} \
       -DTORCH_CUDA_ARCH_LIST="${cuda_arch_list}"
 
@@ -452,22 +496,18 @@ the package.
 
   # !! Run in fbgemm_gpu/ directory inside the Conda environment !!
 
-  export ARCH=$(uname -m)
   export ROCM_PATH=/path/to/rocm
 
   # Build for the target architecture of the ROCm device installed on the machine (e.g. 'gfx906;gfx908;gfx90a')
   # See https://wiki.gentoo.org/wiki/ROCm for list
   export PYTORCH_ROCM_ARCH=$(${ROCM_PATH}/bin/rocminfo | grep -o -m 1 'gfx.*')
 
-  python_tag=py310
-  package_name=fbgemm_gpu_rocm
-
   # Build the wheel artifact only
   python setup.py bdist_wheel \
-      --package_name="${package_name}" \
       --package_variant=rocm \
+      --package_name="${package_name}" \
       --python-tag="${python_tag}" \
-      --plat-name="manylinux1_${ARCH}" \
+      --plat-name="${python_plat_name}" \
       -DHIP_ROOT_DIR="${ROCM_PATH}" \
       -DCMAKE_C_FLAGS="-DTORCH_USE_HIP_DSA" \
       -DCMAKE_CXX_FLAGS="-DTORCH_USE_HIP_DSA"
@@ -478,32 +518,6 @@ the package.
       -DHIP_ROOT_DIR="${ROCM_PATH}" \
       -DCMAKE_C_FLAGS="-DTORCH_USE_HIP_DSA" \
       -DCMAKE_CXX_FLAGS="-DTORCH_USE_HIP_DSA"
-
-.. _fbgemm-gpu.build.process.cpu:
-
-CPU-Only Build
-~~~~~~~~~~~~~~
-
-For CPU-only builds, the ``--cpu_only`` flag needs to be specified.
-
-.. code:: sh
-
-  # !! Run in fbgemm_gpu/ directory inside the Conda environment !!
-
-  export ARCH=$(uname -m)
-
-  python_tag=py310
-  package_name=fbgemm_gpu_cpu
-
-  # Build the wheel artifact only
-  python setup.py bdist_wheel \
-      --package_name="${package_name}" \
-      --package_variant=cpu \
-      --python-tag="${python_tag}" \
-      --plat-name="manylinux1_${ARCH}"
-
-  # Build and install the library into the Conda environment
-  python setup.py install --package_variant=cpu
 
 Post-Build Checks (For Developers)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -182,14 +182,14 @@ set(GPU_ONLY_OPTIMIZERS
   partial_rowwise_adam
   partial_rowwise_lamb
   lars_sgd
-  rowwise_adagrad_with_weight_decay
-  approx_rowwise_adagrad_with_weight_decay
   none)
 
 set(DEPRECATED_OPTIMIZERS
   approx_sgd
   approx_rowwise_adagrad
-  approx_rowwise_adagrad_with_counter)
+  approx_rowwise_adagrad_with_counter
+  approx_rowwise_adagrad_with_weight_decay
+  rowwise_adagrad_with_weight_decay)
 
 set(ALL_OPTIMIZERS
   ${COMMON_OPTIMIZERS}
@@ -228,7 +228,8 @@ set(gen_gpu_kernel_source_files
     "gen_batch_index_select_dim0_backward_codegen_cuda.cu"
     "gen_batch_index_select_dim0_backward_kernel_cta.cu"
     "gen_batch_index_select_dim0_backward_kernel_warp.cu"
-    "gen_embedding_backward_split_grad.cu"
+    "gen_embedding_backward_split_grad_embedding_ops.cu"
+    "gen_embedding_backward_split_grad_index_select.cu"
 )
 
 if(NOT USE_ROCM)
@@ -500,6 +501,7 @@ endif()
 
 set(fbgemm_sources_normal
   "${FBGEMM}/src/EmbeddingSpMDM.cc"
+  "${FBGEMM}/src/EmbeddingSpMDMAutovec.cc"
   "${FBGEMM}/src/EmbeddingSpMDMNBit.cc"
   "${FBGEMM}/src/QuantUtils.cc"
   "${FBGEMM}/src/RefImplementations.cc"
