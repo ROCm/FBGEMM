@@ -34,6 +34,17 @@ setup_miniconda () {
     echo "################################################################################"
     echo ""
   fi
+  echo "==============old path"
+  echo $PATH
+  new_path="$PATH:/opt/rocm/llvm/bin:\
+/opt/rocm/opencl/bin:\
+/opt/rocm/hip/bin:\
+/opt/rocm/hcc/bin:\
+/opt/rocm/bin
+"
+  echo "==============new path"
+  echo $new_path
+  print_exec conda env config vars set ${env_prefix} PATH="$new_path" || return 1
 
   test_network_connection || return 1
 
