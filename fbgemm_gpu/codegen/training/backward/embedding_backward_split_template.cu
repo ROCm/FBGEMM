@@ -771,7 +771,7 @@ Tensor split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}_e
                         {{ hip_kernel }}                        \
                             <emb_t,                             \
                              grad_t,                            \
-                             float, /* FIXME: fp16 cache_t */   \
+                             cache_t,                           \
                              kFixedMaxVecsPerThread,            \
                              kThreadGroupSize,                  \
                              kUseVecBlocking,                   \
@@ -789,7 +789,7 @@ Tensor split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}_e
                             {%- if not dense %}
                             MAKE_PTA_WITH_NAME(func_name4, dev_weights, emb_t, 1, 64),                                          \
                             MAKE_PTA_WITH_NAME(func_name4, uvm_weights, emb_t, 1, 64),                                          \
-                            MAKE_PTA_WITH_NAME(func_name4, lxu_cache_weights, float, 2, 64),  /* FIXME: fp16 cache_t */         \
+                            MAKE_PTA_WITH_NAME(func_name4, lxu_cache_weights, cache_t, 2, 64),                                  \
                             MAKE_PTA_WITH_NAME(func_name4, weights_placements, int32_t, 1, 32),                                 \
                             {%- else %}
                             MAKE_PTA_WITH_NAME(func_name4, dev_weights, emb_t, 1, 64),                                          \
