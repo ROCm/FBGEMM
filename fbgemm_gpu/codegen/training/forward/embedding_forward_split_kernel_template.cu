@@ -616,3 +616,270 @@ batch_index_select_dim0_codegen_forward_kernel
 ////////////////////////////////////////////////////////////////////////////////
 #endif
 ////////////////////////////////////////////////////////////////////////////////
+
+{%- if is_rocm and not is_index_select and not dense and not nobag and not vbe%}
+// PR23: ROCM
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include "fbgemm_gpu/hip_kernel_inc/split_embeddings_common.h"
+#include "hip_gen_embedding_forward_split_{{ wdesc }}_kernel.hip"
+// #include "gen_embedding_forward_split_{{ kdesc }}_device_kernel_hip.hip"
+
+template <
+    typename emb_t,
+    typename cache_t,
+    typename output_t,
+    {%- if not dense %}
+    bool use_lxu_cache,
+    {%- endif %}
+    typename index_t,
+    {%- if not nobag %}
+    size_t kMaxVecsPerThread,
+    {%- endif %}
+    size_t kThreadGroupSize,
+    size_t embedding_dim >
+__launch_bounds__(kForwardMaxThreads) __global__ void
+{%- if is_index_select %}
+hip_batch_index_select_dim0_codegen_forward_kernel(
+{%- else %}
+hip{{ ddesc }}_embedding{{ ndesc }}_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel(
+{%- endif %}
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    const pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %} // if nobag
+    {%- if vbe %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> row_output_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> b_t_map,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- else %}
+    FixedDivisor fd_B,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> indices,
+    {%- if not is_index_select %}
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    int64_t pooling_mode,
+    {%- endif %}
+    {%- if weighted %}
+    pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> indice_weights,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations,
+    /*
+      NOTE: We pass in `lxu_cache_conflict_misses =
+      uvm_cache_stats[uvm_cache_stats_index::num_conflict_unique_misses]` as a
+      run-time argument here instead of passing the cache miss rate as a
+      compile-time argument, because `lxu_cache_conflict_misses` is only
+      available on the GPU, and invoking a templatized kernel with the cache
+      miss rate as a template argument requires this information to first be
+      passed back to the host, which is an expensive operation.
+    */
+    const int32_t* lxu_cache_conflict_misses,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> output_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> total_L_offsets,
+    const int32_t fixed_L_per_warp,
+    const bool permute_output_dim_0_1,
+    {%- endif %}
+    // If 2D, shape is [B][total_D]
+    pta::PackedTensorAccessor64<output_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> output
+    ) {
+            {%- if not nobag %}
+            int32_t T = D_offsets.size(0) - 1;
+            {%- else %}
+            int32_t T = weights_offsets.size(0);
+            {%- endif %}
+            auto batch = output.size(0);
+            auto num_rows = dev_weights.size(0) / T / embedding_dim;
+            // printf("batch:%d, num_rows:%d, T:%d\n", batch, num_rows, T);
+            struct {
+                void            *output;
+                void         *emb_table;
+                const int64_t  *indices;
+                const int64_t  *offsets;
+                const int32_t* D_offsets;
+                const int64_t* weights_offsets;
+                int64_t    pooling_mode;
+                void   *indice_weights;
+                uint32_t          batch;
+                uint32_t       num_rows;
+                uint32_t     num_tables;
+            } args;
+            size_t arg_size = sizeof(args);
+            args.output = output.data();
+            args.emb_table = dev_weights.data();
+            args.indices = indices.data();
+            args.offsets = offsets.data();
+            // FIXME: properly account for else statement (D instead of D_offsets)
+            {%- if not nobag or is_index_select %}
+            args.D_offsets = D_offsets.data();
+            {%- endif %}
+            args.weights_offsets = weights_offsets.data();
+            args.pooling_mode = pooling_mode;
+            {%- if weighted %}
+            args.indice_weights = indice_weights.data();
+            {%- else %}
+            args.indice_weights = nullptr;
+            {%- endif %}
+            args.batch = (uint32_t) batch;
+            args.num_rows = num_rows;
+            args.num_tables = (uint32_t) T;
+            split_tbe_fwd_hip_kernel<emb_t, cache_t, output_t, index_t, 
+                                    embedding_dim, 2, 16, {{ "true" if weighted else "false" }}>
+                                    ((output_t *)args.output, (const emb_t *)args.emb_table, args.indices, args.offsets, args.D_offsets, args.weights_offsets, args.pooling_mode,
+                                    args.batch, args.num_rows, args.num_tables, (cache_t *)args.indice_weights);
+    }
+////////////////////////////////////////////////////////////////////////////////
+// Explicit Template Instantiations
+////////////////////////////////////////////////////////////////////////////////
+
+/*
+    Explicitly instantiate the kernel function template.  The instantiations are
+    based on the types enumerated by DISPATCH_EMB_CACHE_TYPES macro used in
+    embedding_forward_split_template.cu
+*/
+
+{%- macro hip_template_instantiation(emb_type, cache_type, output_type, use_cache, kMaxVecsPerThread, kThreadGroupSize, kEmbeddingDim) %}
+template __launch_bounds__(kForwardMaxThreads) __global__ void
+hip{{ ddesc }}_embedding{{ ndesc }}_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel
+<
+    {{ emb_type }},
+    {{ cache_type }},
+    {{ output_type }},
+    {%- if not dense %}
+    {{ use_cache }},
+    {%- endif %}
+    int64_t,
+    {%- if not nobag %}
+    {{ kMaxVecsPerThread }},
+    {%- endif %}
+    {{ kThreadGroupSize }},
+    {{ kEmbeddingDim }}
+> (
+    const pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    const pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> uvm_weights,
+    const pta::PackedTensorAccessor64<{{ cache_type }}, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %}
+    {%- if vbe %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> output_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> b_t_map,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- else %}
+    FixedDivisor fd_B,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> indices,
+    {%- if not is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    int64_t pooling_mode,
+    {%- endif %}
+    {%- if weighted %}
+    pta::PackedTensorAccessor32<at::acc_type<{{ cache_type }}, true>, 1, at::RestrictPtrTraits> indice_weights,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations,
+    const int32_t* lxu_cache_conflict_misses,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> output_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> total_L_offsets,
+    const int32_t fixed_L_per_warp,
+    const bool permute_output_dim_0_1,
+    {%- endif %}
+    pta::PackedTensorAccessor64<{{ output_type }}, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> output);
+{%- endmacro %}
+
+{%- macro hip_bulk_template_instantiations(use_cache, kMaxVecsPerThread, kThreadGroupSize) %}
+    {%- for emb_type in ['float', 'at::Half'] %}
+    {%- for cache_type in ['float', 'at::Half'] %}
+    {%- for output_type in ['float', 'at::Half', 'at::BFloat16'] %}
+    {%- for kEmbeddingDim in [128, 160, 256] %}
+        {{ hip_template_instantiation(emb_type, cache_type, output_type, use_cache, kMaxVecsPerThread, kThreadGroupSize, kEmbeddingDim) }}
+    {%- endfor %}
+    {%- endfor %}
+    {%- endfor %}
+    {%- endfor %}
+{%- endmacro %}
+
+{%- macro instantiate_templates(use_subwarp_shuffle) %}
+{%- set has_experimental =
+      has_experimental_support(dense, nobag, vbe, is_index_select, is_rocm)
+%}
+{%- set max_forward_embedding_dim =
+      legacy_max_embedding_dim if has_experimental else max_embedding_dim
+%}
+{%- for use_cache in (["true", "false"] if not dense else ["NULL"]) %}
+{%- for (kMaxVecsPerThread, kThreadGroupSize, use_blocking)
+    in get_max_vecs_template_configs(
+        items_per_warp,
+        fixed_max_vecs_per_thread=max_forward_embedding_dim // items_per_warp,
+        use_subwarp_shuffle=use_subwarp_shuffle,
+        use_vec_blocking=False,
+    )
+%}
+    {#-/* nobag does not have kMaxVecsPerThread as a template arg */#}
+    {%- if not nobag or kMaxVecsPerThread <= 1 %}
+        {{
+           hip_bulk_template_instantiations(
+               use_cache,
+               kMaxVecsPerThread,
+               kThreadGroupSize
+           )
+        }}
+    {%- endif %}
+{%- endfor %}
+{%- endfor %}
+{%- endmacro %}
+
+////////////////////////////////////////////////////////////////////////////////
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+////////////////////////////////////////////////////////////////////////////////
+
+{#- /*
+    Explicitly instantiate kernels for the FBGEMM_USE_SUBWARP_SHUFFLE case
+
+    Please see get_max_vecs_template_configs in
+    codegen/embedding_common_code_generator.py for more details
+*/ #}
+
+{{ instantiate_templates(use_subwarp_shuffle=True) }}
+
+////////////////////////////////////////////////////////////////////////////////
+#else
+////////////////////////////////////////////////////////////////////////////////
+
+{#- /*
+    Explicitly instantiate kernels for the non-FBGEMM_USE_SUBWARP_SHUFFLE case
+
+    Please see get_max_vecs_template_configs in
+    codegen/embedding_common_code_generator.py for more details
+*/ #}
+
+{{ instantiate_templates(use_subwarp_shuffle=False) }}
+
+////////////////////////////////////////////////////////////////////////////////
+#endif
+////////////////////////////////////////////////////////////////////////////////
+{%- endif %}

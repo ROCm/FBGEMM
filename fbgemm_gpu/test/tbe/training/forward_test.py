@@ -90,6 +90,21 @@ class ForwardTest(unittest.TestCase):
         use_experimental_tbe: bool,
     ) -> None:
         # NOTE: cache is not applicable to CPU version.
+        print(not use_cpu or not use_cache)
+        print(not use_cpu or T * B * L * D <= 2048)
+        print(not (use_cpu and weights_precision == SparseType.FP16))
+        print(pooling_mode == PoolingMode.SUM or not weighted)
+        print(not use_cpu or pooling_mode != PoolingMode.NONE)
+        print(not mixed or pooling_mode != PoolingMode.NONE)
+        print(
+            not mixed_B
+            or (
+                weights_precision != SparseType.INT8
+                and output_dtype != SparseType.INT8
+                and not use_cpu
+                and pooling_mode != PoolingMode.NONE
+            )
+        )
         assume(not use_cpu or not use_cache)
         # NOTE: limit (T * B * L * D) to avoid timeout for CPU version!
         assume(not use_cpu or T * B * L * D <= 2048)
@@ -886,6 +901,71 @@ class ForwardTest(unittest.TestCase):
             torch.testing.assert_close(
                 cat_deq_lowp_pooled_output, cat_dq_fp32_pooled_output
             )
+
+    @unittest.skipIf(*gpu_unavailable)
+    @given(
+        T=st.sampled_from([1, 2, 3]),
+        # D*4 later in SplitTableBatchedEmbeddingsTest
+        # Both weighted & unweighted for all Ds:
+        # D=st.integers(min_value=1, max_value=(1024//4)),
+        D=st.sampled_from([32, 40, 64]),
+        B=st.integers(min_value=1, max_value=128),
+        log_E=st.integers(min_value=3, max_value=5),
+        L=st.integers(min_value=0, max_value=32),
+        weights_precision=st.sampled_from([SparseType.FP16, SparseType.FP32]),
+        # mixed=st.booleans(),
+        mixed=st.just(False),
+        use_cache=st.just(False),
+        use_cpu=st.just(False),
+        cache_algorithm=st.sampled_from(CacheAlgorithm),
+        output_dtype=st.just(SparseType.FP32),
+        # pooling_mode=st.sampled_from([PoolingMode.SUM, PoolingMode.MEAN]),
+        pooling_mode=st.sampled_from([PoolingMode.SUM, PoolingMode.MEAN]),
+        weighted=st.booleans(),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=MAX_EXAMPLES_LONG_RUNNING,
+        deadline=None,
+        suppress_health_check=[
+            HealthCheck.filter_too_much,
+            HealthCheck.data_too_large,
+        ],
+    )
+    def test_new_forward_kernel(
+        self,
+        cache_algorithm: CacheAlgorithm,
+        weights_precision: SparseType,
+        use_cpu: bool,
+        T: int,
+        D: int,
+        B: int,
+        L: int,
+        log_E: int,
+        use_cache: bool,
+        pooling_mode: PoolingMode,
+        output_dtype: SparseType,
+        mixed: bool,
+        weighted: bool,
+    ) -> None:
+        mixed_B = False
+        self.execute_forward_(
+            T,
+            D,
+            B,
+            log_E,
+            L,
+            weights_precision,
+            weighted,
+            mixed,
+            mixed_B,
+            use_cache,
+            cache_algorithm,
+            pooling_mode,
+            use_cpu,
+            output_dtype,
+            False,  # use_experimental_tbe
+        )
 
 
 if __name__ == "__main__":

@@ -115,6 +115,74 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
 #endif
 {% endif %} {#-/* if not dense */#}
 
+{%- if is_rocm and not nobag and not vbe and not is_index_select and not dense %}
+{%- for nobag in [True, False] %}
+{%- set ndesc = "_nobag" if nobag else "" %}
+{%- if is_valid_forward_config(nobag, weighted, vbe, is_index_select) %}
+{%- set has_experimental = has_experimental_support(dense, nobag, vbe, is_index_select, is_rocm) %}
+template <
+    typename emb_t,
+    typename cache_t,
+    typename output_t,
+    {%- if not dense %}
+    bool use_lxu_cache,
+    {%- endif %}
+    typename index_t,
+    {%- if not nobag %}
+    size_t kMaxVecsPerThread,
+    {%- endif %}
+    size_t kThreadGroupSize = kWarpSize,
+    size_t embedding_dim = 128
+    >
+__launch_bounds__(kForwardMaxThreads) __global__ void
+hip{{ ddesc }}_embedding{{ ndesc }}_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel(
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    const pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %}
+    {%- if vbe %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> row_output_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> b_t_map,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- else %}
+    FixedDivisor fd_B,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> indices,
+    {%- if not is_index_select %}
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    int64_t pooling_mode,
+    {%- endif %}
+    {%- if weighted %}
+    pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> indice_weights,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations,
+    const int32_t* lxu_cache_conflict_misses,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> output_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> total_L_offsets,
+    const int32_t fixed_L_per_warp,
+    const bool permute_output_dim_0_1,
+    {%- endif %} // if dense
+    pta::PackedTensorAccessor64<output_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> output
+    );
+
+{%- endif %} {#-/* if is_valid_forward_config(...) */#}
+{%- endfor %} {#-/* for nobag in [True, False] */#}
+{%- endif %}
+
 
 {%- for nobag in [True, False] %}
 {%- set ndesc = "_nobag" if nobag else "" %}
@@ -658,6 +726,130 @@ batch_index_select_dim0_codegen_forward_cuda(
             // kFixedMaxVecsPerThread instead of kMaxVecsPerThread. But
             // kMaxVecsPerThread and kFixedMaxVecsPerThread are the same
             // forward
+            {%-if is_rocm and not nobag and not dense and not vbe and not is_index_select %}
+            // weight param cnt
+            int64_t wcnts = dev_weights.numel();
+            // execution guards
+            bool guard_ex = (wcnts > 0);
+
+            // all Ts on device
+            std::vector<int32_t> wplas(weights_placements.data_ptr<int32_t>(), weights_placements.data_ptr<int32_t>() + weights_placements.numel());
+            bool all_devs = std::accumulate(wplas.begin(), wplas.end(), 0) == 0;
+            // no duplicate in weight offsets (which is the case exact optim used sometimes)
+            std::vector<int64_t> woffs(weights_offsets.data_ptr<int64_t>(), weights_offsets.data_ptr<int64_t>() + weights_offsets.numel());
+            std::vector<int64_t>::iterator it = std::unique(woffs.begin(), woffs.end());
+            // not support duplicated weights table yet
+            bool no_dupt = (it == woffs.end());
+
+            if (guard_ex)  guard_ex = all_devs && no_dupt;
+
+            // if (guard_ex && (dev_weights.scalar_type() == at::ScalarType::Half || dev_weights.scalar_type() == at::ScalarType::Float)) {
+                constexpr uint32_t workgroup_size = 256;
+                constexpr uint32_t wave_size = 64;
+
+                uint32_t bags_per_workgroup = workgroup_size / wave_size;
+                uint32_t grids[3] = {(B + bags_per_workgroup - 1) / bags_per_workgroup, (uint32_t)T, 1};
+                uint32_t blocks[3] = {workgroup_size, 1, 1};
+                int64_t E = wcnts / T / max_D;
+
+            std::string prec = dev_weights.scalar_type() == at::ScalarType::Half  ? "fp16" : "fp32";
+
+                
+                    struct {
+                        void            *output;
+                        void         *emb_table;
+                        const int64_t  *indices;
+                        const int64_t  *offsets;
+                        const int32_t* D_offsets;
+                        const int64_t* weights_offsets;
+                        int64_t    pooling_mode;
+                        cache_t   *indice_weights;
+                        uint32_t          batch;
+                        uint32_t       num_rows;
+                        uint32_t     num_tables;
+                    } args;
+                    size_t arg_size = sizeof(args);
+                    // args.output = output.packed_accessor32<float, 2, at::RestrictPtrTraits>().data();
+                    // if (dev_weights.scalar_type() == at::ScalarType::Half)
+                    //     args.emb_table = dev_weights.packed_accessor64<at::Half, 1, at::RestrictPtrTraits>().data();
+                    // else
+                    //     args.emb_table = dev_weights.packed_accessor64<float, 1, at::RestrictPtrTraits>().data();
+                    // args.indices = indices.packed_accessor32<int64_t, 1, at::RestrictPtrTraits>().data();
+                    // args.offsets = offsets.packed_accessor32<int64_t, 1, at::RestrictPtrTraits>().data();
+                    // args.D_offsets = D_offsets.packed_accessor32<int32_t, 1, at::RestrictPtrTraits>().data();
+                    // args.weights_offsets = weights_offsets.packed_accessor32<int64_t, 1, at::RestrictPtrTraits>().data();
+                    // args.pooling_mode = pooling_mode;
+                    {%- if weighted %}
+                    // args.indice_weights = indice_weights.packed_accessor32<cache_t, 1, at::RestrictPtrTraits>().data();
+                    {%- else %}
+                    // args.indice_weights = nullptr;
+                    {%- endif %}
+                    args.batch = (uint32_t) B;
+                    args.num_rows = E;
+                    args.num_tables = (uint32_t) T;
+                    {%- set hip_kernel = "hip{{ ddesc }}_embedding{{ ndesc }}_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel".format(
+                            ddesc,
+                            ndesc,
+                            wdesc,
+                            vdesc,
+                            )
+                    %}
+
+                    {% for kDimSize in [128, 160, 256] %}
+                    if (max_D == {{ kDimSize }}) {
+                            std::cout << "Calling forward perf kernel: " << E << std::endl;
+                            hip{{ ddesc }}_embedding{{ ndesc }}_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel
+                            <emb_t,
+                            cache_t,
+                            output_t,
+                            {%- if not dense %}
+                            use_cache_t,
+                            {%- endif %}
+                            int64_t,
+                            kFixedMaxVecsPerThread,
+                            kThreadGroupSize,
+                            {{ kDimSize }}>
+                            <<<dim3(grids[0], grids[1], grids[2]), dim3(blocks[0], blocks[1], blocks[2]),
+                              0, at::cuda::getCurrentCUDAStream()>>>(
+                            MAKE_PTA_WITH_NAME(func_name, dev_weights, emb_t, 1, 64),
+                            {%- if not dense %}
+                            MAKE_PTA_WITH_NAME(func_name, uvm_weights, emb_t, 1, 64),
+                            MAKE_PTA_WITH_NAME(func_name, lxu_cache_weights, cache_t, 2, 64),
+                            MAKE_PTA_WITH_NAME(func_name, weights_placements, int32_t, 1, 32),
+                            {%- endif %}
+                            MAKE_PTA_WITH_NAME(func_name, weights_offsets, int64_t, 1, 32),
+                            MAKE_PTA_WITH_NAME(func_name, D_offsets, int32_t, 1, 32),
+                            {%- if vbe %}
+                            MAKE_PTA_WITH_NAME(func_name, vbe_row_output_offsets, int64_t, 1, 32),
+                            MAKE_PTA_WITH_NAME(func_name, vbe_b_t_map, int32_t, 1, 32),
+                            info_B_num_bits,
+                            info_B_mask,
+                            {%- else %}
+                            FixedDivisor(B),
+                            {%- endif %}
+                            MAKE_PTA_WITH_NAME(func_name, indices, int64_t, 1, 32),
+                            MAKE_PTA_WITH_NAME(func_name, offsets, int64_t, 1, 32),
+                            pooling_mode,
+                            {%- if weighted %}
+                            MAKE_PTA_ACC_WITH_NAME(func_name, indice_weights, cache_t, 1, 32),
+                            {%- endif %}
+                            {%- if not dense %}
+                            MAKE_PTA_WITH_NAME(func_name, lxu_cache_locations, int32_t, 1, 32),
+                            uvm_cache_stats.size(0) == 0
+                                ? nullptr
+                                : (uvm_cache_stats.data_ptr<int32_t>() + uvm_cache_stats_index::num_conflict_unique_misses),
+                            {%- endif %} // if not dense
+                            MAKE_PTA_WITH_NAME(func_name, output, output_t, 2, 64)
+                          );
+                          C10_CUDA_KERNEL_LAUNCH_CHECK();
+                      }
+                    {% endfor %}
+                    return;
+                    
+                    
+                // }
+            // }
+            {%-else %}
             constexpr auto kMaxVecsPerThread = kFixedMaxVecsPerThread;
             {{ ddesc }}_embedding_codegen_forward_{{ wdesc }}{{ vdesc }}_kernel
                 <emb_t,
@@ -709,6 +901,7 @@ batch_index_select_dim0_codegen_forward_cuda(
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             {%- if vbe %}
             output = output.reshape({-1});
+            {%- endif %}
             {%- endif %}
             return;
           });
@@ -829,4 +1022,4 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
 {%- endif %} {#-/* if not is_index_select */#}
 {%- endif %} {#-/* if is_valid_forward_config(...) */#}
 {%- endfor %} {#-/* for nobag */#}
-    // clang-format on
+// clang-format on

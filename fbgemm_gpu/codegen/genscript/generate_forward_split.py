@@ -126,6 +126,14 @@ class ForwardSplitGenerator:
             vbe_options=[False],  # vbe is not supported
         )
 
+        ForwardSplitGenerator.render_forward_templates(
+            "training/forward/rocm/embedding_forward_split_device_kernel_template.hip",
+            "hip_gen_embedding_forward_{}_kernel.hip",
+            dense_options=[False],  # dense is not supported
+            nobag_options=[False],  # nobag is not supported
+            vbe_options=[False],  # vbe is not supported
+        )
+
     @staticmethod
     def generate() -> None:
         ForwardSplitGenerator.generate_kernels()
