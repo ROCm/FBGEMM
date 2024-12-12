@@ -129,4 +129,15 @@ C10_HOST_DEVICE C10_ALWAYS_INLINE int32_t padded_row_size_in_bytes(
   return static_cast<int32_t>(round_up(r, row_alignment));
 }
 
+// TODO: Rename argument
+template<int32_t kWarpSize, int32_t kBitWidth>
+inline int32_t packed_bags_per_D(int32_t max_padded_row_size_in_bytes)
+{
+  constexpr int32_t kOutputsPerThread = 32 / kBitWidth;
+  int32_t packed_bags = kWarpSize * kOutputsPerThread / max_padded_row_size_in_bytes;
+  packed_bags = (packed_bags == 0) ? 1 : packed_bags; 
+
+  return packed_bags; 
+}
+
 } // namespace nbit

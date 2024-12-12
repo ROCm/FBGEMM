@@ -44,6 +44,7 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
   const int exponent_bits,
   const int exponent_bias,
   {% endif %}
+  const int32_t num_packed_bags,
   pta::PackedTensorAccessor32<output_t, 2, at::RestrictPtrTraits> output, // [B][total_D],
   const pta::PackedTensorAccessor64<uint8_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
   const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations
@@ -94,14 +95,15 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
   int32_t indices_starts[OutputRowsPerThread];
   int32_t Ls[OutputRowsPerThread];
   int32_t max_Ls = 0;
-  constexpr uint32_t kPackedBags = 8;
-  // int32_t Ls_offsets[OutputRowsPerThread];
   const uint32_t uint4_loads_per_row = div_round_up(D_bytes, sizeof(uint4));
+  constexpr size_t kOutputsPerThread = {{ (32 // emb_weight_type.bit_width) }};
 
-  const uint32_t packed_bag_idx = threadIdx.x / kPackedBags;
+  // const uint32_t kPackedBags = std::clamp((kWarpSize * kOutputsPerThread) / D_total, 1, );
+  // const uint32_t kPackedBags = 8;
+  const uint32_t packed_bag_idx = num_packed_bags > 0 ? threadIdx.x / num_packed_bags : 0;
 
   for (uint32_t i = 0; i < OutputRowsPerThread; ++i) {
-    uint32_t b = min(static_cast<uint32_t>(bb * OutputRowsPerThread * kPackedBags + packed_bag_idx * OutputRowsPerThread + i), static_cast<uint32_t>(B - 1));
+    uint32_t b = min(static_cast<uint32_t>(bb * OutputRowsPerThread * num_packed_bags + packed_bag_idx * OutputRowsPerThread + i), static_cast<uint32_t>(B - 1));
     int32_t indices_start = offsets[t * B + b];
     int32_t indices_end = offsets[t * B + b + 1];
     indices_starts[i] = indices_start;
@@ -118,7 +120,6 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
   } else {
       weights = &uvm_weights[weights_offset];
   }
-  constexpr size_t kOutputsPerThread = {{ (32 // emb_weight_type.bit_width) }};
 
   constexpr uint32_t NumUint4LoadsPerRow = MaxNum128BRows * 128 / sizeof(uint4);
 
@@ -137,7 +138,7 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
     __shared__ AllIndiceWeights buffers_indice_weights;
     {% endif %}
 
-    for (uint32_t load_idx = threadIdx.x; load_idx < input_rows_in_flight * NumUint4LoadsPerRow * kPackedBags; load_idx += kWarpSize) {
+    for (uint32_t load_idx = threadIdx.x; load_idx < input_rows_in_flight * NumUint4LoadsPerRow * num_packed_bags; load_idx += kWarpSize) {
       uint32_t row_load_idx = load_idx % NumUint4LoadsPerRow;
       uint32_t input_row_idx = (load_idx / NumUint4LoadsPerRow);
       bool load_idx_valid = row_load_idx < uint4_loads_per_row;
@@ -319,7 +320,7 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
   {% if not nobag %}
   #pragma unroll OutputRowsPerThread
   for (uint32_t i = 0; i < OutputRowsPerThread; ++i) {
-    const uint32_t b = min(static_cast<uint32_t>(bb * OutputRowsPerThread * kPackedBags + threadIdx.x / kPackedBags * OutputRowsPerThread + i), static_cast<uint32_t>(B - 1));
+    const uint32_t b = min(static_cast<uint32_t>(bb * OutputRowsPerThread * num_packed_bags + packed_bag_idx * OutputRowsPerThread + i), static_cast<uint32_t>(B - 1));
     const float inv_L = (mean_pooling && Ls[i] != 0) ? static_cast<float>(1.0) / Ls[i]: static_cast<float>(1.0);
 
     if constexpr (std::is_same_v<output_t, float> || std::is_same_v<output_t, at::Half> || std::is_same_v<output_t, at::BFloat16>) {
@@ -419,6 +420,7 @@ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if nobag else ""
   const int exponent_bits,
   const int exponent_bias,
   {% endif %}
+  const int32_t num_packed_bags,
   pta::PackedTensorAccessor32<{{ output_type }}, 2, at::RestrictPtrTraits> output, // [B][total_D],
   const pta::PackedTensorAccessor64<uint8_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
   const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations
