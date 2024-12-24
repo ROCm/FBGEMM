@@ -1330,6 +1330,10 @@ def nbit_device(  # noqa C901
     def _kineto_trace_handler(p: profile, phase: str) -> None:
         p.export_chrome_trace(
             trace_url.format(tbe_type=tbe_type, phase=phase, ospid=os.getpid())
+        #print(p.key_averages())
+        # averges the sum of all kernels
+        total_cuda_time = sum(event.device_time*event.count/(iters+1) for event in p.key_averages() if event.cpu_time == 0.0)
+        print(f"Total CUDA time: {total_cuda_time:.3f} ")
         )
 
     # pyre-ignore[3]
