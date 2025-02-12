@@ -330,18 +330,36 @@ class BackwardDenseTest(unittest.TestCase):
         )
         y.sum().backward()
         indice_weight_grad_mask = per_sample_weights.grad.clone().cpu()
+        # if gpu_available and not TEST_WITH_ROCM:
+        torch.cuda.synchronize()
+        acc_B = 0
         for t in range(T_):
             B = Bs[t]
+            table_indice_weight_grad_mask = indice_weight_grad_mask[acc_B : acc_B + B * L]
+            table_indice_weight_grad_all = indice_weight_grad_all[acc_B : acc_B + B * L]
+            acc_B += B * L
             if feature_requires_grad[t]:
                 torch.testing.assert_close(
-                    indice_weight_grad_mask.view(T_, B, L)[t],
-                    indice_weight_grad_all.view(T_, B, L)[t],
+                    table_indice_weight_grad_mask,
+                    table_indice_weight_grad_all,
                 )
             else:
                 torch.testing.assert_close(
-                    indice_weight_grad_mask.view(T_, B, L)[t],
-                    torch.zeros_like(indice_weight_grad_mask.view(T_, B, L)[t]),
+                    table_indice_weight_grad_mask,
+                    torch.zeros_like(table_indice_weight_grad_mask),
                 )
+            # if feature_requires_grad[t]:
+            #     print(indice_weight_grad_mask.shape)
+            #     print(indice_weight_grad_all.shape)
+            #     torch.testing.assert_close(
+            #         table_indice_weight_grad_mask.view(T_, B, L)[t],
+            #         table_indice_weight_grad_all.view(T_, B, L)[t],
+            #     )
+            # else:
+            #     torch.testing.assert_close(
+            #         table_indice_weight_grad_mask.view(T_, B, L)[t],
+            #         torch.zeros_like(indice_weight_grad_mask.view(T_, B, L)[t]),
+            #     )
 
         per_sample_weights = to_device(xw.contiguous().view(-1), use_cpu)
         cc = cc.float()
