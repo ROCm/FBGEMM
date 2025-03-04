@@ -768,7 +768,13 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     if (is_zero_total_L) {
       const uint32_t D_start = D_offsets[t] / VEC_WIDTH;
       const uint32_t load_D = (D_offsets[t + 1] / VEC_WIDTH) - D_start;
+      const auto placement = static_cast<PlacementType>(weights_placements[t]);
+      const auto is_cache = placement == PlacementType::MANAGED_CACHING;
+      {%- if is_rocm and not is_cache %}
+      const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, (kWarpSize/2));
+      {%- else %}
       const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, kWarpSize);
+      {% endif %}
       if (table_warp_id >= num_warps_per_row * B) {
         return;
       }
@@ -809,13 +815,16 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
       load_D = (D_offsets[t + 1] / VEC_WIDTH) - D_start;
     }
     load_D = shfl_sync(load_D, 0);
-
+    const auto placement = static_cast<PlacementType>(weights_placements[t]);
+    const auto is_cache = placement == PlacementType::MANAGED_CACHING;
+    {%- if is_rocm and not is_cache %}
+    const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, (kWarpSize/2));
+    {%- else %}
     const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, kWarpSize);
-
+    {% endif %}
     if (table_warp_id >= num_warps_per_row * (is_small_L ? num_warps_for_small_L : B)) {
       return;
     }
-
     // Compute d (same for all Ls)
     const uint32_t load_d = (table_warp_id % num_warps_per_row) * kWarpSize;
     // Compute sample ID
@@ -855,7 +864,7 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
         smem[params_offset + SAVED_PARAMS::P_load_D] = load_D;
         smem[params_offset + SAVED_PARAMS::P_total_load_D] = total_load_D;
         if (USE_LXU_CACHE) {
-          if (placement == PlacementType::MANAGED_CACHING) {
+          if ( placement == PlacementType::MANAGED_CACHING) {
             *reinterpret_cast<const cache_t**>(&smem[params_offset + LXU_CACHE_PARAMS::P_lxu_cache_weights]) =
               lxu_cache_weights + (load_d * VEC_WIDTH);
             *reinterpret_cast<const int32_t**>(&smem[params_offset + LXU_CACHE_PARAMS::P_lxu_cache_locations]) =
