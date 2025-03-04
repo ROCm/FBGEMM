@@ -122,6 +122,7 @@ def cli() -> None:
 @click.option("--batch-size", default=512)
 @click.option("--embedding-dim", default=128)
 @click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--cache-precision", type=SparseType, default=None)
 @click.option("--stoc", is_flag=True, default=False)
 @click.option("--iters", default=100)
 @click.option("--warmup-runs", default=0)
@@ -162,6 +163,7 @@ def cli() -> None:
     "--ssd-prefix", type=str, default="/tmp/ssd_benchmark", help="SSD directory prefix"
 )
 @click.option("--cache-load-factor", default=0.2)
+@click.option("--use_experimental_tbe", default=True)
 @click.option(
     "--num-requests",
     default=-1,
@@ -174,6 +176,7 @@ def device(  # noqa C901
     batch_size: int,
     embedding_dim: int,
     weights_precision: SparseType,
+    cache_precision: Optional[SparseType],
     stoc: bool,
     iters: int,
     warmup_runs: int,
@@ -199,6 +202,7 @@ def device(  # noqa C901
     ssd: bool,
     ssd_prefix: str,
     cache_load_factor: float,
+    use_experimental_tbe: bool,
     num_requests: int,
 ) -> None:
     assert not ssd or not dense, "--ssd cannot be used together with --dense"
@@ -317,9 +321,12 @@ def device(  # noqa C901
                 )
                 for d in Ds
             ],
-            cache_precision=weights_precision,
+            cache_precision=(
+                weights_precision if cache_precision is None else cache_precision
+            ),
             cache_algorithm=CacheAlgorithm.LRU,
             cache_load_factor=cache_load_factor,
+            use_experimental_tbe=use_experimental_tbe,
             **common_split_args,
         )
     emb = emb.to(get_device())
@@ -461,6 +468,7 @@ def device(  # noqa C901
 @click.option("--enforce-hbm", is_flag=True, default=False)
 @click.option("--no-conflict-misses", is_flag=True, default=False)
 @click.option("--all-conflict-misses", is_flag=True, default=False)
+@click.option("--use_experimental_tbe", default=True)
 @click.option(
     "--uvm-host-mapped",
     is_flag=True,
@@ -496,6 +504,7 @@ def uvm(
     # Simulate a UVM cache with a cache conflict miss rate of 100%
     all_conflict_misses: bool,
     uvm_host_mapped: bool,
+    use_experimental_tbe: bool,
 ) -> None:
     np.random.seed(42)
     torch.manual_seed(42)
@@ -544,6 +553,7 @@ def uvm(
         cache_algorithm=cache_alg,
         enforce_hbm=enforce_hbm,
         uvm_host_mapped=uvm_host_mapped,
+        use_experimental_tbe=use_experimental_tbe
     ).cuda()
 
     if weights_precision == SparseType.INT8:
@@ -562,6 +572,7 @@ def uvm(
             ],
             weights_precision=weights_precision,
             stochastic_rounding=stoc,
+            use_experimental_tbe=use_experimental_tbe,
         ).cuda()
 
         if weights_precision == SparseType.INT8:
@@ -587,6 +598,7 @@ def uvm(
             cache_algorithm=cache_alg,
             enforce_hbm=enforce_hbm,
             uvm_host_mapped=uvm_host_mapped,
+            use_experimental_tbe=use_experimental_tbe,
         ).cuda()
 
         if weights_precision == SparseType.INT8:
@@ -800,6 +812,7 @@ def uvm(
     default=False,
     help="Use host mapped UVM buffers in SSD-TBE (malloc+cudaHostRegister)",
 )
+@click.option("--use_experimental_tbe", default=True)
 def cache(  # noqa C901
     alpha: float,
     bag_size: int,
@@ -821,6 +834,7 @@ def cache(  # noqa C901
     requests_data_file: Optional[str],
     tables: Optional[str],
     uvm_host_mapped: bool,
+    use_experimental_tbe: bool,
 ) -> None:
     np.random.seed(42)
     torch.manual_seed(42)
@@ -854,6 +868,7 @@ def cache(  # noqa C901
         weights_precision=weights_precision,
         stochastic_rounding=stoc,
         uvm_host_mapped=uvm_host_mapped,
+        use_experimental_tbe=use_experimental_tbe,
     ).cuda()
 
     if weights_precision == SparseType.INT8:
@@ -875,6 +890,7 @@ def cache(  # noqa C901
         cache_load_factor=cache_load_factor,
         cache_algorithm=cache_alg,
         uvm_host_mapped=uvm_host_mapped,
+        use_experimental_tbe=use_experimental_tbe,
     ).cuda()
 
     if weights_precision == SparseType.INT8:
@@ -3299,6 +3315,7 @@ def emb_inplace_update(  # noqa C901
 @click.option("--bounds-check-mode", type=int, default=BoundsCheckMode.NONE.value)
 @click.option("--flush-gpu-cache-size-mb", default=0)
 @click.option("--output-dtype", type=SparseType, default=SparseType.FP32)
+@click.option("--use_experimental_tbe", default=True)
 def device_with_spec(  # noqa C901
     alpha: float,
     bag_size_list: str,
@@ -3318,6 +3335,7 @@ def device_with_spec(  # noqa C901
     bounds_check_mode: int,
     flush_gpu_cache_size_mb: int,
     output_dtype: SparseType,
+    use_experimental_tbe: bool,
 ) -> None:
     np.random.seed(42)
     torch.manual_seed(42)
@@ -3398,6 +3416,7 @@ def device_with_spec(  # noqa C901
         output_dtype=output_dtype,
         pooling_mode=pooling_mode,
         bounds_check_mode=BoundsCheckMode(bounds_check_mode),
+        use_experimental_tbe=use_experimental_tbe,
     )
     emb = emb.to(get_device())
 
@@ -3549,6 +3568,8 @@ def _to_offsets(lengths: torch.Tensor) -> torch.Tensor:
 @click.option("--num-tables", default=20)
 @click.option("--compressed-tables", default=10)
 @click.option("--iters", default=100)
+
+@click.option("--use_experimental_tbe", default=True)
 def benchmark_tbe_input_compression(
     batch_size: int,
     compressed_batch_size: int,
@@ -3558,6 +3579,7 @@ def benchmark_tbe_input_compression(
     num_tables: int,
     compressed_tables: int,
     iters: int,
+    use_experimental_tbe: bool,
 ) -> None:
     # TODO: Add warmup_runs
     torch.manual_seed(42)
@@ -3595,6 +3617,7 @@ def benchmark_tbe_input_compression(
         output_dtype=SparseType.FP32,
         pooling_mode=pooling_mode,
         bounds_check_mode=BoundsCheckMode(BoundsCheckMode.NONE.value),
+        use_experimental_tbe=use_experimental_tbe,
     ).to(get_device())
 
     compressed_batch_sizes = ([cB] * cT) + ([B] * (T - cT))
