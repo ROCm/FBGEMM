@@ -10,7 +10,6 @@
 # pyre-ignore-all-errors[56]
 
 import logging
-import uuid
 from itertools import accumulate
 from typing import List, Optional, Tuple, Union
 
@@ -18,7 +17,6 @@ import fbgemm_gpu  # noqa: F401
 import torch  # usort:skip
 from torch import nn, Tensor  # usort:skip
 
-from fbgemm_gpu.config import FeatureGateName
 from fbgemm_gpu.split_embedding_configs import sparse_type_to_int, SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -57,7 +55,12 @@ except Exception:
 
 import fbgemm_gpu  # noqa
 
-
+def find_max_ls(ty: SparseType, weights_tys:List[SparseType], offsets: Tensor )-> int:
+    bag_sizes = offsets[1:] - offsets[:-1]
+    for type_ in weights_tys:
+        if type_ == ty or type_.value == ty.value:
+            return bag_sizes.max().item()
+    return  0
 def rounded_row_size_in_bytes(
     dim: int,
     weight_ty: SparseType,
@@ -371,10 +374,6 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         indices_dtype: torch.dtype = torch.int32,  # Used for construction of the remap_indices tensors.  Should match the dtype of the indices passed in the forward() call (INT32 or INT64).
     ) -> None:  # noqa C901  # tuple of (rows, dims,)
         super(IntNBitTableBatchedEmbeddingBagsCodegen, self).__init__()
-        self.uuid = str(uuid.uuid4())
-        self.log(
-            f"Feature Gates: {[(feature.name, feature.is_enabled()) for feature in FeatureGateName]}"
-        )
 
         # 64 for AMD
         if cache_assoc == 32 and torch.version.hip is not None:
@@ -475,6 +474,8 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 ],
                 default=0,
             )
+        
+
 
         self.max_int2_D: int = max_ty_D(SparseType.INT2)
         self.max_int4_D: int = max_ty_D(SparseType.INT4)
@@ -482,7 +483,6 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         self.max_float8_D: int = max_ty_D(SparseType.FP8)
         self.max_float16_D: int = max_ty_D(SparseType.FP16)
         self.max_float32_D: int = max_ty_D(SparseType.FP32)
-
         self.register_buffer(
             "D_offsets",
             torch.tensor(D_offsets, device=self.current_device, dtype=torch.int32),
@@ -630,20 +630,6 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             self.fp8_exponent_bits = -1
             self.fp8_exponent_bias = -1
 
-    @torch.jit.ignore
-    def log(self, msg: str) -> None:
-        """
-        Log with TBE id prefix to distinguish between multiple TBE instances
-        per process
-
-        Args:
-            msg (str): The message to print
-
-        Returns:
-            None
-        """
-        logging.info(f"[TBE={self.uuid}] {msg}")
-
     def get_cache_miss_counter(self) -> Tensor:
         # cache_miss_counter[0]: cache_miss_forward_count which records the total number of forwards which has at least one cache miss
         # cache_miss_counter[1]: unique_cache_miss_count which records to total number of unique (dedup) cache misses
@@ -692,17 +678,17 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         assert (
             self.record_cache_metrics.record_cache_miss_counter
         ), "record_cache_miss_counter should be true to access counter values"
-        self.log(
+        logging.info(
             f"\n"
             f"Miss counter value [0] - # of miss occured iters : {self.cache_miss_counter[0]}, \n"
             f"Miss counter value [1] - # of unique misses : {self.cache_miss_counter[1]}, \n"
             f"Miss counter value [2] - # of unique requested indices : {self.cache_miss_counter[2]}, \n"
             f"Miss counter value [3] - # of total requested indices : {self.cache_miss_counter[3]}, "
         )
-        self.log(
+        logging.info(
             f"unique_miss_rate using counter : {self.cache_miss_counter[1] / self.cache_miss_counter[2]}, \n"
         )
-        self.log(
+        logging.info(
             f"total_miss_rate using counter : {self.cache_miss_counter[1] / self.cache_miss_counter[3]}, \n"
         )
 
@@ -717,7 +703,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             self.gather_uvm_cache_stats
         ), "gather_uvm_cache_stats should be set to true to access uvm cache stats."
         uvm_cache_stats = self.uvm_cache_stats.tolist()
-        self.log(
+        logging.info(
             f"N_called: {uvm_cache_stats[0]}\n"
             f"N_requested_indices: {uvm_cache_stats[1]}\n"
             f"N_unique_indices: {uvm_cache_stats[2]}\n"
@@ -726,7 +712,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             f"N_conflict_misses: {uvm_cache_stats[5]}\n"
         )
         if uvm_cache_stats[1]:
-            self.log(
+            logging.info(
                 f"unique indices / requested indices: {uvm_cache_stats[2] / uvm_cache_stats[1]}\n"
                 f"unique misses / requested indices: {uvm_cache_stats[3] / uvm_cache_stats[1]}\n"
             )
@@ -952,6 +938,19 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         indices, offsets, per_sample_weights = inputs_to_device(
             indices, offsets, per_sample_weights, self.bounds_check_warning.device
         )
+        weights_tys: List[SparseType] = [e[3] for e in self.embedding_specs]
+       
+        INT2_max_ls = find_max_ls(SparseType.INT2, weights_tys, offsets)
+        INT4_max_ls = find_max_ls(SparseType.INT4, weights_tys, offsets)
+        INT8_max_ls = find_max_ls(SparseType.INT8, weights_tys, offsets)
+        FP8_max_ls = find_max_ls(SparseType.FP8, weights_tys, offsets)
+        FP16_max_ls = find_max_ls(SparseType.FP16, weights_tys, offsets)
+        FP32_max_ls = find_max_ls(SparseType.FP32, weights_tys, offsets)
+
+   
+
+   
+
 
         # First bound check: check if the indices/offsets are within the boundary
         # of the original embedding rows before pruning.
@@ -1029,6 +1028,12 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             max_int8_D=self.max_int8_D,
             max_float16_D=self.max_float16_D,
             max_float32_D=self.max_float32_D,
+            INT2_max_ls=INT2_max_ls,
+            INT4_max_ls=INT4_max_ls,
+            INT8_max_ls=INT8_max_ls,
+            FP8_max_ls = FP8_max_ls,
+            FP16_max_ls=FP16_max_ls,
+            FP32_max_ls=FP32_max_ls,
             indices=indices,
             offsets=offsets,
             pooling_mode=int(self.pooling_mode),
@@ -1039,7 +1044,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             row_alignment=self.row_alignment,
             max_float8_D=self.max_float8_D,
             fp8_exponent_bits=self.fp8_exponent_bits,
-            fp8_exponent_bias=self.fp8_exponent_bias,
+            fp8_exponent_bias=self.fp8_exponent_bias
         )
 
     def forward(
@@ -1232,7 +1237,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
             assert not self.use_cpu
             if enforce_hbm:
                 if not torch.jit.is_scripting():
-                    self.log("Enforce hbm for the cache location")
+                    logging.info("Enforce hbm for the cache location")
                 self.weights_uvm = torch.zeros(
                     uvm_size,
                     device=self.current_device,
@@ -1372,7 +1377,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegen(nn.Module):
         if cache_algorithm == CacheAlgorithm.LFU:
             assert cache_sets < 2**24 - 1
         cache_size = cache_sets * self.cache_assoc * self.max_D_cache
-        self.log(
+        logging.info(
             f"Using on-device cache with admission algorithm "
             f"{cache_algorithm}, {cache_sets} sets, "
             f"cache_load_factor: {cache_load_factor : .3f}, "
