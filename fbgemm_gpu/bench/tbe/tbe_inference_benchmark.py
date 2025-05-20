@@ -189,6 +189,7 @@ def nbit_cpu(  # noqa C901
     emb = IntNBitTableBatchedEmbeddingBagsCodegen(
         [("", E, d, weights_precision, EmbeddingLocation.HOST) for d in Ds],
         device="cpu",
+        Ls=L,
         index_remapping=[torch.arange(E) for _ in Ds] if index_remapping else None,
         output_dtype=output_dtype,
         pooling_mode=pooling_mode,
@@ -403,6 +404,7 @@ def nbit_device(  # noqa C901
     emb = IntNBitTableBatchedEmbeddingBagsCodegen(
         [("", E, d, weights_precision, managed_option) for d in Ds],
         bounds_check_mode=BoundsCheckMode(bounds_check_mode),
+        Ls=L,
         index_remapping=index_remapping,
         pruning_hash_load_factor=pruning_hash_load_factor,
         use_array_for_index_remapping=use_array_for_index_remapping,
@@ -791,6 +793,7 @@ def nbit_device_with_spec(  # noqa C901
     emb = IntNBitTableBatchedEmbeddingBagsCodegen(
         [("", e, d, weights_precision, managed_option) for d, e in zip(Ds, Es)],
         device="cpu" if use_cpu else None,
+        Ls=Ls,
         bounds_check_mode=BoundsCheckMode(bounds_check_mode),
         index_remapping=index_remapping,
         pruning_hash_load_factor=pruning_hash_load_factor,
@@ -1109,6 +1112,7 @@ def nbit_uvm(
             )
             for d in Ds[:T_uvm]
         ],
+        Ls=L,
         output_dtype=output_dtype,
         cache_load_factor=cache_load_factor,
         cache_algorithm=cache_alg,
@@ -1131,6 +1135,7 @@ def nbit_uvm(
                 )
                 for d in Ds[T_uvm:]
             ],
+            Ls=L,
             output_dtype=output_dtype,
             fp8_exponent_bits=fp8_exponent_bits,
             fp8_exponent_bias=fp8_exponent_bias,
@@ -1153,6 +1158,7 @@ def nbit_uvm(
                     [managed_type] * T_uvm + [EmbeddingLocation.DEVICE] * T_gpu,
                 )
             ],
+            Ls=L,
             output_dtype=output_dtype,
             cache_load_factor=cache_load_factor,
             cache_algorithm=cache_alg,
@@ -1454,6 +1460,7 @@ def nbit_uvm_compare_direct_mapped(
                 )
                 for d in Ds[:T]
             ],
+            Ls=L,
             output_dtype=output_dtype,
             cache_load_factor=cache_load_factor,
             cache_algorithm=cache_alg,
@@ -1635,6 +1642,7 @@ def nbit_cache(  # noqa C901
             )
             for d in Ds
         ],
+        Ls=L,
         output_dtype=output_dtype,
         enforce_hbm=enforce_hbm,
         fp8_exponent_bits=fp8_exponent_bits,
@@ -1659,6 +1667,7 @@ def nbit_cache(  # noqa C901
         record_cache_metrics=RecordCacheMetrics(
             record_cache_miss_counter, record_tablewise_cache_miss
         ),
+        Ls=L,
         gather_uvm_cache_stats=gather_uvm_cache_stats,
         cache_load_factor=cache_load_factor,
         cache_algorithm=cache_alg,
