@@ -17,8 +17,8 @@
 #include <iostream>
 #include <vector>
 
-#include "./GenerateKernel.h"
-#include "./RefImplementations.h"
+#include "./GenerateKernel.h" // @manual
+#include "./RefImplementations.h" // @manual
 #include "fbgemm/PackingTraits-inl.h"
 
 using namespace std;
@@ -33,9 +33,9 @@ template <>
 template <inst_set_t instSet>
 void CodeGenBase<int64_t, int64_t, int64_t, int64_t>::genComputeBlock(
     x86::Emitter* a,
-    x86::Gp buffer_A,
-    x86::Gp buffer_B,
-    x86::Gp B_pf,
+    const x86::Gp& buffer_A,
+    const x86::Gp& buffer_B,
+    const x86::Gp& B_pf,
     int rowRegs,
     int colRegs,
     int lda) {
@@ -79,8 +79,8 @@ void CodeGenBase<int64_t, int64_t, int64_t, int64_t>::storeCRegs(
     x86::Emitter* a,
     int rowRegs,
     int colRegs,
-    x86::Gp C_Offset,
-    x86::Gp ldcReg,
+    const x86::Gp& C_Offset,
+    const x86::Gp& ldcReg,
     bool accum) {
   using VecT = typename simd_info<instSet>::vec_reg_t;
   static constexpr int vectorLen = simd_info<instSet>::WIDTH_BITS / 64;
@@ -120,11 +120,10 @@ CodeGenBase<int64_t, int64_t, int64_t, int64_t>::getOrCreate(
     int32_t /* unused */) {
   static constexpr int vectorLen = simd_info<instSet>::WIDTH_BITS / 64;
 
-  tuple<bool, int, int, int, int, int, int> kernelSig;
-  int kBlock;
-  int nBlock;
-  int mRegBlockSize;
-  int nRegBlockSize;
+  int kBlock = 0;
+  int nBlock = 0;
+  int mRegBlockSize = 0;
+  int nRegBlockSize = 0;
 
   if (blocking_params) {
     kBlock = blocking_params->KCB;
@@ -138,7 +137,7 @@ CodeGenBase<int64_t, int64_t, int64_t, int64_t>::getOrCreate(
     nRegBlockSize = PackingTraits<int64_t, int64_t, instSet>::NR;
   }
 
-  kernelSig =
+  auto kernelSig =
       make_tuple(accum, mc, nc, nBlock, kBlock, mRegBlockSize, nRegBlockSize);
 
   return codeCache_.getOrCreate(kernelSig, [&]() -> jit_micro_kernel_fp {
@@ -159,8 +158,7 @@ CodeGenBase<int64_t, int64_t, int64_t, int64_t>::getOrCreate(
     }
 #endif
 
-    const int maxMRegs = mRegBlockSize;
-    (void)maxMRegs; // Suppress unused variable warning
+    const int maxMRegs [[maybe_unused]] = mRegBlockSize;
     const int maxNRegs = nRegBlockSize / vectorLen;
     assert(
         maxMRegs * maxNRegs <= 30 &&
@@ -180,14 +178,8 @@ CodeGenBase<int64_t, int64_t, int64_t, int64_t>::getOrCreate(
 
     asmjit::FuncDetail func;
     func.init(
-        asmjit::FuncSignatureT<
-            void,
-            int64_t*,
-            int64_t*,
-            int64_t*,
-            int64_t*,
-            int,
-            int>(asmjit::CallConvId::kHost),
+        asmjit::FuncSignature::
+            build<void, int64_t*, int64_t*, int64_t*, int64_t*, int, int>(),
         a->environment());
 
     asmjit::FuncFrame frame;
@@ -376,14 +368,14 @@ CodeGenBase<int64_t, int64_t, int64_t, int64_t>::getOrCreate(
 
     a->emitEpilog(frame);
 
-    jit_micro_kernel_fp fn;
-    asmjit::Error err;
+    jit_micro_kernel_fp fn = nullptr;
+    asmjit::Error err = 0;
     {
       unique_lock<mutex> lock(rtMutex_);
       err = runtime().add(&fn, &code);
     }
     if (err) {
-      cout << "Error: in fn add" << endl;
+      cout << "Error: in fn add" << '\n';
       return nullptr;
     }
 
@@ -439,14 +431,14 @@ void cblas_gemm_i64_i64acc(
   CodeGenType codeObj;
   CodeGenType::jit_micro_kernel_fp fn =
       codeObj.getOrCreate<inst_set_t::avx512>(true /* accum */, MCB, NCB, KCB);
-  CodeGenType::jit_micro_kernel_fp fn_noacc;
+  CodeGenType::jit_micro_kernel_fp fn_noacc = nullptr;
   if (!accumulate) {
     fn_noacc = codeObj.getOrCreate<inst_set_t::avx512>(
         false /* accum */, MCB, NCB, KCB);
   }
 
-  vector<int64_t> At, Bt;
   // TODO: handle transpose during packing
+  vector<int64_t> At;
   if (transa == matrix_op_t::Transpose) {
     At.resize(M * K);
     for (int i = 0; i < M; ++i) {
@@ -457,6 +449,7 @@ void cblas_gemm_i64_i64acc(
     A = At.data();
     lda = K;
   }
+  vector<int64_t> Bt;
   if (transb == matrix_op_t::Transpose) {
     Bt.resize(K * N);
     for (int k = 0; k < K; ++k) {

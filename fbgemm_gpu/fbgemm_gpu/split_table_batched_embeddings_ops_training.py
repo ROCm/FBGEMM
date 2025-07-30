@@ -157,6 +157,7 @@ class UserEnabledConfigDefinition:
     # This is used in Adam to perform rowwise bias correction using `row_counter`
     # More details can be found in D64848802.
     use_rowwise_bias_correction: bool = False
+    use_writeback_bwd_prehook: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,19 @@ class UVMCacheStatsIndex(enum.IntEnum):
     num_unique_misses = 3
     num_conflict_unique_misses = 4
     num_conflict_misses = 5
+
+
+@dataclass
+class RESParams:
+    res_server_port: int = 0  # the port of the res server
+    res_store_shards: int = 1  # the number of shards to store the raw embeddings
+    table_names: List[str] = field(default_factory=list)  # table names the TBE holds
+    table_offsets: List[int] = field(
+        default_factory=list
+    )  # table offsets for the global rows the TBE holds
+    table_sizes: List[int] = field(
+        default_factory=list
+    )  # table sizes for the global rows the TBE holds
 
 
 def construct_split_state(
@@ -1134,9 +1148,17 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         self.use_rowwise_bias_correction: bool = (
             extra_optimizer_config.use_rowwise_bias_correction
         )
+        self.use_writeback_bwd_prehook: bool = (
+            extra_optimizer_config.use_writeback_bwd_prehook
+        )
+        self.log(f"self.extra_optimizer_config is {extra_optimizer_config}")
         if self.use_rowwise_bias_correction and not self.optimizer == OptimType.ADAM:
             raise AssertionError(
                 "`use_rowwise_bias_correction` is only supported for OptimType.ADAM",
+            )
+        if self.use_writeback_bwd_prehook and not self.optimizer == OptimType.EXACT_SGD:
+            raise AssertionError(
+                "`use_writeback_bwd_prehook` is only supported for OptimType.EXACT_SGD",
             )
 
         self.learning_rate_tensor: torch.Tensor = torch.tensor(
@@ -1418,6 +1440,14 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         self._debug_print_input_stats: Callable[..., None] = (
             self._debug_print_input_stats_factory()
         )
+
+        if optimizer == OptimType.EXACT_SGD and self.use_writeback_bwd_prehook:
+            # Register writeback hook for Exact_SGD optimizer
+            self.log(
+                "SplitTableBatchedEmbeddingBagsCodegen:  use_writeback_bwd_prehook is enabled."
+            )
+            # pyre-fixme[6]: Expected `typing.Callable[[Module, Union[Tensor, typing.Tuple[Tensor, ...]]], Union[None, Tensor, typing.Tuple[Tensor, ...]]]`
+            self.register_full_backward_pre_hook(self.writeback_hook)
 
         if embedding_table_index_type not in [torch.int32, torch.int64]:
             raise ValueError(
@@ -1749,6 +1779,41 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         # This allows models using this class to compile correctly
         return FeatureGate.is_enabled(feature)
 
+    def writeback_update_gradient(
+        self, indices: torch.Tensor, offsets: torch.Tensor, grad: Tensor
+    ) -> Tensor:
+        if indices.numel() == 0:
+            return grad[0]
+        num_of_tables = len(set(self.feature_table_map))
+        assert num_of_tables * indices.max() < torch.iinfo(indices.dtype).max
+        batch_size = offsets.shape[0] // num_of_tables
+        max_indices = indices.max()
+        non_empty_index = (offsets[1:] - offsets[:-1]).nonzero().flatten()
+        # disable dedup across different table
+        indices = ((offsets[non_empty_index]) // batch_size) * (
+            1 + max_indices
+        ) + indices
+        grad = grad[0]
+        _, idx, counts = torch.unique(
+            indices, dim=0, sorted=True, return_inverse=True, return_counts=True
+        )
+        _, ind_sorted = torch.sort(idx, stable=True)
+        cum_sum = counts.cumsum(0)
+        cum_sum = torch.cat((torch.tensor([0]).to(indices.device), cum_sum[:-1]))
+        first_indicies = ind_sorted[cum_sum]
+        mask = torch.zeros_like(grad, device=grad.device)
+        original_index = non_empty_index[first_indicies]
+
+        mask[original_index] = grad[original_index]
+        return mask
+
+    # pyre-fixme[2]: For 1st argument expected not ANY
+    def writeback_hook(self, module: Any, grad: Tensor) -> Tuple[Tensor]:
+        indices = self._indices
+        offsets = self._offsets
+
+        return (self.writeback_update_gradient(indices, offsets, grad),)
+
     def forward(  # noqa: C901
         self,
         indices: Tensor,
@@ -1882,6 +1947,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             per_sample_weights,
             batch_size_per_feature_per_rank,
             force_cast_input_types=True,
+            prefetch_pipeline=False,
         )
 
         # Print input stats if enable (for debugging purpose only)
@@ -2413,6 +2479,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
             per_sample_weights=None,
             batch_size_per_feature_per_rank=batch_size_per_feature_per_rank,
             force_cast_input_types=False,
+            prefetch_pipeline=self.prefetch_pipeline,
         )
 
         with self._recording_to_timer(
@@ -3478,6 +3545,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         per_sample_weights: Optional[Tensor] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         force_cast_input_types: bool = True,
+        prefetch_pipeline: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor], invokers.lookup_args.VBEMetadata]:
         """
         Prepare TBE inputs as follows:
@@ -3548,9 +3616,17 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 per_sample_weights = per_sample_weights.float()
 
         if self.bounds_check_mode_int != BoundsCheckMode.NONE.value:
+            # Override the bounds check version based on prefetch_pipeline
+            use_bounds_check_v2 = self.bounds_check_version == 2 or prefetch_pipeline
+            bounds_check_version = (
+                2 if use_bounds_check_v2 else self.bounds_check_version
+            )
+
+            vbe = vbe_metadata.B_offsets is not None
+
             # Compute B info and VBE metadata for bounds_check_indices only if
             # VBE and bounds check indices v2 are used
-            if vbe and self.bounds_check_version == 2:
+            if vbe and use_bounds_check_v2:
                 B_offsets = vbe_metadata.B_offsets
                 B_offsets_rank_per_feature = vbe_metadata.B_offsets_rank_per_feature
                 output_offsets_feature_rank = vbe_metadata.output_offsets_feature_rank
@@ -3588,7 +3664,8 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 b_t_map=b_t_map,
                 info_B_num_bits=self.info_B_num_bits,
                 info_B_mask=self.info_B_mask,
-                bounds_check_version=self.bounds_check_version,
+                bounds_check_version=bounds_check_version,
+                prefetch_pipeline=prefetch_pipeline,
             )
 
         return indices, offsets, per_sample_weights, vbe_metadata

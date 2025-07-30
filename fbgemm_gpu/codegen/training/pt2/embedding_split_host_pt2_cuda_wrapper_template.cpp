@@ -26,6 +26,7 @@
 #include <torch/script.h>
 #include "fbgemm_gpu/utils/dispatch_macros.h"
 #include "fbgemm_gpu/embedding_common.h"
+#include "fbgemm_gpu/utils/torch_library.h"
 
 using Tensor = at::Tensor;
 using namespace fbgemm_gpu;
@@ -96,6 +97,7 @@ Tensor {{ fwd_mdesc }}_embedding{{ ndesc }}_codegen_forward_{{ desc_suffix }}_pt
     const Tensor& vbe_B_offsets_rank_per_feature,
     const Tensor& vbe_output_offsets_feature_rank,
     const c10::SymInt max_B,
+    const Tensor& B_offsets,
     {%- endif %}
     {%- if is_gwd %}
     const Tensor& prev_iter_dev,
@@ -249,6 +251,9 @@ Tensor {{ bwd_mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ 
     {%- endif %}
     const bool use_uniq_cache_locations,
     const bool use_homogeneous_placements,
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}    
     {%- if is_gwd %}
     {%- if "prev_iter_dev" not in args.split_function_arg_names %}
     const Tensor& prev_iter_dev,
@@ -308,6 +313,9 @@ Tensor {{ bwd_mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ 
                         {%- endif %}
                         const bool /*use_uniq_cache_locations*/,
                         const bool /*use_homogeneous_placements*/,
+                        {%- if ssd %}
+                        const bool /*enable_optimizer_offloading*/,
+                        {%- endif %}
                         {%- if is_gwd %}
                         {%- if "prev_iter_dev" not in args.split_function_arg_names %}
                         const Tensor& /*prev_iter_dev*/,
@@ -365,6 +373,9 @@ Tensor {{ bwd_mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ 
             {%- endif %}
             use_uniq_cache_locations,
             use_homogeneous_placements,
+            {%- if ssd %}
+            enable_optimizer_offloading,
+            {%- endif %}            
             {%- if is_gwd %}
             {%- if "prev_iter_dev" not in args.split_function_arg_names %}
             prev_iter_dev,
@@ -501,8 +512,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       fwd_mdesc, ndesc, desc_suffix
       )
     %}
-    {%- if ssd or is_gwd or nobag %}
-    /* Register scehema for wrappers with GPU-only support */
+    {%- if ssd or is_gwd %}
+    /* Register scehema for wrappers with GPU-only support */    
+    if (!utils::torch::schemaExists("fbgemm::{{ embedding_codegen_forward_op }}_wrapper")) {
     m.def("{{ embedding_codegen_forward_op }}_wrapper("
         "    Tensor host_weights, "
         "    Tensor dev_weights, "
@@ -539,6 +551,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
         "    Tensor vbe_B_offsets_rank_per_feature, "
         "    Tensor vbe_output_offsets_feature_rank, "
         "    SymInt max_B, "
+        "    Tensor B_offsets, "
         {%- endif %}
         {%- if is_gwd %}
         "    Tensor{{ schema_annotation['prev_iter_dev'] }} prev_iter_dev, "
@@ -556,6 +569,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
         , {PT2_COMPLIANT_TAG}
         {%- endif %}
         );
+    }
     {%- endif %}
     DISPATCH_TO_CUDA(
       "{{ embedding_codegen_forward_op }}_wrapper",
@@ -568,8 +582,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
         bwd_mdesc, ndesc, optimizer, desc_suffix
         )
     %}
-    {%- if ssd or is_gwd or nobag or not has_cpu_support %}
+    {%- if ssd or is_gwd or not has_cpu_support %}
     /* Register scehema for wrappers with GPU-only support */
+    if (!utils::torch::schemaExists("fbgemm::{{ embedding_codegen_backward_op }}_wrapper")) {
     m.def("{{ embedding_codegen_backward_op }}_wrapper("
         "    Tensor grad_output, "
         "    Tensor{{ schema_annotation['weights_host'] }} host_weights, "
@@ -614,6 +629,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
         {%- endif %}
         "    bool use_uniq_cache_locations, "
         "    bool use_homogeneous_placements,"
+        {%- if ssd %}
+        "    bool enable_optimizer_offloading,"
+        {%- endif %}        
         {%- if is_gwd %}
         {%- if "prev_iter_dev" not in args.split_function_arg_names %}
         "    Tensor{{ schema_annotation['prev_iter_dev'] }} prev_iter_dev, "
@@ -628,6 +646,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
         "    , int output_dtype=0 "
         {%- endif %}
         ") -> Tensor");
+    }
     {%- endif %}
     DISPATCH_TO_CUDA(
         "{{ embedding_codegen_backward_op }}_wrapper",

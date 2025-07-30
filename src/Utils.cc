@@ -16,7 +16,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <new>
@@ -65,10 +64,10 @@ int compare_buffers(
     for (int j = 0; j < n; ++j) {
       T reference = ref[i * ld + j], actual = test[i * ld + j];
       if (std::abs(reference - actual) > atol) {
-        std::cout << "\tmismatch at (" << i << ", " << j << ")" << std::endl;
-        if (std::is_integral<T>::value) {
+        std::cout << "\tmismatch at (" << i << ", " << j << ")" << '\n';
+        if constexpr (std::is_integral_v<T>) {
           std::cout << "\t  reference:" << static_cast<int64_t>(reference)
-                    << " test:" << static_cast<int64_t>(actual) << std::endl;
+                    << " test:" << static_cast<int64_t>(actual) << '\n';
         } else {
           std::cout << "\t  reference:" << reference << " test:" << actual
                     << std::endl;
@@ -82,40 +81,6 @@ int compare_buffers(
     }
   }
   return 0;
-}
-
-/**
- * @brief Print the matrix.
- * @param op Transpose type of the matrix.
- * @param R The height of the matrix.
- * @param C The width of the matrix.
- * @param ld The leading dimension of the matrix.
- * @param name The prefix string before printing the matrix.
- */
-template <typename T>
-void printMatrix(
-    matrix_op_t op,
-    const T* inp,
-    size_t R,
-    size_t C,
-    size_t ld,
-    std::string name) {
-  // R: number of rows in op(inp)
-  // C: number of cols in op(inp)
-  // ld: leading dimension in inp
-  std::cout << name << ":" << "[" << R << ", " << C << "]" << std::endl;
-  bool tr = (op == matrix_op_t::Transpose);
-  for (size_t r = 0; r < R; ++r) {
-    for (size_t c = 0; c < C; ++c) {
-      T res = tr ? inp[c * ld + r] : inp[r * ld + c];
-      if (std::is_integral<T>::value) {
-        std::cout << std::setw(5) << static_cast<int64_t>(res) << " ";
-      } else {
-        std::cout << std::setw(5) << res << " ";
-      }
-    }
-    std::cout << std::endl;
-  }
 }
 
 template int compare_buffers<float>(
@@ -153,35 +118,6 @@ template int compare_buffers<int64_t>(
     int ld,
     size_t max_mismatches_to_report,
     float atol);
-
-template void printMatrix<float>(
-    matrix_op_t op,
-    const float* inp,
-    size_t R,
-    size_t C,
-    size_t ld,
-    std::string name);
-template void printMatrix<int8_t>(
-    matrix_op_t op,
-    const int8_t* inp,
-    size_t R,
-    size_t C,
-    size_t ld,
-    std::string name);
-template void printMatrix<uint8_t>(
-    matrix_op_t op,
-    const uint8_t* inp,
-    size_t R,
-    size_t C,
-    size_t ld,
-    std::string name);
-template void printMatrix<int32_t>(
-    matrix_op_t op,
-    const int32_t* inp,
-    size_t R,
-    size_t C,
-    size_t ld,
-    std::string name);
 
 namespace {
 inst_set_t g_forced_isa = inst_set_t::anyarch;
@@ -365,11 +301,8 @@ bool isYmm(inst_set_t isa) {
 
 bool fbgemmIsIntelXeonD() {
   auto const pkgInfo = cpuinfo_get_packages();
-  if (strstr(pkgInfo->name, "Intel Xeon D-") ||
-      cpuinfo_get_packages_count() == 1) {
-    return true;
-  }
-  return false;
+  return strstr(pkgInfo->name, "Intel Xeon D-") ||
+      cpuinfo_get_packages_count() == 1;
 }
 
 bool fbgemmHasAvx512Support() {
@@ -423,10 +356,11 @@ void fbgemmPartition1DBlocked(
     int64_t& start,
     int64_t& end) {
   if (block_size == 1) {
-    return fbgemmPartition1D(thread_id, num_threads, total_work, start, end);
+    fbgemmPartition1D(thread_id, num_threads, total_work, start, end);
+    return;
   }
   int64_t total_work_in_blocks = total_work / block_size;
-  int64_t start_block, end_block;
+  int64_t start_block = 0, end_block = 0;
   fbgemmPartition1D(
       thread_id, num_threads, total_work_in_blocks, start_block, end_block);
   start = std::min(start_block * block_size, total_work);
@@ -440,7 +374,7 @@ void* fbgemmAlignedAlloc(
     size_t size,
     bool raiseException /*=false*/) {
   void* aligned_mem = nullptr;
-  int ret;
+  int ret = 0;
 #ifdef _MSC_VER
   aligned_mem = _aligned_malloc(size, align);
   ret = 0;
@@ -448,7 +382,7 @@ void* fbgemmAlignedAlloc(
   ret = posix_memalign(&aligned_mem, align, size);
 #endif
   // Throw std::bad_alloc in the case of memory allocation failure.
-  if (raiseException || ret || aligned_mem == nullptr) {
+  if (raiseException && (ret || aligned_mem == nullptr)) {
     throw std::bad_alloc();
   }
   return aligned_mem;
@@ -478,7 +412,7 @@ int fbgemmGet2DPartition(
   // for large thread numbers, we would like to reduce the aspect_ratio ---
   // if the matrix is short-and-fat
   // this allows us to assign more parallelism to i-dimension
-  if (nthreads > 16 && m / n < 0.2) {
+  if (nthreads > 16 && static_cast<double>(m) / n < 0.2) {
     aspect_ratio = 0.2;
   }
 
@@ -629,7 +563,7 @@ void update_prefsum_and_offset_in_range(
 
 void combine_prefix_sum(
     const int nthreads,
-    const int64_t elements_count,
+    const int64_t elements_count [[maybe_unused]],
     const int64_t* const histogram,
     int64_t* const histogram_ps) {
   int64_t offset = 0;
@@ -638,13 +572,11 @@ void combine_prefix_sum(
   // TODO(DamianSzwichtenberg): Is assert sufficient? In most cases, it will
   // work only in debug build.
   assert(offset == elements_count);
-  // Suppress unused variable warning
-  (void)elements_count;
 }
 
 void combine_prefix_sum_for_msb(
     const int nthreads,
-    const int64_t elements_count,
+    const int64_t elements_count [[maybe_unused]],
     const int64_t* const histogram,
     int64_t* const histogram_ps) {
   int64_t offset = 0;
@@ -655,8 +587,6 @@ void combine_prefix_sum_for_msb(
   // TODO(DamianSzwichtenberg): Is assert sufficient? In most cases, it will
   // work only in debug build.
   assert(offset == elements_count);
-  // Suppress unused variable warning
-  (void)elements_count;
 }
 
 template <typename K, typename V>
@@ -783,8 +713,8 @@ std::pair<K*, V*> radix_sort_parallel(
   int num_bits = sizeof(K) * 8;
   if (!maybe_with_neg_vals)
     // __builtin_clz is not portable, std::countl_zero is available in C++20
-    num_bits -= count_leading_zeros(
-        static_cast<typename std::make_unsigned<K>::type>(max_value));
+    num_bits -=
+        count_leading_zeros(static_cast<std::make_unsigned_t<K>>(max_value));
 
   const unsigned int num_passes = (num_bits + 7) / 8;
 
@@ -890,6 +820,18 @@ bool is_asmjit_disabled() {
   }
   called_once = true;
   char* env_val = std::getenv("FBGEMM_NO_ASMJIT");
+  res = (env_val != nullptr);
+  return res;
+}
+
+bool is_stats_enabled() {
+  static bool res;
+  static bool called_once = false;
+  if (called_once) {
+    return res;
+  }
+  called_once = true;
+  char* env_val = std::getenv("FBGEMM_STATS_ENABLE");
   res = (env_val != nullptr);
   return res;
 }

@@ -10,10 +10,11 @@
 #pragma once
 
 #include <fbgemm/FbgemmPackMatrixB.h>
-#include <fbgemm/SimdUtils.h>
 #include <fbgemm/Types.h>
 #include <fbgemm/Utils.h>
 #include <array>
+#include <cmath>
+#include <memory>
 
 #if defined(FBGEMM_FP16_FALLBACK_TO_REF_KERNEL) || \
     defined(FBGEMM_FP32_FALLBACK_TO_REF_KERNEL)
@@ -114,7 +115,7 @@ FBGEMM_API void cblas_gemm_compute(
 // autotuned kernel splits for various cases m = 1:mb_max
 template <typename T>
 void cblas_gemm_compute(
-    const matrix_op_t transa,
+    const matrix_op_t transa [[maybe_unused]],
     const int m,
     const float* A,
     const PackedGemmMatrixB<T>& Bp,
@@ -129,7 +130,6 @@ void cblas_gemm_compute(
   assert(cpuinfo_has_x86_f16c());
 #endif
   assert(transa == matrix_op_t::NoTranspose);
-  (void)transa; // Suppress unused variable warning
 
   const auto iset = fbgemmInstructionSet();
   // private scratchpad storage
@@ -161,7 +161,7 @@ void cblas_gemm_compute(
 #endif
 #endif
   GemmParams<T> gp;
-  int i_begin, i_end;
+  int i_begin = 0, i_end = 0;
   i_begin = 0;
   i_end = m;
   for (auto m0 = i_begin; m0 < i_end; m0 += mb_max) {
@@ -169,12 +169,10 @@ void cblas_gemm_compute(
     assert(mb < static_cast<int64_t>(partition.size()));
     for (auto k_ind = 0; k_ind < k; k_ind += Bp.blockRowSize()) {
       // set up proper accumulation to avoid "Nan" problem
-      float beta_;
-      if (k_ind == 0) {
-        // accumulate of beta != 0.0
-        // do not!!! accumulate otherwise
-        beta_ = beta;
-      } else {
+      // accumulate of beta != 0.0
+      // do not!!! accumulate otherwise
+      float beta_ = beta;
+      if (k_ind != 0) {
         // always accumulate with beta_ = 1.0f
         beta_ = 1.0f;
       }
@@ -231,7 +229,7 @@ void cblas_gemm_compute(
           }
 #endif
           if ((n % Bp.blockColSize()) == 0) {
-            int64_t jb_begin, jb_end;
+            int64_t jb_begin = 0, jb_end = 0;
             fbgemmPartition1D(
                 thread_id, num_threads, gp.b_block_cols, jb_begin, jb_end);
             gp.B += gp.k * Bp.blockColSize() * jb_begin;
@@ -253,7 +251,7 @@ void cblas_gemm_compute(
           } else {
             int last_blk_col = nbcol * Bp.blockColSize();
             if (nbcol) {
-              int64_t jb_begin, jb_end;
+              int64_t jb_begin = 0, jb_end = 0;
               fbgemmPartition1D(
                   thread_id, num_threads, gp.b_block_cols, jb_begin, jb_end);
               gp.B += gp.k * Bp.blockColSize() * jb_begin;
@@ -277,8 +275,7 @@ void cblas_gemm_compute(
             // use one thread to handle the fringe cases
             if (thread_id == num_threads - 1) {
               // leftover
-              const int rem = n - last_blk_col;
-              (void)rem; // Suppress unused variable warning
+              const int rem [[maybe_unused]] = n - last_blk_col;
               assert(rem < Bp.blockColSize());
 
               // small temporary buffer: the size should be larger than the

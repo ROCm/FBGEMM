@@ -32,10 +32,10 @@ template <
     int TBS_M,
     int TBS_N,
     int TBS_K,
+    int ARCH,
     bool PONG,
     bool COOP,
     bool FAST_ACCUM,
-    bool USE_BIAS,
     typename INPUT_DTYPE,
     typename BIAS_DTYPE>
 at::Tensor f8f8bf16_rowwise_impl(
@@ -98,8 +98,11 @@ at::Tensor f8f8bf16_rowwise_impl(
 
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
-  using ArchTag = cutlass::arch::Sm90; // Tag indicating the minimum SM that
-                                       // supports the intended feature
+  using ArchTag = cute::conditional_t<
+      ARCH == 10,
+      cutlass::arch::Sm100,
+      cutlass::arch::Sm90>; // Tag indicating the minimum SM that
+                            // supports the intended feature
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   using TileShape = cute::Shape<
       cute::Int<TB_M>,
@@ -154,10 +157,7 @@ at::Tensor f8f8bf16_rowwise_impl(
 
   using Compute1 = cutlass::epilogue::fusion::Sm90Compute<
       cutlass::multiplies,
-      cute::conditional_t< // Second stage output type.
-          USE_BIAS,
-          ElementBias,
-          ElementOutput>,
+      ElementBias, // Second stage output type.
       ElementComputeEpilogue, // Second stage input types.
       cutlass::FloatRoundStyle::round_to_nearest>;
 
@@ -170,11 +170,8 @@ at::Tensor f8f8bf16_rowwise_impl(
       ElementBias, // Final stage input types.
       cutlass::FloatRoundStyle::round_to_nearest>;
 
-  using EVTComputeBias =
-      cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
-
   using EpilogueEVT =
-      cute::conditional_t<USE_BIAS, EVTComputeBias, EVTCompute1>;
+      cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
 
   using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
   using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
@@ -186,16 +183,26 @@ at::Tensor f8f8bf16_rowwise_impl(
           PONG,
           cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
           cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum>>;
-  using MainLoopSchedule =
-      cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>;
+
+  using MainLoopScheduleSM100 = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueScheduleSM100 =
+      cutlass::epilogue::collective::EpilogueScheduleAuto;
+
+  using MainLoopSchedule = cute::conditional_t<
+      ARCH == 10,
+      MainLoopScheduleSM100,
+      cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>>;
   using EpilogueSchedule = cute::conditional_t<
-      COOP,
-      cutlass::epilogue::TmaWarpSpecializedCooperative,
-      cutlass::epilogue::TmaWarpSpecialized>;
+      ARCH == 10,
+      EpilogueScheduleSM100,
+      cute::conditional_t<
+          COOP,
+          cutlass::epilogue::TmaWarpSpecializedCooperative,
+          cutlass::epilogue::TmaWarpSpecialized>>;
 
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
-          cutlass::arch::Sm90,
+          ArchTag,
           cutlass::arch::OpClassTensorOp,
           TileShape,
           ClusterShape,
@@ -259,38 +266,26 @@ at::Tensor f8f8bf16_rowwise_impl(
        (ElementOutput*)Y.data_ptr<at::BFloat16>(),
        stride_output}};
 
-  if constexpr (USE_BIAS) {
-    arguments.epilogue.thread = {
-        {reinterpret_cast<ElementBias*>(bias.value().data_ptr())}, // bias
-        // compute_1
-        {
-            {reinterpret_cast<ElementComputeEpilogue*>(
-                w_scale.data_ptr())}, // x_scale
-            // compute_0
-            {
-                {reinterpret_cast<ElementComputeEpilogue*>(
-                    x_scale.data_ptr())}, // w_scale
-                {}, // Accumulator
-                {} // Multiplies
-            },
-            {}, // Multiplies
-        },
-        {}, // Plus
-    };
-  } else {
-    arguments.epilogue.thread = {
-        {reinterpret_cast<ElementComputeEpilogue*>(
-            w_scale.data_ptr())}, // x_scale
-        // compute_0
-        {
-            {reinterpret_cast<ElementComputeEpilogue*>(
-                x_scale.data_ptr())}, // w_scale
-            {}, // Accumulator
-            {} // Multiplies
-        },
-        {}, // Multiplies
-    };
-  }
+  arguments.epilogue.thread = {
+      {bias.has_value()
+           ? reinterpret_cast<ElementBias*>(bias.value().data_ptr())
+           : nullptr}, // bias. Note Cutlass EVT will skip node if argument is
+                       // nullptr
+      // compute_1
+      {
+          {reinterpret_cast<ElementComputeEpilogue*>(
+              w_scale.data_ptr())}, // x_scale
+          // compute_0
+          {
+              {reinterpret_cast<ElementComputeEpilogue*>(
+                  x_scale.data_ptr())}, // w_scale
+              {}, // Accumulator
+              {} // Multiplies
+          },
+          {}, // Multiplies
+      },
+      {}, // Plus
+  };
 
   Gemm gemm;
 
@@ -332,6 +327,7 @@ template <
     int TBS_M,
     int TBS_N,
     int TBS_K,
+    int ARCH,
     bool PONG,
     bool COOP>
 at::Tensor f8f8bf16_rowwise_wrapper(
@@ -352,136 +348,71 @@ at::Tensor f8f8bf16_rowwise_wrapper(
             bias.value().dtype() == at::kBFloat16,
         "Bias type must be bfloat16 or float32 if provided.");
   }
-  bool use_bias = bias.has_value();
-  bool bf16_bias = use_bias && bias.value().dtype() == at::kBFloat16;
+  bool bf16_bias = bias.has_value() && bias.value().dtype() == at::kBFloat16;
 
   // Templatize based on input dtype.
   bool use_e5m2 = XQ.dtype() == at::kFloat8_e5m2;
 
-  if (use_bias) {
-    if (bf16_bias) {
-      if (use_fast_accum) {
-        if (use_e5m2) {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              true,
-              true,
-              cutlass::float_e5m2_t,
-              cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-        } else {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              true,
-              true,
-              cutlass::float_e4m3_t,
-              cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-        }
+  if (bf16_bias) {
+    if (use_fast_accum) {
+      if (use_e5m2) {
+        return f8f8bf16_rowwise_impl<
+            TB_M,
+            TB_N,
+            TB_K,
+            TBS_M,
+            TBS_N,
+            TBS_K,
+            ARCH,
+            PONG,
+            COOP,
+            true,
+            cutlass::float_e5m2_t,
+            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
       } else {
-        if (use_e5m2) {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              false,
-              true,
-              cutlass::float_e5m2_t,
-              cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-        } else {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              false,
-              true,
-              cutlass::float_e4m3_t,
-              cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-        }
+        return f8f8bf16_rowwise_impl<
+            TB_M,
+            TB_N,
+            TB_K,
+            TBS_M,
+            TBS_N,
+            TBS_K,
+            ARCH,
+            PONG,
+            COOP,
+            true,
+            cutlass::float_e4m3_t,
+            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
       }
     } else {
-      if (use_fast_accum) {
-        if (use_e5m2) {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              true,
-              true,
-              cutlass::float_e5m2_t,
-              float>(XQ, WQ, x_scale, w_scale, bias, output);
-        } else {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              true,
-              true,
-              cutlass::float_e4m3_t,
-              float>(XQ, WQ, x_scale, w_scale, bias, output);
-        }
+      if (use_e5m2) {
+        return f8f8bf16_rowwise_impl<
+            TB_M,
+            TB_N,
+            TB_K,
+            TBS_M,
+            TBS_N,
+            TBS_K,
+            ARCH,
+            PONG,
+            COOP,
+            false,
+            cutlass::float_e5m2_t,
+            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
       } else {
-        if (use_e5m2) {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              false,
-              true,
-              cutlass::float_e5m2_t,
-              float>(XQ, WQ, x_scale, w_scale, bias, output);
-        } else {
-          return f8f8bf16_rowwise_impl<
-              TB_M,
-              TB_N,
-              TB_K,
-              TBS_M,
-              TBS_N,
-              TBS_K,
-              PONG,
-              COOP,
-              false,
-              true,
-              cutlass::float_e4m3_t,
-              float>(XQ, WQ, x_scale, w_scale, bias, output);
-        }
+        return f8f8bf16_rowwise_impl<
+            TB_M,
+            TB_N,
+            TB_K,
+            TBS_M,
+            TBS_N,
+            TBS_K,
+            ARCH,
+            PONG,
+            COOP,
+            false,
+            cutlass::float_e4m3_t,
+            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
       }
     }
   } else {
@@ -494,10 +425,10 @@ at::Tensor f8f8bf16_rowwise_wrapper(
             TBS_M,
             TBS_N,
             TBS_K,
+            ARCH,
             PONG,
             COOP,
             true,
-            false,
             cutlass::float_e5m2_t,
             float>(XQ, WQ, x_scale, w_scale, bias, output);
       } else {
@@ -508,10 +439,10 @@ at::Tensor f8f8bf16_rowwise_wrapper(
             TBS_M,
             TBS_N,
             TBS_K,
+            ARCH,
             PONG,
             COOP,
             true,
-            false,
             cutlass::float_e4m3_t,
             float>(XQ, WQ, x_scale, w_scale, bias, output);
       }
@@ -524,9 +455,9 @@ at::Tensor f8f8bf16_rowwise_wrapper(
             TBS_M,
             TBS_N,
             TBS_K,
+            ARCH,
             PONG,
             COOP,
-            false,
             false,
             cutlass::float_e5m2_t,
             float>(XQ, WQ, x_scale, w_scale, bias, output);
@@ -538,9 +469,9 @@ at::Tensor f8f8bf16_rowwise_wrapper(
             TBS_M,
             TBS_N,
             TBS_K,
+            ARCH,
             PONG,
             COOP,
-            false,
             false,
             cutlass::float_e4m3_t,
             float>(XQ, WQ, x_scale, w_scale, bias, output);

@@ -8,13 +8,146 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 // clang-format on
 
 #include "f8f8bf16_rowwise/f8f8bf16_rowwise_manifest.cuh"
+#include "fbgemm_gpu/quantize/tuning_cache.hpp"
+#include "fbgemm_gpu/quantize/utils.h"
 
 namespace fbgemm_gpu {
 
 #if CUDART_VERSION >= 12000
+
+// FP8 Rowwise Cutlass kernel dispatch.
+Kernel_f8f8bf16_rowwise
+get_kernel_via_heuristic(int arch, int M, int N, int K, bool use_fast_accum) {
+  // Use shape heuristics to dispatch to optimized kernel configuration.
+  if (arch == 10) {
+    if (M <= 128) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_128_32_128_1_1_1_10_f_f;
+      } else {
+        return f8f8bf16_rowwise_128_64_128_1_1_1_10_f_f;
+      }
+    } else if (M <= 1024) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_128_256_128_2_1_1_10_f_f;
+      } else {
+        return f8f8bf16_rowwise_128_128_128_2_2_1_10_f_f;
+      }
+    } else if (M <= 2048) {
+      return f8f8bf16_rowwise_128_256_128_2_1_1_10_f_f;
+    } else {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_128_256_128_1_2_1_10_f_f;
+      } else {
+        return f8f8bf16_rowwise_128_256_128_2_1_1_10_f_f;
+      }
+    }
+  } else {
+    if (M <= 16) {
+      return f8f8bf16_rowwise_64_16_128_1_1_1_9_f_f;
+    } else if (M <= 32) {
+      if (N <= 4096) {
+        return f8f8bf16_rowwise_64_16_128_1_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_64_32_128_2_1_1_9_f_f;
+      }
+    } else if (M <= 64) {
+      if (N <= 2048) {
+        return f8f8bf16_rowwise_64_16_128_1_1_1_9_f_f;
+      } else if (N <= 4096) {
+        return f8f8bf16_rowwise_64_32_128_2_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_64_64_128_2_1_1_9_f_f;
+      }
+    } else if (M <= 128) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_64_16_128_1_1_1_9_f_f;
+      } else if (N <= 2048) {
+        return f8f8bf16_rowwise_64_32_128_2_1_1_9_f_f;
+      } else if (N <= 4096) {
+        return f8f8bf16_rowwise_64_64_128_2_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_64_128_128_1_1_1_9_f_f;
+      }
+    } else if (M <= 256) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_64_32_128_2_1_1_9_f_f;
+      } else if (N <= 2048) {
+        return f8f8bf16_rowwise_64_64_128_2_1_1_9_f_f;
+      } else if (N <= 4096) {
+        return f8f8bf16_rowwise_64_128_128_1_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_64_256_128_1_1_1_9_f_f;
+      }
+    } else if (M <= 512) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_64_64_128_2_1_1_9_f_f;
+      } else if (N <= 2048) {
+        return f8f8bf16_rowwise_64_128_128_1_1_1_9_f_f;
+      } else if (N <= 4096 || use_fast_accum == false) {
+        return f8f8bf16_rowwise_64_256_128_1_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_128_256_128_2_1_1_9_f_t;
+      }
+    } else if (M <= 1024) {
+      if (N <= 1024) {
+        return f8f8bf16_rowwise_64_128_128_1_1_1_9_f_f;
+      } else if (N <= 2048 || use_fast_accum == false) {
+        return f8f8bf16_rowwise_64_256_128_1_1_1_9_f_f;
+      } else {
+        return f8f8bf16_rowwise_128_256_128_2_1_1_9_f_t;
+      }
+    } else {
+      if (M <= 2048 && N <= 1024) {
+        return f8f8bf16_rowwise_64_256_128_2_1_1_9_f_f;
+      } else if (K <= 4096 || use_fast_accum == false) {
+        return f8f8bf16_rowwise_128_128_128_2_1_1_9_t_f;
+      } else if (M > 8192 && N > 8192) {
+        return f8f8bf16_rowwise_128_256_128_4_4_1_9_f_t;
+      } else {
+        return f8f8bf16_rowwise_128_256_128_2_1_1_9_f_t;
+      }
+    }
+  }
+}
+
+Kernel_f8f8bf16_rowwise get_kernel_via_tuning(
+    int arch,
+    int M,
+    int N,
+    int K,
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    bool use_fast_accum,
+    std::optional<at::Tensor> bias = std::nullopt,
+    std::optional<at::Tensor> output = std::nullopt) {
+  // One cache per kernel type
+  static TuningCache cache("f8f8bf16_rowwise");
+
+  // Reducing amount of auto tuning by rounding up M to next power of 2.
+  M = nextPowerOf2(M);
+  // Use (M, N, K) shape as the key.
+  const std::string shape_key =
+      std::to_string(M) + "_" + std::to_string(N) + "_" + std::to_string(K);
+  const auto& kernels = get_f8f8bf16_rowwise_kernels(arch);
+  auto kernel = cache.findBestKernelMaybeAutotune(
+      shape_key,
+      kernels,
+      XQ,
+      WQ,
+      x_scale,
+      w_scale,
+      use_fast_accum,
+      bias,
+      output);
+
+  return kernel;
+}
 
 // FP8 Rowwise Cutlass kernel dispatch.
 at::Tensor dispatch_fp8_rowwise_kernel(
@@ -29,97 +162,44 @@ at::Tensor dispatch_fp8_rowwise_kernel(
   int N = size_to_dim_(WQ.dim() - 1, WQ.sizes());
   int K = XQ.size(-1);
 
-  // Use shape heuristics to dispatch to optimized kernel configuration.
-  if (M <= 16) {
-    return f8f8bf16_rowwise_64_16_128_1_1_1_f_f(
-        XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-  } else if (M <= 32) {
-    if (N <= 4096) {
-      return f8f8bf16_rowwise_64_16_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+  static int arch = -1;
+  // Avoid expensive cudaGetDeviceProperties call.
+  if (arch < 0) {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    if (prop.major >= 10) {
+      arch = 10;
+      int runtimeVersion;
+      C10_CUDA_CHECK(cudaRuntimeGetVersion(&runtimeVersion));
+      TORCH_CHECK(
+          runtimeVersion >= 12080,
+          "FP8 GEMM on sm100a or above requires cuda >= 12.8");
     } else {
-      return f8f8bf16_rowwise_64_32_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else if (M <= 64) {
-    if (N <= 2048) {
-      return f8f8bf16_rowwise_64_16_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 4096) {
-      return f8f8bf16_rowwise_64_32_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_64_64_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else if (M <= 128) {
-    if (N <= 1024) {
-      return f8f8bf16_rowwise_64_16_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 2048) {
-      return f8f8bf16_rowwise_64_32_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 4096) {
-      return f8f8bf16_rowwise_64_64_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_64_128_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else if (M <= 256) {
-    if (N <= 1024) {
-      return f8f8bf16_rowwise_64_32_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 2048) {
-      return f8f8bf16_rowwise_64_64_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 4096) {
-      return f8f8bf16_rowwise_64_128_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_64_256_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else if (M <= 512) {
-    if (N <= 1024) {
-      return f8f8bf16_rowwise_64_64_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 2048) {
-      return f8f8bf16_rowwise_64_128_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 4096 || use_fast_accum == false) {
-      return f8f8bf16_rowwise_64_256_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_128_256_128_2_1_1_f_t(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else if (M <= 1024) {
-    if (N <= 1024) {
-      return f8f8bf16_rowwise_64_128_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (N <= 2048 || use_fast_accum == false) {
-      return f8f8bf16_rowwise_64_256_128_1_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_128_256_128_2_1_1_f_t(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    }
-  } else {
-    if (M <= 2048 && N <= 1024) {
-      return f8f8bf16_rowwise_64_256_128_2_1_1_f_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (K <= 4096 || use_fast_accum == false) {
-      return f8f8bf16_rowwise_128_128_128_2_1_1_t_f(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else if (M > 8192 && N > 8192) {
-      return f8f8bf16_rowwise_128_256_128_4_4_1_f_t(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
-    } else {
-      return f8f8bf16_rowwise_128_256_128_2_1_1_f_t(
-          XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+      arch = 9;
     }
   }
+
+  // Select kernel to run via heuristics or tuning.
+  auto kernel = [&]() {
+    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+      return get_kernel_via_tuning(
+          arch,
+          M,
+          N,
+          K,
+          XQ,
+          WQ,
+          x_scale,
+          w_scale,
+          use_fast_accum,
+          bias,
+          output);
+    } else {
+      return get_kernel_via_heuristic(arch, M, N, K, use_fast_accum);
+    }
+  }();
+  // Invoke kernel
+  return kernel(XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
 }
 
 void f8f8bf16_rowwise_out(

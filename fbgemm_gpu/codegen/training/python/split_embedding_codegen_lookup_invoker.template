@@ -92,6 +92,7 @@ torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
         "Please check the frontend and backend version. "
     )
     {{ arg_type }}.append(dict_{{ arg_type }}["{{ var }}"])
+    
     {%- endfor %}
 {%- endmacro %}
 
@@ -203,7 +204,10 @@ def invoke(
         "use_uniq_cache_locations_bwd": common_args.use_uniq_cache_locations_bwd,
         "use_homogeneous_placements": common_args.use_homogeneous_placements,
         "apply_global_weight_decay": apply_global_weight_decay,
-        "mixed_D": mixed_D
+        "mixed_D": mixed_D,
+        {%- if ssd %}
+        "enable_optimizer_offloading": common_args.enable_optimizer_offloading,
+        {%- endif %}
     }
     dict_optim_int: Dict[str, int] = {}
     dict_optim_float: Dict[str, float] = {}

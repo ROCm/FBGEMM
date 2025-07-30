@@ -20,6 +20,8 @@ __install_print_dependencies_info () {
   local installed_pytorch_version=$(conda run ${env_prefix} python -c "import torch; print(torch.__version__)")
   # shellcheck disable=SC2086,SC2155
   local installed_cuda_version=$(conda run ${env_prefix} python -c "import torch; print(torch.version.cuda)")
+
+  echo ""
   echo "################################################################################"
   echo "[CHECK] !!!!    INFO    !!!!"
   echo "[CHECK] The installed version of PyTorch is: ${installed_pytorch_version}"
@@ -44,6 +46,8 @@ __install_fetch_version_and_variant_info () {
   installed_fbgemm_variant=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__variant__)")
   # shellcheck disable=SC2086,SC2155
   installed_fbgemm_version=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__version__)")
+
+  echo ""
   echo "################################################################################"
   echo "[CHECK] The installed FBGEMM TARGET is: ${installed_fbgemm_target}"
   echo "[CHECK] The installed FBGEMM VARIANT is: ${installed_fbgemm_variant}"
@@ -77,7 +81,7 @@ __install_check_subpackages () {
     "fbgemm_gpu.tbe.cache"
   )
 
-  if [ "$installed_fbgemm_target" != "genai" ]; then
+  if [ "$installed_fbgemm_target" == "default" ]; then
     subpackages+=(
       "fbgemm_gpu.split_embedding_codegen_lookup_invokers"
       "fbgemm_gpu.tbe.ssd"
@@ -91,15 +95,41 @@ __install_check_subpackages () {
 }
 
 __install_check_operator_registrations () {
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
+
+  local test_operators=()
+  local base_import="fbgemm_gpu"
   echo "[INSTALL] Check for operator registrations ..."
+
   if [ "$installed_fbgemm_target" == "genai" ]; then
-    local test_operators=(
-      "torch.ops.fbgemm.nccl_init"
-      "torch.ops.fbgemm.gqa_attn_splitk"
-      "torch.ops.fbgemm.rope_qkv_decoding"
+    # NOTE: Currently, ROCm builds of GenAI only include quantization
+    # operators.
+    if [ "$installed_fbgemm_variant" == "cuda" ]; then
+      test_operators+=(
+        "torch.ops.fbgemm.nccl_init"
+        "torch.ops.fbgemm.gqa_attn_splitk"
+      )
+
+      # NOTE: kv_cache.cu is currently disabled from GenAI CUDA 11.8 builds
+      # shellcheck disable=SC2086,SC2155
+      local installed_cuda_version=$(conda run ${env_prefix} python -c "import torch; print(torch.version.cuda)")
+      local installed_cuda_version_major="${installed_cuda_version%%.*}"
+      if [[ "$installed_cuda_version_major" -ge 12 ]]; then
+        test_operators+=(
+          "torch.ops.fbgemm.rope_qkv_decoding"
+        )
+      fi
+    fi
+
+  elif [ "$installed_fbgemm_target" == "hstu" ]; then
+    test_operators+=(
+      "torch.ops.fbgemm.hstu_varlen_bwd_80"
     )
-  else
-    local test_operators=(
+    base_import="fbgemm_gpu.experimental.hstu"
+
+  elif [ "$installed_fbgemm_target" == "genai" ]; then
+    test_operators+=(
       "torch.ops.fbgemm.asynchronous_inclusive_cumsum"
       "torch.ops.fbgemm.split_embedding_codegen_lookup_sgd_function_pt2"
     )
@@ -107,7 +137,7 @@ __install_check_operator_registrations () {
 
   for operator in "${test_operators[@]}"; do
     # shellcheck disable=SC2086
-    if conda run ${env_prefix} python -c "import torch; import fbgemm_gpu; print($operator)"; then
+    if conda run ${env_prefix} python -c "import torch; import ${base_import}; print($operator)"; then
       echo "[CHECK] FBGEMM_GPU operator appears to be correctly registered: $operator"
     else
       echo "################################################################################"

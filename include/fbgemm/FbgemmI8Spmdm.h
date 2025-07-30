@@ -10,9 +10,9 @@
 
 #include <cstdint>
 #include <vector>
-#include "./ConvUtils.h"
-#include "./FbgemmBuild.h"
-#include "./Utils.h"
+#include "./ConvUtils.h" // @manual
+#include "./FbgemmBuild.h" // @manual
+#include "./Utils.h" // @manual
 
 // #define FBGEMM_MEASURE_TIME_BREAKDOWN
 
@@ -124,12 +124,12 @@ class FBGEMM_API CompressedSparseColumn {
   std::vector<std::int16_t> ic_; // in channels
 
   // Cache IsHyperSparse to minimize its overhead.
-  mutable bool hyper_sparse_;
+  mutable bool hyper_sparse_{false};
 
   // Whether we can reuse the cached hyper_sparse_ is determined by checking
   // if NumOfNonZeros() is same as old_nnz_ saved in previous invocation of
   // IsHyperSparse call.
-  mutable std::int32_t old_nnz_;
+  mutable std::int32_t old_nnz_{-1};
 };
 
 } // namespace fbgemm

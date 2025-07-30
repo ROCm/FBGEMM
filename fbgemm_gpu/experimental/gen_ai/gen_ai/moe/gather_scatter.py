@@ -21,11 +21,41 @@ def gather_scale_dense_tokens(
     token_indices: torch.Tensor,
     expert_indices: torch.Tensor,
     scores: torch.Tensor,
+    valid_token_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Gather and scale dense tokens along 1D indices.
+
+    For each input token, token_indices[i] is the index of the token in the input sequence.
+    expert_indices[i] is the index of the expert that the token is assigned to.
+    scores[i] is the score of the token.
+
+    For each expert, the tokens assigned to this expert are gathered from the input sequence,
+    and then their scores are multiplied element-wise.
+
+    valid_token_count is an optional tensor that can be used to filter out some tokens.
+    If it is provided, the function will only consider the first valid_token_count tokens in the input sequence.
+
+    The function returns a tensor of shape (a, D), where a is the number of tokens and D is the input dimension.
+
+    Args:
+        x (torch.Tensor): input tensor of shape (T, D)
+        token_indices (torch.Tensor): token indices of shape (a,)
+        expert_indices (torch.Tensor): expert indices of shape (a,)
+        scores (torch.Tensor): scores of shape (T, E)
+        valid_token_count (torch.Tensor, optional): valid token count of shape (,)
+
+    Returns:
+        torch.Tensor: output tensor of shape (a, D)
+    """
     T, D = x.shape
     E = scores.shape[1]
     # a = K * T
     a = token_indices.shape[0]
+
+    out = torch.empty((a, D), device="cuda", dtype=torch.bfloat16)
+    if a == 0 or D == 0:
+        return out
 
     assert x.is_contiguous()
     assert token_indices.is_contiguous()
@@ -37,8 +67,6 @@ def gather_scale_dense_tokens(
 
     stride_t = scores.stride(0)
     stride_e = scores.stride(1)
-
-    out = torch.empty((a, D), device="cuda", dtype=torch.bfloat16)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if a >= NUM_SMS:
@@ -58,6 +86,7 @@ def gather_scale_dense_tokens(
         scores,
         stride_t,
         stride_e,
+        valid_token_count,
         D,  # pyre-ignore
         BLOCK_D_OUTER,  # pyre-ignore
         BLOCK_D_INNER,  # pyre-ignore
@@ -71,7 +100,34 @@ def gather_scale_quant_dense_tokens(
     expert_indices: torch.Tensor,
     scores: torch.Tensor,
     scale_ub: Optional[torch.Tensor] = None,
+    valid_token_count: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Gather, scale, and quantize dense tokens along 1D indices.
+
+    For each input token, token_indices[i] is the index of the token in the input sequence.
+    expert_indices[i] is the index of the expert that the token is assigned to.
+    scores[i] is the score of the token.
+
+    For each expert, the tokens assigned to this expert are gathered from the input sequence,
+    and then their scores are multiplied element-wise, and then quantized to FP8.
+
+    valid_token_count is an optional tensor that can be used to filter out some tokens.
+    If it is provided, the function will only consider the first valid_token_count tokens in the input sequence.
+
+    The function returns a tensor of shape (a, D), where a is the number of tokens and D is the input dimension.
+
+    Args:
+        x (torch.Tensor): input tensor of shape (T, D)
+        token_indices (torch.Tensor): token indices of shape (a,)
+        expert_indices (torch.Tensor): expert indices of shape (a,)
+        scores (torch.Tensor): scores of shape (T, E)
+        scale_ub (torch.Tensor, optional): scale upper bound of shape (1,)
+        valid_token_count (torch.Tensor, optional): valid token count of shape (1,)
+
+    Returns:
+        torch.Tensor: output tensor of shape (a, D)
+    """
     T, D = x.shape
     E = scores.shape[1]
     # a = K * T
@@ -104,6 +160,7 @@ def gather_scale_quant_dense_tokens(
         scale_ub,
         stride_t,
         stride_e,
+        valid_token_count,
         D,
         TL_FP8_DTYPE=tl_dtype,
         MAX_FP8=max_fp8,
@@ -117,7 +174,21 @@ def scatter_add_dense_tokens(
     out_tokens: torch.Tensor,  # [T, D]
     in_tokens: torch.Tensor,  # [a, D]
     token_indices: torch.Tensor,  # [a]
+    valid_token_count: Optional[torch.Tensor] = None,
 ) -> None:
+    """
+    Scatter add dense tokens along 1D indices.
+
+    Args:
+        out_tokens (torch.Tensor): output tensor of shape (T, D)
+        in_tokens (torch.Tensor): input tensor of shape (a, D)
+        token_indices (torch.Tensor): token indices of shape (a,)
+        valid_token_count (torch.Tensor, optional): valid token count of shape (1,)
+
+    Returns:
+        None
+    """
+
     assert torch.version.hip is not None or (
         torch.version.cuda is not None and torch.version.cuda >= "12.4"
     ), "Requires CUDA version 12.4 or later on Nvidia GPUs!"
@@ -144,6 +215,7 @@ def scatter_add_dense_tokens(
         out_tokens,
         in_tokens,
         token_indices,
+        valid_token_count,
         D,  # pyre-ignore
         BLOCK_D_OUTER,  # pyre-ignore
         BLOCK_D_INNER,  # pyre-ignore
@@ -156,6 +228,18 @@ def scatter_add_padded_tokens(
     token_indices: torch.Tensor,  # [T]
     out_tokens: torch.Tensor,  # [T, D]
 ) -> None:
+    """
+    Scatter add valid tokens based on token counts metadata.
+
+    Args:
+        in_tokens (torch.Tensor): input tensor of shape (EP, T, D)
+        token_counts (torch.Tensor): token counts of shape (E,)
+        token_indices (torch.Tensor): token indices of shape (T,)
+        out_tokens (torch.Tensor): output tensor of shape (T, D)
+
+    Returns:
+        None
+    """
     assert torch.version.hip is not None or (
         torch.version.cuda is not None and torch.version.cuda >= "12.4"
     ), "Requires CUDA version 12.4 or later on Nvidia GPUs!"
@@ -196,7 +280,7 @@ _GATHER_SCALE_DENSE_TOKENS_OP_NAME = "fbgemm::gather_scale_dense_tokens"
 
 torch.library.define(
     "fbgemm::gather_scale_dense_tokens",
-    "(Tensor x, Tensor token_indices, Tensor expert_indices, Tensor scores) -> Tensor",
+    "(Tensor x, Tensor token_indices, Tensor expert_indices, Tensor scores, Tensor? valid_token_count=None) -> Tensor",
 )
 
 
@@ -206,6 +290,7 @@ def gather_scale_dense_tokens_meta(
     token_indices,
     expert_indices,
     scores,
+    valid_token_count=None,
 ):
     D = x.shape[1]
     a = token_indices.shape[0]
@@ -218,12 +303,14 @@ def gather_scale_dense_tokens_cuda(
     token_indices,
     expert_indices,
     scores,
+    valid_token_count=None,
 ):
     return gather_scale_dense_tokens(
         x,
         token_indices,
         expert_indices,
         scores,
+        valid_token_count,
     )
 
 
@@ -231,7 +318,7 @@ _GATHER_SCALE_QUANT_DENSE_TOKENS_OP_NAME = "fbgemm::gather_scale_quant_dense_tok
 
 torch.library.define(
     "fbgemm::gather_scale_quant_dense_tokens",
-    "(Tensor x, Tensor token_indices, Tensor expert_indices, Tensor scores, Tensor? scale_ub) -> Tensor",
+    "(Tensor x, Tensor token_indices, Tensor expert_indices, Tensor scores, Tensor? scale_ub=None, Tensor? valid_token_count=None) -> Tensor",
 )
 
 
@@ -241,7 +328,8 @@ def gather_scale_quant_dense_tokens_meta(
     token_indices,
     expert_indices,
     scores,
-    scale_ub,
+    scale_ub=None,
+    valid_token_count=None,
 ):
     D = x.shape[1]
     a = token_indices.shape[0]
@@ -258,6 +346,7 @@ def gather_scale_quant_dense_tokens_cuda(
     expert_indices,
     scores,
     scale_ub=None,
+    valid_token_count=None,
 ):
     return gather_scale_quant_dense_tokens(
         x,
@@ -265,6 +354,7 @@ def gather_scale_quant_dense_tokens_cuda(
         expert_indices,
         scores,
         scale_ub,
+        valid_token_count,
     )
 
 
@@ -272,7 +362,7 @@ _SCATTER_ADD_DENSE_TOKENS_OP_NAME = "fbgemm::scatter_add_dense_tokens"
 
 torch.library.define(
     "fbgemm::scatter_add_dense_tokens",
-    "(Tensor out_tokens, Tensor in_tokens, Tensor token_indices) -> None",
+    "(Tensor out_tokens, Tensor in_tokens, Tensor token_indices, Tensor? valid_token_count=None) -> None",
 )
 
 
@@ -281,6 +371,7 @@ def scatter_add_dense_tokens_meta(
     out_tokens,
     in_tokens,
     token_indices,
+    valid_token_count=None,
 ):
     return None
 
@@ -290,8 +381,11 @@ def scatter_add_dense_tokens_cuda(
     out_tokens,
     in_tokens,
     token_indices,
+    valid_token_count=None,
 ):
-    return scatter_add_dense_tokens(out_tokens, in_tokens, token_indices)
+    return scatter_add_dense_tokens(
+        out_tokens, in_tokens, token_indices, valid_token_count
+    )
 
 
 _SCATTER_ADD_PADDED_TOKENS_OP_NAME = "fbgemm::scatter_add_padded_tokens"
@@ -337,12 +431,20 @@ def _fbgemm_gather_scale_dense_tokens(
     scores,
     stride_t,
     stride_e,
+    valid_token_count,
     D: tl.constexpr,
     BLOCK_D_OUTER: tl.constexpr,
     BLOCK_D_INNER: tl.constexpr,
 ):
     output_token_index = tl.program_id(0)
     feature_offset = tl.program_id(1) * BLOCK_D_OUTER
+
+    if valid_token_count is not None:
+        valid_token_count = tl.load(
+            valid_token_count, None, eviction_policy="evict_last"
+        )
+        if output_token_index >= valid_token_count:
+            return
 
     input_token_index = tl.load(
         token_indices + output_token_index, None, eviction_policy="evict_last"
@@ -383,12 +485,20 @@ def _fbgemm_scatter_add_dense_tokens(
     out_tokens,
     in_tokens,
     token_indices,
+    valid_token_count,
     D: tl.constexpr,
     BLOCK_D_OUTER: tl.constexpr,
     BLOCK_D_INNER: tl.constexpr,
 ):
     input_token_index = tl.program_id(0).to(tl.int64)
     feature_offset = tl.program_id(1) * BLOCK_D_OUTER + tl.arange(0, BLOCK_D_INNER)[:]
+
+    if valid_token_count is not None:
+        valid_token_count = tl.load(
+            valid_token_count, None, eviction_policy="evict_last"
+        )
+        if input_token_index >= valid_token_count:
+            return
 
     output_token_index = tl.load(
         token_indices + input_token_index, None, eviction_policy="evict_last"
@@ -429,6 +539,7 @@ def _fbgemm_gather_scale_fp8_rowwise_quant_dense_tokens(
     scale_ub_ptr,
     stride_t,
     stride_e,
+    valid_token_count,
     D: tl.constexpr,
     TL_FP8_DTYPE: tl.constexpr,
     MAX_FP8: tl.constexpr,
@@ -439,6 +550,13 @@ def _fbgemm_gather_scale_fp8_rowwise_quant_dense_tokens(
     tl.static_assert(D % BLOCK_D == 0, "D must be a multiple of BLOCK_D")
 
     output_token_index = tl.program_id(0)
+
+    if valid_token_count is not None:
+        valid_token_count = tl.load(
+            valid_token_count, None, eviction_policy="evict_last"
+        )
+        if output_token_index >= valid_token_count:
+            return
 
     input_token_index = tl.load(
         token_indices_ptr + output_token_index, None, eviction_policy="evict_first"
@@ -483,7 +601,7 @@ def _fbgemm_gather_scale_fp8_rowwise_quant_dense_tokens(
         input_ptr + input_token_index.to(tl.int64) * D + tl.arange(0, BLOCK_D)[:]
     )
     out_2d_ptr = (
-        output_ptr + output_token_index.to(tl.int64) * D + tl.arange(0, BLOCK_D)[:],
+        output_ptr + output_token_index.to(tl.int64) * D + tl.arange(0, BLOCK_D)[:]
     )
     for _ in range(0, D, BLOCK_D):
         # Load from L2

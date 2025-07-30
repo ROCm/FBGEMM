@@ -8,7 +8,7 @@
 
 import functools
 import inspect
-import logging
+import warnings
 
 from typing import Optional
 
@@ -20,7 +20,6 @@ import triton.language as tl
 from fbgemm_gpu.experimental.gemm.triton_gemm import utils
 from triton.runtime import driver  # @manual
 
-logger: logging.Logger = logging.getLogger(__name__)
 
 _NV_CONFIGS = [
     triton.Config(
@@ -253,8 +252,8 @@ def _fbgemm_grouped_gemm(
     NUM_CONSUMER_GROUPS: tl.constexpr,
 ) -> None:
     tl.static_assert(
-        not FUSE_SCATTER_ADD,
-        "FUSE_SCATTER_ADD not supported at _fbgemm_grouped_gemm at the moment!",
+        not (FUSE_SCATTER_ADD and USE_TMA_STORE),
+        "Cannot fuse scatter add with TMA store!",
     )
 
     tidx = tl.program_id(0)
@@ -267,7 +266,7 @@ def _fbgemm_grouped_gemm(
         c_desc_ptr = None
 
     M_end_offset = 0
-    M_end_offset = M_end_offset.to(tl.int64)
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
     iterated_tiles = 0
     for g in tl.range(G):
         # Move across groups
@@ -353,6 +352,22 @@ def _fbgemm_grouped_gemm(
                         accumulator.to(c_ptr.dtype.element_ty),
                         [m_offset, n_offset],
                     )
+                elif FUSE_SCATTER_ADD:
+                    offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                    mask = offs_am < m_size
+                    m_offsets = tl.load(
+                        scatter_add_indices + M_start_offset + offs_am,
+                        mask=mask,
+                        cache_modifier=".ca",
+                    )
+                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                    c = accumulator.to(c_ptr.dtype.element_ty)
+                    tl.atomic_add(
+                        c_ptr + m_offsets[:, None] * N + offs_bn[None, :],
+                        c,
+                        mask=mask[:, None] and offs_bn[None, :] < n_size,
+                        sem="relaxed",
+                    )
                 else:
                     offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
                     offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -418,7 +433,7 @@ def _fbgemm_grouped_gemm_ws(
         c_desc_ptr = None
 
     M_end_offset = 0
-    M_end_offset = M_end_offset.to(tl.int64)
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
     iterated_tiles = 0
     for g in tl.range(G):
         # Move across groups
@@ -576,8 +591,8 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
     NUM_CONSUMER_GROUPS: tl.constexpr,
 ) -> None:
     tl.static_assert(
-        not FUSE_SCATTER_ADD,
-        "FUSE_SCATTER_ADD not supported at _fbgemm_grouped_gemm_fp8_rowwise at the moment!",
+        not (FUSE_SCATTER_ADD and USE_TMA_STORE),
+        "Cannot fuse scatter add with TMA store!",
     )
 
     tidx = tl.program_id(0)
@@ -590,7 +605,7 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
         c_desc_ptr = None
 
     M_end_offset = 0
-    M_end_offset = M_end_offset.to(tl.int64)
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
     iterated_tiles = 0
     for g in tl.range(G):
         # Move across groups
@@ -688,6 +703,21 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
                         c.to(c_ptr.dtype.element_ty),
                         [m_offset, n_offset],
                     )
+                elif FUSE_SCATTER_ADD:
+                    offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                    mask = offs_am < m_size
+                    m_offsets = tl.load(
+                        scatter_add_indices + M_start_offset + offs_am,
+                        mask=mask,
+                        cache_modifier=".ca",
+                    )
+                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                    tl.atomic_add(
+                        c_ptr + m_offsets[:, None] * N + offs_bn[None, :],
+                        c.to(c_ptr.dtype.element_ty),
+                        mask=mask[:, None] and offs_bn[None, :] < n_size,
+                        sem="relaxed",
+                    )
                 else:
                     tl.store(
                         c_ptr
@@ -756,7 +786,7 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
         c_desc_ptr = None
 
     M_end_offset = 0
-    M_end_offset = M_end_offset.to(tl.int64)
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
     iterated_tiles = 0
     for g in tl.range(G):
         # Move across groups
@@ -909,6 +939,9 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
             iterated_tiles += num_tiles
 
 
+warnings.simplefilter("once")
+
+
 def _grouped_gemm(
     *,
     x: torch.Tensor,
@@ -927,21 +960,19 @@ def _grouped_gemm(
 
     if USE_TMA_LOAD and not utils.HAS_TMA_DESC:
         USE_TMA_LOAD = False
-        logging.warning("TMA load is disabled as there is no TMA descriptor support!")
+        warnings.warn("TMA load is disabled as there is no TMA descriptor support!")
 
     if USE_TMA_STORE and not utils.HAS_TMA_DESC:
         USE_TMA_STORE = False
-        logging.warning("TMA store is disabled as there is no TMA descriptor support!")
+        warnings.warn("TMA store is disabled as there is no TMA descriptor support!")
 
     # TODO(shikaili): Check the readniess of WS on ROCm side in Meta's Triton.
     if use_warp_specialization and torch.version.hip:
-        logging.warning(
-            "Warp specialization is disabled as it is not supported on ROCm."
-        )
+        warnings.warn("Warp specialization is disabled as it is not supported on ROCm.")
         use_warp_specialization = False
 
     if use_warp_specialization and not _HAS_WS_SUPPORT:
-        logging.warning(
+        warnings.warn(
             "Warp specialization is disabled as the Triton build in current environment doesn't have such support. Please build from https://github.com/facebookexperimental/triton/tree/ws-3.2.x to enable it for best performance on Nvidia's SM90 GPUs."
         )
         use_warp_specialization = False

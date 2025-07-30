@@ -24,7 +24,7 @@
 #include "fbgemm_gpu/sparse_ops.h"
 #include "fbgemm_gpu/config/feature_gates.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
-#include "fbgemm_gpu/utils/barrier_isolation.cuh"
+#include "fbgemm_gpu/utils/cuda_utilities.cuh"
 #include "fbgemm_gpu/utils/kernel_launcher.cuh"
 #include "fbgemm_gpu/utils/ops_utils.h"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
@@ -130,6 +130,9 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
     {%- endif %}
     const float gwd_lower_bound,
     {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}
     {%- if is_index_select %}
     const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
@@ -212,6 +215,9 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     const int64_t iter,
     {%- endif %}
     const float gwd_lower_bound,
+    {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
     const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
@@ -478,20 +484,8 @@ int32_t compute_num_groups_and_dynamic_smem_bytes(
   }
   TORCH_CHECK_GE(*num_groups, 1);
 
-  // Check https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-7-x
-  // "Compute capability 7.x devices allow a single thread block to
-  // address the full capacity of shared memory: 96 KB on Volta,
-  // 64 KB on Turing. Kernels relying on shared memory allocations
-  // over 48 KB per block are architecture-specific, as such they
-  // must use dynamic shared memory (rather than statically sized
-  // arrays) and require an explicit opt-in using cudaFuncSetAttribute()".
-#ifndef USE_ROCM
-  cudaFuncSetAttribute(
-      bwd_kernel_fn,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      used_shared_bytes); // V100: 64 KB; A100: 96 KB; H100: 144 KB
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
+  utils::cuda::set_max_dynamic_smem(bwd_kernel_fn, used_shared_bytes);
+
   return smem_bytes;
 }
 
@@ -571,6 +565,9 @@ Tensor {{ embedding_cuda_op }}(
     {%- if not is_index_select and not dense %}
     const bool use_uniq_cache_locations,
     const bool use_homogeneous_placements,
+    {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
     const Tensor& grad_offsets,
@@ -654,6 +651,17 @@ Tensor {{ embedding_cuda_op }}(
     auto aligned_grad_output = aligned_grad_output_tensor_for_cuda_backwards(grad_output);
 
     CUDA_DEVICE_GUARD(dev_weights);
+
+
+    #ifdef USE_ROCM
+        if (!rocm::is_supported_cdna()) {
+            TORCH_WARN_ONCE("Running on non-CDNA architecture. Performance may be suboptimal.");
+        }
+        else {
+            // Ensure we're running on a supported CDNA architecture (including MI350)
+            TORCH_WARN_ONCE("Running on CDNA architecture");
+            }
+    #endif
 
     {%- if nobag and not is_index_select %}
     auto max_D = D;
@@ -921,19 +929,18 @@ Tensor {{ embedding_cuda_op }}(
             const auto grad_output_reshaped = aligned_grad_output;
             {%- endif %}
 
-            auto grad_output_accessor = MAKE_PTA_WITH_NAME(
-                "{{ embedding_cuda_op }}.1",
+            auto grad_output_accessor = PTA_B(
                 grad_output_reshaped,
-                grad_t, {{ "1" if is_index_select else "2" }},
+                grad_t,
+                {{ "1" if is_index_select else "2" }},
                 64
-            );
+            ).build("{{ embedding_cuda_op }}.1");
 
             {%- if not nobag %}
             Tensor grad_output_mean;
             if (static_cast<PoolingMode>(pooling_mode) == PoolingMode::MEAN) {
                 grad_output_mean = at::empty_like(grad_output_reshaped);
 
-                {%- if not dense or not vbe %}
                 FBGEMM_LAUNCH_KERNEL(
                     (grad_mean{{ vdesc }}_kernel<grad_t, index_t>),
                     div_round_up(total_B, kMaxThreads / kWarpSize),
@@ -953,9 +960,8 @@ Tensor {{ embedding_cuda_op }}(
                     FixedDivisor(total_B / T)
                     {%- endif %}
                 );
-                {%- endif %} // if not dense or not vbe
 
-                grad_output_accessor = MAKE_PTA_WITH_NAME("{{ embedding_cuda_op }}.2", grad_output_mean, grad_t, 2, 64);
+                grad_output_accessor = PTA_B(grad_output_mean, grad_t, 2, 64).build("{{ embedding_cuda_op }}.2");
             }
             {%- endif %}
 
@@ -1134,6 +1140,9 @@ Tensor {{ embedding_cuda_op }}(
                         {%- endif %}
                         gwd_lower_bound,
                         {%- endif %}
+                        {%- if ssd %}
+                        enable_optimizer_offloading,
+                        {%- endif %}
                         {%- if is_index_select %}
                         grad_offsets.packed_accessor32<int64_t, 1, at::RestrictPtrTraits>(),
                         permute_output_dim_0_1
@@ -1169,7 +1178,7 @@ Tensor {{ embedding_cuda_op }}(
                     int32_t num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
                     int32_t warp_per_row_smem_bytes = 0;
 
-                    if (kUseVecBlocking) {
+                    if constexpr (kUseVecBlocking) {
                       warp_per_row_smem_bytes = compute_num_groups_and_dynamic_smem_bytes(
                           &num_warp_per_row_groups,
                           // Use max_D to compute shmem_bytes (for smem_grad_sum)
@@ -1196,8 +1205,8 @@ Tensor {{ embedding_cuda_op }}(
 
                     const auto supported_weights_type = dev_weights.scalar_type() == at::ScalarType::Half
                                                       || dev_weights.scalar_type() == at::ScalarType::Float;
-
-                    if (use_hip_kernel && supported_weights_type && rocm::is_supported_cdna())
+                    std::cout<<use_hip_kernel <<" "<< supported_weights_type << " " << mixed_D << " " << rocm::is_supported_cdna() << std::endl;
+                    if (use_hip_kernel && supported_weights_type  && rocm::is_supported_cdna())
                     {
                         constexpr int segments_per_workgroup = 4;
                         {%- for kDimSize in [64, 128, 160, 192, 256] %}
@@ -1290,6 +1299,9 @@ Tensor {{ embedding_cuda_op }}(
                         {%- endif %}
                         gwd_lower_bound,
                         {%- endif %}
+                        {%- if ssd %}
+                        enable_optimizer_offloading,
+                        {%- endif %}
                         {%- if is_index_select %}
                         grad_offsets.packed_accessor32<int64_t, 1, at::RestrictPtrTraits>(),
                         permute_output_dim_0_1
@@ -1381,6 +1393,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
           {%- if not is_index_select and not dense %}
           "    bool use_uniq_cache_locations, "
           "    bool use_homogeneous_placements, "
+          {%- endif %}
+          {%- if ssd %}
+          "    bool enable_optimizer_offloading, "
           {%- endif %}
           {%- if is_gwd_kernel %}
           {%- if "prev_iter_dev" not in args.split_function_arg_names %}

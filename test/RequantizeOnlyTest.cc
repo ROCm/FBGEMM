@@ -8,21 +8,16 @@
 
 #include <algorithm>
 #include <functional>
-#include <iostream>
-#include <random>
-#include <stdexcept>
-#include <string>
 
 #include <gtest/gtest.h>
 
-#include "./TestUtils.h"
-#include "bench/BenchUtils.h"
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/Fbgemm.h"
 
 using namespace std;
 using namespace fbgemm;
 
-vector<QuantizationGranularity> qGranularityVals{
+static vector<QuantizationGranularity> qGranularityVals{
     QuantizationGranularity::TENSOR,
     QuantizationGranularity::OUT_CHANNEL};
 
@@ -35,7 +30,7 @@ class FloatRequantizeTest
 
 }; // namespace
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     FloatRequantizeTest,
     ::testing::Combine(
@@ -50,10 +45,7 @@ INSTANTIATE_TEST_CASE_P(
  * Test for float bias
  */
 TEST_P(FloatRequantizeTest, floatBiasTest) {
-  int rows, cols;
-  bool fuse_relu;
-  QuantizationGranularity q_gran;
-  tie(rows, cols, fuse_relu, q_gran) = GetParam();
+  auto [rows, cols, fuse_relu, q_gran] = GetParam();
 
   int numElements = rows * cols;
 

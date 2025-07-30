@@ -16,16 +16,16 @@
 #include <limits>
 #include <memory>
 #include <type_traits>
-#include "./ConvUtils.h"
-#include "./FbgemmBuild.h"
-#include "./FbgemmEmbedding.h"
-#include "./FbgemmI8DepthwiseAvx2.h"
-#include "./FbgemmI8DirectconvAvx2.h"
-#include "./FbgemmI8Spmdm.h"
-#include "./FloatConversion.h"
-#include "./QuantUtilsAvx2.h"
-#include "./Types.h"
-#include "./Utils.h"
+#include "./ConvUtils.h" // @manual
+#include "./FbgemmBuild.h" // @manual
+#include "./FbgemmEmbedding.h" // @manual
+#include "./FbgemmI8DepthwiseAvx2.h" // @manual
+#include "./FbgemmI8DirectconvAvx2.h" // @manual
+#include "./FbgemmI8Spmdm.h" // @manual
+#include "./FloatConversion.h" // @manual
+#include "./QuantUtilsAvx2.h" // @manual
+#include "./Types.h" // @manual
+#include "./Utils.h" // @manual
 
 // Turning on this option will print out time breakdown of each stage (e.g.,
 // input packing, the main GEMM kernel, each output processing pipeline).
@@ -62,7 +62,7 @@ template <
 struct PackingTraits;
 
 // type specialized implementation in an include file
-#include "./PackingTraits-inl.h"
+#include "./PackingTraits-inl.h" // @manual
 
 /**
  * @brief Base class for packing matrices for higher GEMM performance.
@@ -79,9 +79,9 @@ class PackMatrix {
  public:
   PackMatrix() = delete; // no default constructor
   PackMatrix(const PackMatrix&) = delete; // no copy
-  PackMatrix& operator==(const PackMatrix&) = delete; // no copy
+  PackMatrix& operator=(const PackMatrix&) = delete; // no copy
   PackMatrix(PackMatrix&&) = delete; // no move
-  PackMatrix& operator==(PackMatrix&& rhs) noexcept = delete; // no move
+  PackMatrix& operator=(PackMatrix&& rhs) noexcept = delete; // no move
 
   /**
    * @param rows total number of rows in the matrix
@@ -123,7 +123,7 @@ class PackMatrix {
    * @return true if this is the first input matrix in GEMM (i.e., A in C = A *
    *         B)
    */
-  static constexpr bool isA() {
+  static bool isA() {
     return PT::isA();
   }
 
@@ -247,7 +247,7 @@ class PackMatrix {
   /**
    * @brief Print the packed block.
    */
-  void printPackedMatrix(std::string name) {
+  void printPackedMatrix(const std::string& name) {
     static_cast<PT*>(this)->printPackedMatrix(name);
   }
 
@@ -379,7 +379,7 @@ class FBGEMM_API PackAMatrix final
   /**
    * @brief Print the packed block.
    */
-  void printPackedMatrix(std::string name);
+  void printPackedMatrix(const std::string& name);
 
  private:
   matrix_op_t trans_;
@@ -464,7 +464,7 @@ class FBGEMM_API PackBMatrix final
    * @brief Print the packed block.
    */
   void printPackedMatrix(
-      std::string name,
+      const std::string& name,
       const BlockingFactors* params = nullptr);
 
   /**
@@ -482,7 +482,7 @@ class FBGEMM_API PackBMatrix final
    */
   void unpack(T* origin_buf, const BlockingFactors* params = nullptr);
 
-  ~PackBMatrix() {}
+  ~PackBMatrix() override = default;
 
  private:
   matrix_op_t trans_;
@@ -515,11 +515,11 @@ class FBGEMM_API PackWeightMatrixForGConv {
 
   PackWeightMatrixForGConv() = delete; // no default constructor
   PackWeightMatrixForGConv(const PackWeightMatrixForGConv&) = delete; // no copy
-  PackWeightMatrixForGConv& operator==(const PackWeightMatrixForGConv&) =
+  PackWeightMatrixForGConv& operator=(const PackWeightMatrixForGConv&) =
       delete; // no copy
 
   PackWeightMatrixForGConv(PackWeightMatrixForGConv&&) = delete; // no move
-  PackWeightMatrixForGConv& operator==(PackWeightMatrixForGConv&&) =
+  PackWeightMatrixForGConv& operator=(PackWeightMatrixForGConv&&) =
       delete; // no move
 
   /**
@@ -715,6 +715,11 @@ class FBGEMM_API PackAWithIm2Col
       bool b_symmetric = false,
       const BlockingFactors* params = nullptr);
 
+  PackAWithIm2Col(const PackAWithIm2Col&) = delete;
+  PackAWithIm2Col(PackAWithIm2Col&&) = delete;
+  PackAWithIm2Col& operator=(const PackAWithIm2Col&) = delete;
+  PackAWithIm2Col& operator=(PackAWithIm2Col&&) = delete;
+
   /**
    * Activation matrices are not constant so cannot amortize the cost of
    * pre-packing.
@@ -745,14 +750,14 @@ class FBGEMM_API PackAWithIm2Col
   /**
    * @brief Print the packed block.
    */
-  void printPackedMatrix(std::string name);
+  void printPackedMatrix(const std::string& name);
 
   /**
    * @return Size of row offset buffer in number of elements
    */
   static int rowOffsetBufferSize(const BlockingFactors* params = nullptr);
 
-  ~PackAWithIm2Col() {
+  ~PackAWithIm2Col() override {
     if (rowOffsetAllocatedHere) {
       fbgemmAlignedFree(row_offset_);
     }
@@ -799,6 +804,11 @@ class FBGEMM_API PackAWithRowOffset final
       std::int32_t* row_offset = nullptr,
       const BlockingFactors* params = nullptr);
 
+  PackAWithRowOffset(const PackAWithRowOffset&) = delete;
+  PackAWithRowOffset(PackAWithRowOffset&&) = delete;
+  PackAWithRowOffset& operator=(const PackAWithRowOffset&) = delete;
+  PackAWithRowOffset& operator=(PackAWithRowOffset&&) = delete;
+
   /**
    * Activation matrices are not constant so cannot amortize the cost of
    * pre-packing.
@@ -835,14 +845,14 @@ class FBGEMM_API PackAWithRowOffset final
   /**
    * @brief Print the packed block.
    */
-  void printPackedMatrix(std::string name);
+  void printPackedMatrix(const std::string& name);
 
   /**
    * @return size of row offset buffer in number of elements
    */
   static int rowOffsetBufferSize(const BlockingFactors* params = nullptr);
 
-  ~PackAWithRowOffset() {
+  ~PackAWithRowOffset() override {
     if (rowOffsetAllocatedHere) {
       fbgemmAlignedFree(row_offset_);
     }
@@ -890,6 +900,10 @@ class FBGEMM_API PackAWithQuantRowOffset final
       int groups = 1,
       std::int32_t* row_offset = nullptr,
       const BlockingFactors* params = nullptr);
+  PackAWithQuantRowOffset(const PackAWithQuantRowOffset&) = delete;
+  PackAWithQuantRowOffset(PackAWithQuantRowOffset&&) = delete;
+  PackAWithQuantRowOffset& operator=(const PackAWithQuantRowOffset&) = delete;
+  PackAWithQuantRowOffset& operator=(PackAWithQuantRowOffset&&) = delete;
 
   /**
    * Activation matrices are not constant so cannot amortize the cost of
@@ -927,14 +941,14 @@ class FBGEMM_API PackAWithQuantRowOffset final
   /**
    * @brief Print the packed block.
    */
-  void printPackedMatrix(std::string name);
+  void printPackedMatrix(const std::string& name);
 
   /**
    * @return Size of row offset buffer in number of elements
    */
   static int rowOffsetBufferSize(const BlockingFactors* params = nullptr);
 
-  ~PackAWithQuantRowOffset() {
+  ~PackAWithQuantRowOffset() override {
     if (rowOffsetAllocatedHere) {
       fbgemmAlignedFree(row_offset_);
     }
@@ -967,7 +981,7 @@ class FBGEMM_API DoNothing {
  public:
   using outType = outT;
   using inpType = inT;
-  DoNothing() {}
+  DoNothing() = default;
   template <inst_set_t instSet>
   int f(
       outType* /* unused */,
@@ -1339,7 +1353,7 @@ class FBGEMM_API ReQuantizeForFloat {
 };
 
 // type specialized implementation in an include file
-#include "./OutputProcessing-inl.h"
+#include "./OutputProcessing-inl.h" // @manual
 
 /*
  *

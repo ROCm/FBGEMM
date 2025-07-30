@@ -39,6 +39,7 @@ prepare_fbgemm_gpu_build () {
   echo "[BUILD] Running git submodules update ..."
   (exec_with_retries 3 git submodule sync) || return 1
   (exec_with_retries 3 git submodule update --init --recursive) || return 1
+  echo "[BUILD] Successfully ran git submodules update"
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
@@ -54,7 +55,16 @@ prepare_fbgemm_gpu_build () {
   # shellcheck disable=SC2086
   (test_python_import_package "${env_name}" skbuild) || return 1
 
-  echo "[BUILD] Successfully ran git submodules update"
+  # shellcheck disable=SC2155,SC2086
+  local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
+
+  echo "[BUILD] Finding library paths ..."
+  # shellcheck disable=SC2061,SC2035
+  (find "${conda_prefix}" -name *omp.so* 2> /dev/null || true)
+  # shellcheck disable=SC2061,SC2035
+  (find "${conda_prefix}" -name *tbb.so* 2> /dev/null || true)
+  # shellcheck disable=SC2061,SC2035
+  (find "${conda_prefix}" -name *bolt.so* 2> /dev/null || true)
 }
 
 __configure_fbgemm_gpu_build_clang () {
@@ -119,7 +129,8 @@ __configure_fbgemm_gpu_build_nvcc () {
 
 __configure_fbgemm_gpu_cuda_home () {
   if  [[ "$BUILD_CUDA_VERSION" =~ ^12.6.*$ ]] ||
-      [[ "$BUILD_CUDA_VERSION" =~ ^12.8.*$ ]]; then
+      [[ "$BUILD_CUDA_VERSION" =~ ^12.8.*$ ]] ||
+      [[ "$BUILD_CUDA_VERSION" =~ ^12.9.*$ ]]; then
     # shellcheck disable=SC2155,SC2086
     local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
     local new_cuda_home="${conda_prefix}/targets/${MACHINE_NAME_LC}-linux"
@@ -156,42 +167,31 @@ __configure_fbgemm_gpu_build_docs () {
 __configure_fbgemm_gpu_build_rocm () {
   local fbgemm_variant_targets="$1"
 
-  # Fetch available ROCm architectures on the machine
+  # By default, we build for a limited number of target architectures to save on
+  # build time.  This list needs to be updated if the CI ROCm machines have
+  # different hardware.
+  #
+  # Target architecture mapping and ROCm compatibility table can be found at:
+  #   https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html
+  #   https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html
+
   if [ "$fbgemm_variant_targets" != "" ]; then
-    echo "[BUILD] ROCm targets have been manually provided: ${fbgemm_variant_targets}"
+    # If targets are manually supplied, override
+    echo "[BUILD] Using the user-supplied ROCm targets ..."
     local arch_list="${fbgemm_variant_targets}"
 
+  elif [ -n "${BUILD_FROM_NOVA+x}" ]; then
+    # If BUILD_FROM_NOVA is set (regardless of 0 or 1 - some steps in Nova have
+    # the value set to 0), we are building in Nova.  Nova machines take much
+    # longer time to build FBGEMM_GPU for ROCm, so we have to limit to just the
+    # latest model.
+    echo "[BUILD] Building in Nova environment, ignoring the provided PYTORCH_ROCM_ARCH list and limiting ROCm targets ..."
+    local arch_list="gfx942"
+
   else
-    if which rocminfo; then
-      # shellcheck disable=SC2155
-      local arch_list=$(rocminfo | grep -o -m 1 'gfx.*')
-      echo "[BUILD] Architectures list from rocminfo: ${arch_list}"
-
-      if [ "$arch_list" == "" ]; then
-        # It is possible to build FBGEMM_GPU-ROCm on a machine without AMD
-        # cards, in which case the arch_list will be empty.
-        echo "[BUILD] rocminfo did not return anything valid!"
-
-        # By default, we build for a limited number of architectures to save on
-        # build time.  This list needs to be updated if the CI ROCm machines
-        # have different hardware.
-        #
-        # Architecture mapping can be found at:
-        #   https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html
-        if [ -z "${BUILD_FROM_NOVA+x}" ]; then
-          # If BUILD_FROM_NOVA is unset, then we are building from AMD host with
-          # sufficient resources, so we can build for more architectures.
-          local arch_list="gfx908,gfx90a,gfx942"
-        else
-          # If BUILD_FROM_NOVA is set (regardless of 0 or 1), we are building in
-          # Nova.  Nova machines take a longer time to build FBGEMM_GPU for
-          # ROCm, so we limit to one architecture.
-          local arch_list="gfx942"
-        fi
-      fi
-    else
-      echo "[BUILD] rocminfo not found in PATH!"
-    fi
+    # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
+    # sufficient resources, so we can build for more AMD Instinct architectures.
+    local arch_list="gfx908,gfx90a,gfx942"
   fi
 
   echo "[BUILD] Setting the following ROCm targets: ${arch_list}"
@@ -250,20 +250,33 @@ __configure_fbgemm_gpu_build_cuda () {
     #   https://github.com/NVIDIA/nvbench/discussions/129
     #   https://github.com/vllm-project/vllm/blob/main/CMakeLists.txt#L187
     #   https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp#L224
-    if    [[ $cuda_version_nvcc == *"V12.8"* ]]; then
-      local arch_list="7.0;8.0;9.0;9.0a;10.0a;12.0a"
+
+    # NOTE: It turns out that the order of the arch_list matters, and that
+    # appending 7.0/7.5 to the back of the list mysteriously results in
+    # undefined symbol errors on .SO loads
+    if [[ $fbgemm_build_target == "hstu" ]]; then
+      # HSTU requires sm_75 or higher
+      local arch_list="7.5"
+    else
+      local arch_list="7.0"
+    fi
+
+    if    [[ $cuda_version_nvcc == *"V12.9"* ]] ||
+          [[ $cuda_version_nvcc == *"V12.8"* ]]; then
+      local arch_list="${arch_list};8.0;9.0a;10.0a;12.0a"
 
     elif  [[ $cuda_version_nvcc == *"V12.6"* ]] ||
           [[ $cuda_version_nvcc == *"V12.4"* ]] ||
           [[ $cuda_version_nvcc == *"V12.1"* ]]; then
-      local arch_list="7.0;8.0;9.0;9.0a"
+      local arch_list="${arch_list};8.0;9.0a"
 
     else
-      local arch_list="7.0;8.0"
+      local arch_list="${arch_list};8.0;9.0"
+      echo "[BUILD] Unknown NVCC version $cuda_version_nvcc - setting TORCH_CUDA_ARCH_LIST to: ${arch_list}"
     fi
   fi
-  echo "[BUILD] Setting the following CUDA targets: ${arch_list}"
 
+  echo "[BUILD] Setting the following CUDA targets: ${arch_list}"
   # Unset the environment-supplied TORCH_CUDA_ARCH_LIST because it will take
   # precedence over cmake -DTORCH_CUDA_ARCH_LIST
   unset TORCH_CUDA_ARCH_LIST
@@ -351,7 +364,7 @@ __configure_fbgemm_gpu_build () {
   if [ "$fbgemm_release_channel" != "release" ] || [ "$BUILD_DEBUG" -eq 1 ]; then
     echo "[BUILD] Enabling debug features in the build ..."
     build_args+=(
-      --debug
+      --debug=1
     )
   fi
 
@@ -392,6 +405,10 @@ __export_target_variant_info () {
       export fbgemm_build_variant="${fbgemm_build_target_variant_arr[1]}"
     fi
   fi
+
+  echo "[BUILD] BUILD_TARGET_VARIANT: ${fbgemm_build_target_variant}"
+  echo "[BUILD] Extracted build target: ${fbgemm_build_target}"
+  echo "[BUILD] Extracted build variant: ${fbgemm_build_variant}"
 }
 
 __build_fbgemm_gpu_set_python_tag () {
@@ -460,31 +477,29 @@ __build_fbgemm_gpu_common_pre_steps () {
   # Private function that uses variables instantiated by its caller
 
   # Check C/C++ compilers are visible (the build scripts look specifically for `gcc`)
-  (test_binpath "${env_name}" cc) || return 1
-  (test_binpath "${env_name}" gcc) || return 1
-  (test_binpath "${env_name}" c++) || return 1
-  (test_binpath "${env_name}" g++) || return 1
+  (test_binpath "${env_name}" cc)   || return 1
+  (test_binpath "${env_name}" gcc)  || return 1
+  (test_binpath "${env_name}" c++)  || return 1
+  (test_binpath "${env_name}" g++)  || return 1
 
   # Set the default the FBGEMM build variant to be default (i.e. FBGEMM_GPU)
-  if  [ "$fbgemm_build_target" != "genai" ] &&
-      [ "$fbgemm_build_target" != "default" ]; then
+  # shellcheck disable=SC2076
+  if [[ ! " genai hstu default " =~ " $fbgemm_build_target " ]]; then
     echo "################################################################################"
     echo "[BUILD] Unknown FBGEMM build TARGET: ${fbgemm_build_target}"
-    echo "[BUILD] Defaulting to 'default'"
+    echo "[BUILD] Exiting ..."
     echo "################################################################################"
-    export fbgemm_build_target="default"
+    return 1
   fi
 
   # Set the default the FBGEMM build variant to be CUDA
-  if  [ "$fbgemm_build_variant" != "docs" ] &&
-      [ "$fbgemm_build_variant" != "cpu" ] &&
-      [ "$fbgemm_build_variant" != "cuda" ] &&
-      [ "$fbgemm_build_variant" != "rocm" ]; then
+  # shellcheck disable=SC2076
+  if [[ ! " docs cpu cuda rocm " =~ " $fbgemm_build_variant " ]]; then
     echo "################################################################################"
     echo "[BUILD] Unknown FBGEMM build VARIANT: ${fbgemm_build_variant}"
-    echo "[BUILD] Defaulting to CUDA"
+    echo "[BUILD] Exiting ..."
     echo "################################################################################"
-    export fbgemm_build_variant="cuda"
+    return 1
   fi
 
   # Extract and set the Python tag
@@ -579,8 +594,19 @@ __verify_library_symbols () {
   # This is by no means an exhaustive set, and should be updated accordingly
   if [ "${fbgemm_build_target}" == "genai" ]; then
     local lib_symbols_to_check=(
-      fbgemm_gpu::car_init
+      # fbgemm_gpu::car_init
       fbgemm_gpu::per_tensor_quantize_i8
+    )
+
+    if  [ "${fbgemm_build_variant}" == "cuda" ]; then
+      lib_symbols_to_check+=(
+        fbgemm_gpu::car_init
+      )
+    fi
+
+  elif [ "${fbgemm_build_target}" == "hstu" ]; then
+    local lib_symbols_to_check=(
+      fbgemm_gpu::hstu::set_params_fprop
     )
 
   else
@@ -589,7 +615,7 @@ __verify_library_symbols () {
       fbgemm_gpu::jagged_2d_to_dense
     )
 
-    if  [ "${fbgemm_build_variant}" == "cuda" ] &&
+    if  [ "${fbgemm_build_variant}" == "cuda" ] ||
         [ "${fbgemm_build_variant}" == "rocm" ]; then
       lib_symbols_to_check+=(
         fbgemm_gpu::asynchronous_inclusive_cumsum_gpu
@@ -753,10 +779,9 @@ build_fbgemm_gpu_install () {
   # Parallelism may need to be limited to prevent the build from being
   # canceled for going over ulimits
   echo "[BUILD] Building + installing FBGEMM wheel (TARGET=${fbgemm_build_target}, VARIANT=${fbgemm_build_variant}) ..."
-  # shellcheck disable=SC2086
+  # shellcheck disable=SC2086,SC2145
   print_exec conda run --no-capture-output ${env_prefix} \
-    python setup.py "${run_multicore}" install \
-      "${build_args[@]}" || return 1
+    sh -c \"python setup.py "${run_multicore}" install "${build_args[@]}"\" || return 1
 
   # Run checks on the built libraries
   __run_fbgemm_gpu_postbuild_checks || return 1

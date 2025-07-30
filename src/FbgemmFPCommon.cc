@@ -11,7 +11,6 @@
 
 #include <array>
 #include <cmath>
-#include <utility>
 
 namespace fbgemm {
 
@@ -301,6 +300,7 @@ partition_array_t partition_sve128 = {
   }
 };
 
+#ifdef FBGEMM_ENABLE_KLEIDIAI
 partition_array_t partition_neon = {
   // NOTE: clang-format wants to use a different formatting but the current
   // formatting should be easier to read.
@@ -428,6 +428,7 @@ partition_array_t partition_neon = {
     {{ { 8, 15 }, { 0, 0 } } }, // 120
   }
 };
+#endif
 
 
 partition_array_t partition_avx512 = {

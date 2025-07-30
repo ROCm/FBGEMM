@@ -9,19 +9,33 @@
 
 import logging
 import unittest
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton  # noqa: F401
-from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import triton_quantize_fp8_row
-from fbgemm_gpu.experimental.gen_ai.moe import (
-    gather_scale_dense_tokens,
-    gather_scale_quant_dense_tokens,
-    open_source,
-    scatter_add_dense_tokens,
-    scatter_add_padded_tokens,
-)
+
+if torch.cuda.is_available():
+    from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
+        triton_quantize_fp8_row,
+    )
+    from fbgemm_gpu.experimental.gen_ai.moe import (
+        gather_scale_dense_tokens,
+        gather_scale_quant_dense_tokens,
+        scatter_add_dense_tokens,
+        scatter_add_padded_tokens,
+    )
+
 from hypothesis import given, settings, strategies as st, Verbosity
+
+try:
+    # @manual=//deeplearning/fbgemm/fbgemm_gpu:test_utils
+    from fbgemm_gpu import open_source
+
+    # @manual=//deeplearning/fbgemm/fbgemm_gpu:test_utils
+    from fbgemm_gpu.docs.version import __version__  # noqa: F401
+except Exception:
+    open_source: bool = False
+
 
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -40,8 +54,9 @@ class GatherScatterTests(unittest.TestCase):
 
     @given(
         E=st.sampled_from([2, 4, 8]),
-        T=st.sampled_from([1, 128, 2048, 4096, 16384]),
+        T=st.sampled_from([0, 1, 128, 2048, 4096, 16384]),
         D=st.sampled_from([5120, 7168]),
+        partial=st.sampled_from([True, False]),
         rowmajor=st.sampled_from([True, False]),
         compiled=st.sampled_from([True, False]),
     )
@@ -51,6 +66,7 @@ class GatherScatterTests(unittest.TestCase):
         E: int,
         T: int,
         D: int,
+        partial: bool,
         rowmajor: bool,
         compiled: bool,
     ) -> None:
@@ -61,6 +77,22 @@ class GatherScatterTests(unittest.TestCase):
         expert_indices: torch.Tensor = torch.randint(0, E, (T,), device="cuda")
         token_indices: torch.Tensor = torch.randperm(T, device="cuda").to(torch.int32)
         scores: torch.Tensor = torch.rand((E, T), dtype=torch.bfloat16, device="cuda")
+
+        num_valid_tokens: int = T
+        valid_token_count: Optional[torch.Tensor] = None
+        partial_expert_indices: torch.Tensor = expert_indices
+        partial_token_indices: torch.Tensor = token_indices
+        if partial:
+            num_valid_tokens = T // 2
+            valid_token_count = torch.tensor(
+                [num_valid_tokens], dtype=torch.int32, device="cuda"
+            )
+            partial_expert_indices = torch.where(
+                torch.arange(T).cuda() < num_valid_tokens, expert_indices, -1
+            )
+            partial_token_indices = torch.where(
+                torch.arange(T).cuda() < num_valid_tokens, token_indices, -1
+            )
 
         def torch_fn() -> torch.Tensor:
             shuffled_x = torch.index_select(x, dim=0, index=token_indices)
@@ -80,17 +112,26 @@ class GatherScatterTests(unittest.TestCase):
             op = gather_scale_dense_tokens
             if compiled:
                 op = torch.compile(op)
-            test_output = op(x, token_indices, expert_indices, scores_)
+            test_output = op(
+                x,
+                partial_token_indices,
+                partial_expert_indices,
+                scores_,
+                valid_token_count,
+            )
             return test_output
 
         test_output = triton_fn()
 
-        torch.testing.assert_close(torch_output, test_output)
+        torch.testing.assert_close(
+            torch_output[:num_valid_tokens], test_output[:num_valid_tokens]
+        )
 
     @given(
         E=st.sampled_from([2, 4, 8]),
         T=st.sampled_from([1, 128, 2048, 4096, 16384]),
         D=st.sampled_from([5120, 7168]),
+        partial=st.sampled_from([True, False]),
         rowmajor=st.sampled_from([True, False]),
         compiled=st.sampled_from([True, False]),
     )
@@ -100,6 +141,7 @@ class GatherScatterTests(unittest.TestCase):
         E: int,
         T: int,
         D: int,
+        partial: bool,
         rowmajor: bool,
         compiled: bool,
     ) -> None:
@@ -110,8 +152,23 @@ class GatherScatterTests(unittest.TestCase):
         expert_indices: torch.Tensor = torch.randint(0, E, (T,), device="cuda")
         token_indices: torch.Tensor = torch.randperm(T, device="cuda").to(torch.int32)
         scores: torch.Tensor = torch.randn((E, T), dtype=torch.bfloat16, device="cuda")
-
         scale_ub = torch.tensor([1200], dtype=torch.float, device="cuda")
+
+        num_valid_tokens: int = T
+        valid_token_count: Optional[torch.Tensor] = None
+        partial_expert_indices: torch.Tensor = expert_indices
+        partial_token_indices: torch.Tensor = token_indices
+        if partial:
+            num_valid_tokens = T // 2
+            valid_token_count = torch.tensor(
+                [num_valid_tokens], dtype=torch.int32, device="cuda"
+            )
+            partial_expert_indices = torch.where(
+                torch.arange(T).cuda() < num_valid_tokens, expert_indices, -1
+            )
+            partial_token_indices = torch.where(
+                torch.arange(T).cuda() < num_valid_tokens, token_indices, -1
+            )
 
         def torch_fn() -> Tuple[torch.Tensor, torch.Tensor]:
             shuffled_x = torch.index_select(x, dim=0, index=token_indices)
@@ -140,18 +197,29 @@ class GatherScatterTests(unittest.TestCase):
             if compiled:
                 op = torch.compile(op)
             test_output_q, test_output_scales = op(
-                x, token_indices, expert_indices, scores_, scale_ub
+                x,
+                partial_token_indices,
+                partial_expert_indices,
+                scores_,
+                scale_ub,
+                valid_token_count,
             )
             return test_output_q, test_output_scales
 
         test_output_q, test_output_scales = triton_fn()
         test_output = test_output_q.to(torch.float32) * test_output_scales.view(-1, 1)
 
-        torch.testing.assert_close(torch_output, test_output, atol=1e-3, rtol=1.6e-2)
+        torch.testing.assert_close(
+            torch_output[:num_valid_tokens],
+            test_output[:num_valid_tokens],
+            atol=1e-3,
+            rtol=1.6e-2,
+        )
 
     @given(
         num_tokens=st.sampled_from([1, 128, 2048, 4096, 16384]),
         dim=st.sampled_from([5120]),
+        partial=st.sampled_from([True, False]),
         compiled=st.sampled_from([True, False]),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
@@ -159,6 +227,7 @@ class GatherScatterTests(unittest.TestCase):
         self,
         num_tokens: int,
         dim: int,
+        partial: bool,
         compiled: bool,
     ) -> None:
         torch.manual_seed(0)
@@ -174,6 +243,18 @@ class GatherScatterTests(unittest.TestCase):
             torch.int32
         )
 
+        num_valid_tokens: int = num_tokens
+        valid_token_count: Optional[torch.Tensor] = None
+        partial_token_indices: torch.Tensor = token_indices
+        if partial:
+            num_valid_tokens = num_tokens // 2
+            valid_token_count = torch.tensor(
+                [num_valid_tokens], dtype=torch.int32, device="cuda"
+            )
+            partial_token_indices = torch.where(
+                torch.arange(num_tokens).cuda() < num_valid_tokens, token_indices, -1
+            )
+
         test_out_tokens: torch.Tensor = out_tokens.clone()
         ref_out_tokens: torch.Tensor = out_tokens.clone()
 
@@ -184,12 +265,13 @@ class GatherScatterTests(unittest.TestCase):
             op(
                 test_out_tokens,
                 in_tokens,
-                token_indices,
+                partial_token_indices,
+                valid_token_count,
             )
 
         fn()
 
-        token_indices: torch.Tensor = token_indices.to(torch.int64)
+        token_indices: torch.Tensor = token_indices[:num_valid_tokens].to(torch.int64)
 
         def ref_fn() -> None:
             ref_out_tokens.scatter_add_(
@@ -201,7 +283,10 @@ class GatherScatterTests(unittest.TestCase):
         ref_fn()
 
         torch.testing.assert_close(
-            test_out_tokens, ref_out_tokens, atol=1e-3, rtol=1.6e-2
+            test_out_tokens[:num_valid_tokens],
+            ref_out_tokens[:num_valid_tokens],
+            atol=1e-3,
+            rtol=1.6e-2,
         )
 
     @given(

@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-unsafe
+import functools
 import logging
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -28,6 +30,8 @@ from triton.runtime.jit import reinterpret as tl_reinterpret, TensorWrapper  # @
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+running_on_github: bool = os.getenv("GITHUB_ENV") is not None
+
 try:
     # pyre-ignore[21]
     from triton.fb.compat import disable_bufferops  # @manual
@@ -42,6 +46,26 @@ except ModuleNotFoundError:
         yield None
 
 
+@functools.lru_cache
+def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
+    if torch.version.hip:
+        device_capability = torch.cuda.get_device_capability()
+
+        if device_capability < (9, 4):
+            gpu_arch = torch.cuda.get_device_properties("cuda").gcnArchName
+            msg = f"Unsupported GPU arch: {gpu_arch} for FP8"
+            if throw_on_hip_incompatibility:
+                raise RuntimeError(msg)
+            else:
+                logging.error(msg)
+                return False
+
+        elif device_capability == (9, 4):
+            return True
+
+    return False
+
+
 def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
     """
     Helper function to get constant values for the current platform.
@@ -52,12 +76,13 @@ def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
         max_fp8 (float): The maximum reprsentable value for the fp8 datatype.
         eps (float): Minimum clip value to prevent divide by zero.
     """
-    if torch.version.hip is not None:
+    if supports_float8_fnuz(throw_on_hip_incompatibility=(not running_on_github)):
         pt_fp8_dtype = torch.float8_e4m3fnuz
         tl_fp8_dtype = tl.float8e4b8
     else:
         pt_fp8_dtype = torch.float8_e4m3fn
         tl_fp8_dtype = tl.float8e4nv
+
     return pt_fp8_dtype, tl_fp8_dtype, torch.finfo(pt_fp8_dtype).max, 1e-12
 
 
@@ -254,6 +279,7 @@ def _kernel_matmul_fp8_row(
     dot_out_dtype: tl.constexpr,
     allow_tf32: tl.constexpr,
     fp8_fast_accum: tl.constexpr,
+    skip_scaling_a: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -296,7 +322,7 @@ def _kernel_matmul_fp8_row(
         SPLIT_K (int): Number of SM's to launch per row.
         USE_BIAS (bool): Whether to use bias.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     # Matrix multiplication.
     start_pid = tl.program_id(axis=0)
@@ -354,11 +380,15 @@ def _kernel_matmul_fp8_row(
             rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
             # Invert scaling.
-            a_scale = tl.load(A_scale + rm, mask=rm < M)
             b_scale = tl.load(B_scale + rn, mask=rn < N)
-            # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
-            scale = a_scale[:, None] * b_scale[None, :]
-            acc *= scale
+            if skip_scaling_a:
+                acc *= b_scale[None, :]
+            else:
+                a_scale = tl.load(A_scale + rm, mask=rm < M)
+                # pyre-ignore[16]: Undefined attribute [16]: `float`
+                # has no attribute `__getitem__`.
+                scale = a_scale[:, None] * b_scale[None, :]
+                acc *= scale
 
             # Load and add bias if specified.
             if USE_BIAS:
@@ -459,7 +489,7 @@ def _kernel_matmul_fp8_row_no_fast_acc(
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
         USE_BIAS(bool): Whether to use bias.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     # Matrix multiplication.
 
@@ -615,7 +645,7 @@ def _kernel_matmul_fp8_row_imprecise_acc(
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
         USE_BIAS (bool): Whether to use bias.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     # Matrix multiplication.
     pid = tl.program_id(0)
@@ -810,7 +840,7 @@ def _kernel_matmul_fp8_row_tma_persistent(
         GROUP_M (int): Number of groups for M dimension swizzle.
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     # Matrix multiplication.
     start_pid = tl.program_id(axis=0)
@@ -1050,7 +1080,7 @@ def _kernel_matmul_fp8_row_tma_persistent_ws_cooperative(
         GROUP_M (int): Number of groups for M dimension swizzle.
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     num_tiles = tl.cdiv(M, BLOCK_M) * tl.cdiv(N, BLOCK_N)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -1119,11 +1149,31 @@ def _kernel_matmul_fp8_row_tma_persistent_ws_cooperative(
             tl._experimental_descriptor_store(C_ptr, acc, [offs_am, offs_bn])
 
 
+def _is_eligible_for_skip_scaling(
+    is_rowwise: bool,
+    fp8_fast_accum: bool,
+    imprecise_acc: bool,
+    tma_persistent: bool,
+    no_use_persistent: Optional[bool],
+    use_warp_specialization: bool,
+) -> bool:
+    if not is_rowwise:
+        return False
+
+    return (
+        fp8_fast_accum
+        and not imprecise_acc
+        and not tma_persistent
+        and not no_use_persistent
+        and not use_warp_specialization
+    )
+
+
 @torch._library.triton_op("triton::matmul_fp8_row", mutates_args=())
 def matmul_fp8_row(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_scale: torch.Tensor,
+    a_scale: Optional[torch.Tensor],
     b_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     dot_out_dtype: Optional[torch.dtype] = None,
@@ -1131,7 +1181,7 @@ def matmul_fp8_row(
     fp8_fast_accum: bool = True,
     imprecise_acc: bool = False,
     tma_persistent: bool = True,
-    no_use_persistent: bool = False,
+    no_use_persistent: Optional[bool] = None,
     use_warp_specialization: bool = False,
 ) -> torch.Tensor:
     """
@@ -1140,7 +1190,8 @@ def matmul_fp8_row(
     Args:
         a (torch.Tensor): [M, K] input tensor.
         b (torch.Tensor): [N, K] input tensor.
-        a_scale (torch.Tensor): [M] reciprocal scale tensor per row. A * a_scale = original A
+        a_scale (Optiona;[torch.Tensor]): [M] reciprocal scale tensor per row.
+            A * a_scale = original A. Scaling will be skiped if a_scale is None.
         b_scale (torch.Tensor): [N] reciprocal scale tensor per row. B * b_scale = original B
         bias (torch.Tensor): [N] optional bias tensor to add to output if provided.
         dot_out_dtype (torch.dtype): Output type of tensor core.
@@ -1151,6 +1202,12 @@ def matmul_fp8_row(
     Returns:
         torch.Tensor: [M, N] Output tensor a @ b / (a_scale[:, None] * b_scale[None, :])
     """
+    if no_use_persistent is None:
+        # Default True for AMD and False for Nvidia.
+        if torch.version.hip is not None:
+            no_use_persistent = True
+        else:
+            no_use_persistent = False
     # Get datatypes and constants to use.
     pt_fp8_dtype, _, _, _ = get_fp8_constants()
     # Handle 3D+ a shape
@@ -1166,6 +1223,16 @@ def matmul_fp8_row(
         prep_matmul(a, b, dot_out_dtype)
     )
 
+    # Skip scaling (a_scale is None) can only be applied in certain cases.
+    assert a_scale is not None or _is_eligible_for_skip_scaling(
+        is_rowwise=True,
+        fp8_fast_accum=fp8_fast_accum,
+        imprecise_acc=imprecise_acc,
+        tma_persistent=tma_persistent,
+        no_use_persistent=no_use_persistent,
+        use_warp_specialization=use_warp_specialization,
+    )
+
     output_shape = a_shape[:-1] + (N,)
     # Handle tensor with empty inputs.
     if (M == 0) or (N == 0) or (K == 0):
@@ -1175,9 +1242,11 @@ def matmul_fp8_row(
         logger.info(
             "FP8 Row-wise Triton kernel not supported on cpu, fallback to torch"
         )
-        output = torch.matmul(a.to(torch.bfloat16), b.to(torch.bfloat16).T) * (
-            a_scale[:, None] * b_scale[None, :]
-        )
+        if a_scale is None:
+            scale = b_scale[None, :]
+        else:
+            scale = a_scale[:, None] * b_scale[None, :]
+        output = torch.matmul(a.to(torch.bfloat16), b.to(torch.bfloat16).T) * scale
         if bias is not None:
             output += bias[None, :]
         return output.to(c.dtype)
@@ -1200,8 +1269,6 @@ def matmul_fp8_row(
 
     if no_use_persistent:
         logger.info("Using non-persistent kernel")
-        if bias is not None:
-            raise AssertionError("bias is not supported in non-persistent kernel")
         # pyre-ignore
         torch._library.capture_triton(_kernel_matmul_fp8_row_non_persistent)[grid](
             a,
@@ -1215,7 +1282,7 @@ def matmul_fp8_row(
             k_key,
             a_scale,
             b_scale,
-            # bias,
+            bias,
             a.stride(0),
             a.stride(1),
             b.stride(0),
@@ -1226,7 +1293,7 @@ def matmul_fp8_row(
             allow_tf32=allow_tf32,
             fp8_fast_accum=fp8_fast_accum,
             # GROUP_M=8,
-            # USE_BIAS=bias is not None,
+            USE_BIAS=bias is not None,
             AB_DTYPE=False,
         )
     elif use_warp_specialization:
@@ -1482,6 +1549,7 @@ def matmul_fp8_row(
             AB_DTYPE=False,
         )
     elif fp8_fast_accum:
+        skip_scaling_a = a_scale is None
         torch._library.capture_triton(_kernel_matmul_fp8_row)[persistent_grid](
             a,
             b,
@@ -1504,6 +1572,7 @@ def matmul_fp8_row(
             dot_out_dtype=dot_out_dtype_triton,
             allow_tf32=allow_tf32,
             fp8_fast_accum=fp8_fast_accum,
+            skip_scaling_a=skip_scaling_a,
             GROUP_M=8,
             USE_BIAS=bias is not None,
             AB_DTYPE=False,
@@ -1546,14 +1615,16 @@ def matmul_fp8_row(
 def matmul_fp8_row_meta(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_scale: torch.Tensor,
+    a_scale: Optional[torch.Tensor],
     b_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     dot_out_dtype: Optional[torch.dtype] = None,
     allow_tf32: bool = True,
     fp8_fast_accum: bool = True,
     imprecise_acc: bool = False,
-    tma_persistent: bool = False,
+    tma_persistent: bool = True,
+    no_use_persistent: Optional[bool] = None,
+    use_warp_specialization: bool = False,
 ) -> torch.Tensor:
     """Shape function for torch compile."""
     M, K = a.shape
@@ -1673,7 +1744,7 @@ def _kernel_matmul_fp8_block_fastacc(
         GROUP_M (int): Number of groups for M dimension swizzle.
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     assert BLOCK_M < scale_block_m
     assert BLOCK_N < scale_block_n
@@ -1869,7 +1940,7 @@ def _kernel_matmul_fp8_block_slowacc(
         GROUP_M (int): Number of groups for M dimension swizzle.
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     assert BLOCK_M < scale_block_m
     assert BLOCK_N < scale_block_n
@@ -2950,6 +3021,7 @@ def _kernel_quantize_fp8_block(
     CLAMP_MAX: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    K_MAJOR: tl.constexpr,
 ) -> None:
     """Quantize and scale each [BLOCK_M, BLOCK_K] block.
 
@@ -2979,6 +3051,7 @@ def _kernel_quantize_fp8_block(
         CLAMP_MAX (bool): Whether to apply scale_ub.
         BLOCK_M (int): Block size for M dimension of A_scale and kernel.
         BLOCK_K (int): Block size for K dimension of A_scale and kernel.
+        K_MAJOR (bool): Whether output scales should be K major (True) or MN major (False).
     """
     pid = tl.program_id(0)
     grid_k = tl.cdiv(K, BLOCK_K)
@@ -3000,9 +3073,12 @@ def _kernel_quantize_fp8_block(
         block_max = tl.maximum(block_max, EPS)
     scale = MAX_FP8 / block_max
 
-    tl.store(
-        A_scale + block_m * stride_a_scale_m + block_k * stride_a_scale_k, 1.0 / scale
-    )
+    # Write in transposed order if specified.
+    if K_MAJOR:
+        scale_offset = block_m * stride_a_scale_m + block_k * stride_a_scale_k
+    else:
+        scale_offset = block_k * stride_a_scale_m + block_m * stride_a_scale_k
+    tl.store(A_scale + scale_offset, 1.0 / scale)
     a_fp8 = a_block * scale
     # Clamp A to fp8 range to make sure there's no overflow.
     # This is required for AMD. Nvidia's default saturation
@@ -3017,6 +3093,7 @@ def triton_quantize_fp8_block(
     block_m: int = 256,
     block_k: int = 256,
     scale_ub: Optional[torch.Tensor] = None,
+    k_major: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with block-wise scalings.
@@ -3028,10 +3105,12 @@ def triton_quantize_fp8_block(
         block_m (int): Block size for M dimension of scale.
         block_k (int): Block size for K dimension of scale.
         scale_ub: Maximum allowed value for scale.
+        k_major (bool): Whether output scales should be K major (True) or MN major (False).
 
     Returns:
         torch.Tensor : [M, K] fp8 scaled tensor.
-        torch.Tensor: [cdiv(M, block_m), cdiv(K, block_k)] reciprocal scale tensor per block.
+        torch.Tensor: [cdiv(M, block_m), cdiv(K, block_k)] reciprocal scale tensor per block
+        if k_major is True, otherwise [cdiv(K, block_k), cdiv(M, block_M)].
     """
     assert x.device != torch.device(
         "cpu"
@@ -3043,7 +3122,10 @@ def triton_quantize_fp8_block(
     M, K = x.shape
     grid_m = triton.cdiv(M, block_m)
     grid_k = triton.cdiv(K, block_k)
-    x_scale = torch.ones((grid_m, grid_k), device=x.device, dtype=torch.float32)
+    if k_major:
+        x_scale = torch.empty((grid_m, grid_k), device=x.device, dtype=torch.float32)
+    else:
+        x_scale = torch.empty((grid_k, grid_m), device=x.device, dtype=torch.float32)
     x_fp8 = torch.empty((M, K), device=x.device, dtype=pt_dtype)
 
     _kernel_quantize_fp8_block[(grid_m * grid_k,)](
@@ -3071,6 +3153,8 @@ def triton_quantize_fp8_block(
         BLOCK_M=block_m,
         # pyre-ignore[6]: Incompatible parameter type [6]
         BLOCK_K=block_k,
+        # pyre-ignore[6]: Incompatible parameter type [6]
+        K_MAJOR=k_major,
     )
 
     return x_fp8.view(x_shape), x_scale
@@ -3083,6 +3167,7 @@ def quantize_fp8_block(
     scale_ub: Optional[torch.Tensor] = None,
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
+    k_major: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to fp8 with block-wise scalings and optionally move to output device.
@@ -3096,10 +3181,12 @@ def quantize_fp8_block(
         scale_ub: Maximum allowed value for scale.
         use_triton (bool): Whether to use triton kernel or pytorch.
         output_device (torch.device): Device to optionally move the scaled tensors to.
+        k_major (bool): Whether output scales should be K major (True) or MN major (False).
 
     Returns:
         torch.Tensor: [M, K] fp8 scaled tensor.
-        torch.Tensor: [cdiv(M, block_m), cdiv(K, block_k)] reciprocal scale tensor per block.
+        torch.Tensor: [cdiv(M, block_m), cdiv(K, block_k)] reciprocal scale tensor per block
+        if k_major is True, otherwise [cdiv(K, block_k), cdiv(M, block_M)].
     """
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
@@ -3107,7 +3194,7 @@ def quantize_fp8_block(
         logger.info("Triton does not support cpu, falling back to torch ops.")
         use_triton = False
     if use_triton:
-        xq, x_scale = triton_quantize_fp8_block(x, block_m, block_k, scale_ub)
+        xq, x_scale = triton_quantize_fp8_block(x, block_m, block_k, scale_ub, k_major)
         return xq.view(x_shape), x_scale
     # else use pytorch implementation.
     if not output_device:
@@ -3135,7 +3222,6 @@ def quantize_fp8_block(
     if scale_ub is not None:
         block_max = torch.clamp(block_max, min=eps, max=scale_ub.item())
     else:
-        # pyre-ignore[6]: Incompatible parameter type [6]
         block_max = torch.clamp(block_max, min=eps)
     x_scale = torch.empty((grid_m, grid_k), dtype=torch.float32, device=output_device)
     x_scale = max_fp8 / block_max.to(torch.float32)  # pyre-ignore
@@ -3151,11 +3237,342 @@ def quantize_fp8_block(
     x_fp8 = x_fp8.to(device=output_device, dtype=pt_dtype)
     x_scale = x_scale.to(output_device)  # pyre-ignore
     del x, x_padded
+    if not k_major:
+        x_scale = x_scale.t().contiguous()
+    return x_fp8.view(x_shape), 1 / x_scale  # pyre-ignore
+
+
+@triton.autotune(
+    configs=[
+        Config({"GROUP_LOAD": 2}),
+        Config({"GROUP_LOAD": 4}),
+        Config({"GROUP_LOAD": 8}),
+        Config({"GROUP_LOAD": 16}),
+        Config({"GROUP_LOAD": 32}),
+    ],
+    key=["K"],
+)
+@triton.jit
+def _kernel_quantize_fp8_group(
+    A,
+    A_scale,
+    A_fp8,
+    scale_ub,
+    m_sizes,
+    M,
+    K,
+    stride_am,
+    stride_ak,
+    stride_om,
+    stride_ok,
+    stride_a_scale_m,
+    stride_a_scale_k,
+    TL_FP8_DTYPE: tl.constexpr,
+    MAX_FP8: tl.constexpr,
+    EPS: tl.constexpr,
+    CLAMP_MAX: tl.constexpr,
+    USE_INT64: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    USE_M_MAJOR: tl.constexpr,
+    G: tl.constexpr,
+    GROUP_LOAD: tl.constexpr,
+):
+    """Quantize and scale each GROUP_SIZE chunk of each row.
+
+    Scale per group i is computed as 1 / (MAX_FP8 / max(abs(A[i:i+GROUP_SIZE])))
+
+    Each kernel thread is responsible for one row and loads and processes a tunable
+    number of groups at once.
+
+    Args:
+        A (Tensor): [M, K] higher precision input tensor.
+        A_scale (Tensor): [M, cdiv(K, GROUP_SIZE)] reciprocal scale tensor per group.
+        A_fp8 (Tensor): [M, K] fp8 scaled tensor. A_fp8 = A * a
+        scale_ub (Tensor): [1] Maximum allowed value for scale.
+        m_sizes (Optional[Tensor]): [G] Number of rows in each group.
+        M (int): Number of rows.
+        K (int): Number of columns.
+        stride_am (int): Stride of m dimension of A.
+        stride_ak (int): Stride of k dimension of A.
+        stride_om (int): Stride of m dimension of output.
+        stride_ok (int): Stride of k dimension of output.
+        stride_a_scale_m (int): Stride of m dimension of A_scale.
+        stride_a_scale_k (int): Stride of k dimension of A_scale.
+        TL_FP8_DTYPE (tl.dtype): Target fp8 datatype.
+        MAX_FP8 (float): Maxmimum expressible value for FP8.
+        EPS (float): Epsilon value for numerical stability.
+        CLAMP_MAX (bool): Whether to apply scale_ub.
+        USE_INT64 (bool): Whether to index using int64, which may be needed for large tensors.
+        GROUP_SIZE (int): Group size for K dimension of A_scale and kernel.
+        USE_M_MAJOR (bool): Whether to use grouped M-major layout for A_scale.
+        G (int): Number of groups in A_scale, only relevant when m_sizes is provided.
+        GROUP_LOAD (int): Number of groups to load and process simultaneously.
+    """
+    pid = tl.program_id(0)
+    if USE_INT64:
+        pid = pid.to(tl.int64)
+    # We load group_size * group_load chunks at a time.
+    row_offset = pid * stride_am
+    out_offset = pid * stride_om
+    scale_row_offset = pid * stride_a_scale_m
+    k_offset = tl.arange(0, GROUP_LOAD * GROUP_SIZE)
+    scale_k_offset = tl.arange(0, GROUP_LOAD)
+    NUM_GROUPS: tl.constexpr = K // GROUP_SIZE
+
+    # When dealing with an M-major grouped gemm, we need to figure out
+    # which group this thread corresponds to and figure out the corresponding
+    # scale offset.
+    group_offset = 0
+    group_cumsum = 0
+    group_M = 0
+    stop = False
+    if USE_M_MAJOR and G > 0:
+        # Iterate over groups to both compute the cumulative sum and find which group we are in.
+        for i in range(G):
+            if not stop:
+                group_M = tl.cast(tl.load(m_sizes + i), pid.dtype)
+                if (group_cumsum + group_M) <= pid:
+                    group_cumsum += group_M
+                else:
+                    # Indicate we are finished computing cumsum.
+                    stop = True
+
+        group_offset = group_cumsum * NUM_GROUPS
+
+    for k in range(0, tl.cdiv(K, (GROUP_LOAD * GROUP_SIZE))):
+        # Load groups of the input.
+        chunk_offset = k_offset + k * GROUP_LOAD * GROUP_SIZE
+        a = tl.load(
+            A + row_offset + chunk_offset * stride_ak, mask=chunk_offset < K, other=0.0
+        )
+        # View loaded chunk as a set of groups.
+        a_grouped = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE])
+        # Reduce over groups.
+        group_max = tl.max(tl.abs(a_grouped), axis=1)
+        # Apply clamping if specified.
+        if CLAMP_MAX:
+            ub = tl.load(scale_ub)
+            group_max = tl.clamp(group_max, EPS, ub)
+        else:
+            group_max = tl.maximum(group_max, EPS)
+        # Scale and quantize.
+        a_scale = MAX_FP8 / group_max
+        scale_chunk_offset = scale_k_offset + k * GROUP_LOAD
+
+        if USE_M_MAJOR and G > 0:
+            tl.store(
+                A_scale
+                + group_offset
+                + (pid - group_cumsum) * stride_a_scale_k
+                + (scale_chunk_offset * group_M),
+                1.0 / a_scale,
+                mask=scale_chunk_offset < NUM_GROUPS,
+            )
+        else:
+            if USE_M_MAJOR:
+                tl.store(
+                    A_scale
+                    + pid * stride_a_scale_k
+                    + scale_chunk_offset * stride_a_scale_m,
+                    1.0 / a_scale,
+                    mask=scale_chunk_offset < NUM_GROUPS,
+                )
+            else:
+                tl.store(
+                    A_scale + scale_row_offset + scale_chunk_offset * stride_a_scale_k,
+                    1.0 / a_scale,
+                    mask=scale_chunk_offset < NUM_GROUPS,
+                )
+        # Apply scale to input.
+        a_fp8 = a_grouped * a_scale[:, None]
+        # Clamp to FP8 range to avoid overflow
+        a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
+        # Write to output.
+        tl.store(
+            A_fp8 + out_offset + chunk_offset * stride_ok,
+            tl.ravel(a_fp8),
+            mask=chunk_offset < K,
+        )
+
+
+def triton_quantize_fp8_group(
+    x: torch.Tensor,
+    group_size: int = 128,
+    scale_ub: Optional[torch.Tensor] = None,
+    m_sizes: Optional[torch.Tensor] = None,
+    k_major: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to fp8 with group-wise scalings.
+
+    Scale per group i is computed as 1 / (MAX_FP8 / max(abs(x[i:i+group_size])))
+
+    Args:
+        x (torch.Tensor): [M, K] higher precision input tensor.
+        group_size (int): Group size for M dimension of scale.
+        scale_ub: Maximum allowed value for scale.
+        m_sizes: Optional input for grouped gemm to specify the number of rows in each group.
+        k_major (bool): Whether output scales should be K major (True) or MN major (False).
+
+    Returns:
+        torch.Tensor: [M, K] fp8 scaled tensor.
+        torch.Tensor: [M, cdiv(K, group_size)] reciprocal scale tensor per group.
+    """
+    assert x.device != torch.device(
+        "cpu"
+    ), "Triton groupwise quantization not supported on cpu."
+    x_shape = x.shape
+    x = x.view(-1, x.size(-1))
+    pt_dtype, tl_dtype, max_fp8, eps = get_fp8_constants()
+    M, K = x.shape
+    k_groups = triton.cdiv(K, group_size)
+    if k_major:
+        x_scale = torch.empty((M, k_groups), device=x.device, dtype=torch.float32)
+    else:
+        x_scale = torch.empty((k_groups, M), device=x.device, dtype=torch.float32)
+    x_fp8 = torch.empty((M, K), device=x.device, dtype=pt_dtype)
+    _kernel_quantize_fp8_group[(M,)](
+        x,
+        x_scale,
+        x_fp8,
+        scale_ub,
+        m_sizes,
+        M,
+        K,
+        x.stride(0),
+        x.stride(1),
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        TL_FP8_DTYPE=tl_dtype,
+        MAX_FP8=max_fp8,
+        EPS=eps,
+        CLAMP_MAX=scale_ub is not None,
+        USE_INT64=x.numel() > (2**32 - 1),
+        GROUP_SIZE=group_size,
+        USE_M_MAJOR=m_sizes is not None or k_major is False,
+        G=m_sizes.numel() if m_sizes is not None else 0,
+    )
+    return x_fp8.view(x_shape), x_scale
+
+
+def quantize_fp8_group(
+    x: torch.Tensor,
+    group_size: int = 128,
+    scale_ub: Optional[torch.Tensor] = None,
+    m_sizes: Optional[torch.Tensor] = None,
+    k_major: bool = True,
+    use_triton: bool = True,
+    output_device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to fp8 with group-wise scalings and optionally move to output device.
+
+    Scale per group i is computed as 1 / (MAX_FP8 / max(abs(x[i:i+group_size])))
+
+    Args:
+        x (Tensor): [M, K] higher precision input tensor.
+        group_size (int): Group size for M dimension of scale.
+        scale_ub: Maximum allowed value for scale.
+        m_sizes: Optional input for grouped gemm to specify the number of rows in each group.
+        k_major (bool): Whether output scales should be K major (True) or MN major (False).
+        This is needed because some kernels like cutlass require a special layout for scales.
+        use_triton (bool): Whether to use triton kernel or pytorch.
+        output_device (torch.device): Device to optionally move the scaled tensors to.
+
+    Returns:
+        torch.Tensor: [M, K] fp8 scaled tensor.
+        torch.Tensor: [M, cdiv(K, group_size)] reciprocal scale tensor per group.
+    """
+    x_shape = x.shape
+    x = x.view(-1, x.size(-1))
+    if x.device == torch.device("cpu"):
+        logger.info("Triton does not support cpu, falling back to torch ops.")
+        use_triton = False
+    if use_triton:
+        xq, x_scale = triton_quantize_fp8_group(
+            x, group_size, scale_ub, m_sizes, k_major
+        )
+        return xq.view(x_shape), x_scale
+    # else use pytorch implementation.
+    if not output_device:
+        output_device = x.device
+
+    # Get constants.
+    pt_dtype, _, max_fp8, eps = get_fp8_constants()
+
+    M, K = x.shape
+    assert (
+        K % group_size == 0
+    ), "K must be divisible by group_size for cpu implementation."
+    assert m_sizes is None, "m_sizes is not supported for cpu implementation."
+    k_groups = triton.cdiv(K, group_size)
+    # View input as colleciton of groups for reduction.
+    x_grouped = x.view(M, k_groups, group_size).to(torch.float32)
+    # Reduce over groups.
+    group_max = x_grouped.abs().amax(dim=2)
+    # Apply clamping.
+    group_max = (
+        torch.clamp(group_max, min=eps, max=scale_ub.item())
+        if scale_ub
+        else torch.clamp(group_max, min=eps)
+    )
+    x_scale = torch.empty((M, k_groups), dtype=torch.float32, device=output_device)
+    x_scale = max_fp8 / group_max  # pyre-ignore
+    # pyre-ignore[16]: Undefined attribute [16]
+    x_scale[x_scale == float("inf")] = 1.0
+    # pyre-ignore[16]: Undefined attribute [16]
+    x_fp8 = x.view(-1, k_groups, group_size) * x_scale.unsqueeze(2)
+    # Cast and move data to output device (for cpu weight loading).
+    x_fp8 = x_fp8.to(device=output_device, dtype=pt_dtype)
+    x_scale = x_scale.to(output_device)  # pyre-ignore
+    if not k_major:
+        x_scale = x_scale.t().contiguous()
     return x_fp8.view(x_shape), 1 / x_scale  # pyre-ignore
 
 
 def need_split_k(SIZE_M, SIZE_N, SIZE_K):
     return (SIZE_M < 64 or SIZE_N < 64) and SIZE_K > 1024
+
+
+# Force a failure instead of a warning when all configs are pruned.
+# TODO: Determine a better approach for model level testing. We need
+# to standardize our approach around prune_configs in general.
+FORCE_FAILURE_ON_EMPTY_CONFIGS = False
+
+
+def is_invalid_config(config, N, M, K, mfma, use_bias):
+    """
+    Contains all of the configuration checks for prune_configs
+    that will result in an invalid result if select as the config.
+
+    This is done to ensure that if no config is "optimal" for a given
+    shape we don't accidentally select
+    """
+    BLOCK_SIZE_M = config.kwargs.get("BLOCK_M")
+    BLOCK_SIZE_N = config.kwargs.get("BLOCK_N")
+    BLOCK_SIZE_K = config.kwargs.get("BLOCK_K")
+    SPLIT_K = config.kwargs.get("SPLIT_K")
+    matrix_instr_nonkdim = config.kwargs.get("matrix_instr_nonkdim")
+    if matrix_instr_nonkdim > mfma:
+        return True
+    if mfma == 4 and BLOCK_SIZE_K < 64:
+        return True
+    # some layouts could not work properly in case
+    # number elements per thread is less 1
+    if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
+        return True
+    if BLOCK_SIZE_M < matrix_instr_nonkdim or BLOCK_SIZE_N < matrix_instr_nonkdim:
+        return True
+    if M <= matrix_instr_nonkdim and BLOCK_SIZE_M != matrix_instr_nonkdim:
+        return True
+    if N <= matrix_instr_nonkdim and BLOCK_SIZE_N != matrix_instr_nonkdim:
+        return True
+    # split_k cannot be used if there is a bias
+    if use_bias and SPLIT_K != 1:
+        return True
+    return False
 
 
 # Configs adapted from https://github.com/ROCm/triton/blob/main_perf/python/perf-kernels/tools/tune_gemm/tune_gemm.py
@@ -3166,6 +3583,7 @@ def prune_configs(configs, named_args, **kwargs):
     K = named_args["K"]
     elemBytes_a = named_args["A"].element_size()
     elemBytes_b = named_args["B"].element_size()
+    use_bias = kwargs["USE_BIAS"]
 
     if M < 32 or N < 32:
         mfma = 16
@@ -3181,23 +3599,10 @@ def prune_configs(configs, named_args, **kwargs):
         BLOCK_SIZE_M = config.kwargs.get("BLOCK_M")
         BLOCK_SIZE_N = config.kwargs.get("BLOCK_N")
         BLOCK_SIZE_K = config.kwargs.get("BLOCK_K")
-        num_warps = config.num_warps
-        matrix_instr_nonkdim = config.kwargs.get("matrix_instr_nonkdim")
-        if matrix_instr_nonkdim > mfma:
-            continue
-        if mfma == 4 and BLOCK_SIZE_K < 64:
-            continue
-        # some layouts could not work properly in case
-        # number elemens per thread is less 1
-        if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
-            continue
         SPLIT_K = config.kwargs.get("SPLIT_K")
         GROUP_M = config.kwargs.get("GROUP_M")
-        if BLOCK_SIZE_M < matrix_instr_nonkdim or BLOCK_SIZE_N < matrix_instr_nonkdim:
-            continue
-        if M <= matrix_instr_nonkdim and BLOCK_SIZE_M != matrix_instr_nonkdim:
-            continue
-        if N <= matrix_instr_nonkdim and BLOCK_SIZE_N != matrix_instr_nonkdim:
+        num_warps = config.num_warps
+        if is_invalid_config(config, N, M, K, mfma, use_bias):
             continue
         # Skip BLOCK_SIZE that is too large compare to M/N
         # unless BLOCK_SIZE is already small enough
@@ -3238,8 +3643,17 @@ def prune_configs(configs, named_args, **kwargs):
 
     print(f"{len(configs)=} {len(pruned_configs)=}")
     if len(pruned_configs) == 0:
-        print(f"No configs left after pruning! {M=} {N=} {K=}")
-        pruned_configs = configs[:10]
+        if not FORCE_FAILURE_ON_EMPTY_CONFIGS:
+            # Prune configs that can lead to incorrect results even if all configs are sub-optimal.
+            candidate_configs = [
+                c for c in configs if not is_invalid_config(c, N, M, K, mfma, use_bias)
+            ]
+            print(f"No configs left after pruning! {M=} {N=} {K=}")
+            pruned_configs = candidate_configs[:10]
+        if len(pruned_configs) == 0:
+            raise RuntimeError(
+                "No valid configs left after pruning! Consider autotuning further with TritonBench"
+            )
     return pruned_configs
 
 
@@ -3332,18 +3746,90 @@ MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K = [
         num_warps=8,
         num_stages=2,
     ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 256,
+            "BLOCK_K": 128,
+            "GROUP_M": 2,
+            "SPLIT_K": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 32,
+            "kpack": 2,
+        },
+        num_warps=8,
+        num_stages=2,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "BLOCK_K": 128,
+            "GROUP_M": 4,
+            "SPLIT_K": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        },
+        num_warps=8,
+        num_stages=2,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_M": 4,
+            "SPLIT_K": 1,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        },
+        num_warps=4,
+        num_stages=2,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_M": 4,
+            "SPLIT_K": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 2,
+        },
+        num_warps=4,
+        num_stages=2,
+    ),
 ]
+
+# Set this to enable full autotuning for proper benchmarking.
+# This should only be used when invoking the kernel through
+# Triton directly (e.g. TritonBench)
+#
+# NOTE: This will SIGNIFICANTLY increase autotuning time, often
+# taking hours. You should combine this with TRITON_PRINT_AUTOTUNING=1
+# to extract and add the optimal autotuning configs to
+# MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K.
+
+FULL_NON_PERSISTENT_AUTOTUNING = False
+USED_MATMUL_NON_PERSISTENT_CONFIGS = (
+    MATMUL_CONFIGS_NON_PERSISTENT
+    if FULL_NON_PERSISTENT_AUTOTUNING
+    else MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K
+)
 
 
 @triton.autotune(
-    configs=MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K,
+    configs=USED_MATMUL_NON_PERSISTENT_CONFIGS,
     key=["M", "N", "K"],
     prune_configs_by={
         "early_config_prune": prune_configs,
         "perf_model": None,
         "top_k": None,
     },
-    use_cuda_graph=True,
+    use_cuda_graph=FULL_NON_PERSISTENT_AUTOTUNING,
 )
 @triton.heuristics(
     {
@@ -3363,6 +3849,7 @@ def _kernel_matmul_fp8_row_non_persistent(
     k_key,
     A_scale,
     B_scale,
+    Bias,
     stride_am,
     stride_ak,
     stride_bn,
@@ -3378,6 +3865,7 @@ def _kernel_matmul_fp8_row_non_persistent(
     GROUP_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
+    USE_BIAS: tl.constexpr,
     AB_DTYPE: tl.constexpr,
 ) -> None:
     """Matmul kernel of [M, K] @ [N, K] with row-wise scales
@@ -3396,6 +3884,7 @@ def _kernel_matmul_fp8_row_non_persistent(
         k_key (int): Autotuning key for K dimension of input tensor.
         A_scale (TensorWrapper): [M] reciprocal scale tensor per row. A * A_scale = original A
         B_scale (TensorWrapper): [N] reciprocal scale tensor per row. B * B_scale = original B
+        Bias (tensorWrapper): [N] Optional bias tensor.
         stride_am (int): Stride of M dimension of A.
         stride_ak (int): Stride of K dimension of A.
         stride_bn (int): Stride of N dimension of B.
@@ -3411,7 +3900,8 @@ def _kernel_matmul_fp8_row_non_persistent(
         GROUP_M (int): Number of groups for M dimension swizzle.
         SPLIT_K (int): Number of SM's to launch per row.
         EVEN_K (bool): Whether K is evenly divisible by BLOCK_K * SPLIT_K.
-        AB_DTYPE (bool): Wether to cast A and B to C.dtype before tensor core.
+        USE_BIAS (bool): Whether to use bias.
+        AB_DTYPE (bool): Whether to cast A and B to C.dtype before tensor core.
     """
     tl.assume(M >= 0)
     tl.assume(N >= 0)
@@ -3431,7 +3921,7 @@ def _kernel_matmul_fp8_row_non_persistent(
     width = GROUP_M * grid_n
     group_id = pid // width
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_m = group_id * GROUP_M + ((pid % width) % group_size)
     pid_n = (pid % width) // (group_size)
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
@@ -3477,6 +3967,11 @@ def _kernel_matmul_fp8_row_non_persistent(
     # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
     scale = a_scale[:, None] * b_scale[None, :]
     acc *= scale
+
+    # Load and add bias if specified.
+    if USE_BIAS:
+        bias = tl.load(Bias + rn, mask=rn < N)
+        acc += bias[None, :]
 
     acc = acc.to(C.dtype.element_ty)
     C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)

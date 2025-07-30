@@ -197,10 +197,6 @@ class KeyedJaggedIndexSelectDim1GPUOp
       block_sums = at::empty({grid_size}, output_offsets.options());
     }
 
-#ifdef FBGEMM_GPU_MEMCHECK
-    const auto func_name = "index_select_scalar_cumsum_wrapper";
-#endif
-
     // Do index select and cumsum
     AT_DISPATCH_INDEX_TYPES(
         lengths.scalar_type(), "index_select_scalar_cumsum_wrapper_1", [&] {
@@ -214,34 +210,28 @@ class KeyedJaggedIndexSelectDim1GPUOp
                     indices.scalar_type(),
                     "index_select_scalar_cumsum_wrapper_3",
                     [&] {
-                      index_select_scalar_cumsum_kernel<
-                          length_t,
-                          index_t,
-                          offset_t,
+                      FBGEMM_LAUNCH_KERNEL(
+                          (index_select_scalar_cumsum_kernel<
+                              length_t,
+                              index_t,
+                              offset_t,
+                              MAX_CUMSUM_ENTRIES_PER_BLOCK,
+                              MAX_CUMSUM_ENTRIES_PER_BLOCK>),
+                          grid_size,
                           MAX_CUMSUM_ENTRIES_PER_BLOCK,
-                          MAX_CUMSUM_ENTRIES_PER_BLOCK>
-                          <<<grid_size,
-                             MAX_CUMSUM_ENTRIES_PER_BLOCK,
-                             0,
-                             at::cuda::getCurrentCUDAStream()>>>(
-                              MAKE_PTA_WITH_NAME(
-                                  func_name, output_lengths, length_t, 1, 32),
-                              MAKE_PTA_WITH_NAME(
-                                  func_name, output_offsets, offset_t, 1, 32),
-                              MAKE_PTA_WITH_NAME(
-                                  func_name, lengths, length_t, 1, 32),
-                              MAKE_PTA_WITH_NAME(
-                                  func_name, indices, index_t, 1, 32),
-                              num_batches,
-                              batch_size,
-                              num_output_lengths -
-                                  MAX_CUMSUM_ENTRIES_PER_BLOCK *
-                                      (grid_size - 1),
-                              grid_size > 1 ? block_flags.data_ptr<int>()
-                                            : nullptr,
-                              grid_size > 1 ? block_sums.data_ptr<offset_t>()
-                                            : nullptr);
-                      C10_CUDA_KERNEL_LAUNCH_CHECK();
+                          0,
+                          at::cuda::getCurrentCUDAStream(),
+                          PTA_B(output_lengths, length_t, 1, 32),
+                          PTA_B(output_offsets, offset_t, 1, 32),
+                          PTA_B(lengths, length_t, 1, 32),
+                          PTA_B(indices, index_t, 1, 32),
+                          num_batches,
+                          batch_size,
+                          num_output_lengths -
+                              MAX_CUMSUM_ENTRIES_PER_BLOCK * (grid_size - 1),
+                          grid_size > 1 ? block_flags.data_ptr<int>() : nullptr,
+                          grid_size > 1 ? block_sums.data_ptr<offset_t>()
+                                        : nullptr);
                     });
               });
         });
@@ -261,30 +251,30 @@ class KeyedJaggedIndexSelectDim1GPUOp
     const auto output_offsets_contig = output_offsets.expect_contiguous();
 
     if (grid_size != 0) {
-#define LAUNCH_KERNEL(WEIGHTED, WEIGHT_TYPE, OUTPUT_WEIGHTS, WEIGHTS)          \
-  {                                                                            \
-    keyed_jagged_index_select_dim1_kernel<                                     \
-        value_t,                                                               \
-        index_t,                                                               \
-        offset_t,                                                              \
-        WEIGHT_TYPE,                                                           \
-        WEIGHTED>                                                              \
-        <<<grid_size, kMaxThreads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
-            MAKE_PTA_WITH_NAME(func_name, output, value_t, 1, 64),             \
-            MAKE_PTA_WITH_NAME(func_name, OUTPUT_WEIGHTS, WEIGHT_TYPE, 1, 64), \
-            MAKE_PTA_WITH_NAME(func_name, values, value_t, 1, 64),             \
-            MAKE_PTA_WITH_NAME(func_name, WEIGHTS, WEIGHT_TYPE, 1, 64),        \
-            MAKE_PTA_WITH_NAME(func_name, offsets, offset_t, 1, 32),           \
-            MAKE_PTA_WITH_NAME(func_name, indices, index_t, 1, 32),            \
-            MAKE_PTA_WITH_NAME(                                                \
-                func_name, *output_offsets_contig, offset_t, 1, 32),           \
-            num_batches,                                                       \
-            batch_size);                                                       \
+#define LAUNCH_KERNEL(WEIGHTED, WEIGHT_TYPE, OUTPUT_WEIGHTS, WEIGHTS) \
+  {                                                                   \
+    FBGEMM_LAUNCH_KERNEL(                                             \
+        (keyed_jagged_index_select_dim1_kernel<                       \
+            value_t,                                                  \
+            index_t,                                                  \
+            offset_t,                                                 \
+            WEIGHT_TYPE,                                              \
+            WEIGHTED>),                                               \
+        grid_size,                                                    \
+        kMaxThreads,                                                  \
+        0,                                                            \
+        at::cuda::getCurrentCUDAStream(),                             \
+        PTA_B(output, value_t, 1, 64),                                \
+        PTA_B(OUTPUT_WEIGHTS, WEIGHT_TYPE, 1, 64),                    \
+        PTA_B(values, value_t, 1, 64),                                \
+        PTA_B(WEIGHTS, WEIGHT_TYPE, 1, 64),                           \
+        PTA_B(offsets, offset_t, 1, 32),                              \
+        PTA_B(indices, index_t, 1, 32),                               \
+        PTA_B(*output_offsets_contig, offset_t, 1, 32),               \
+        num_batches,                                                  \
+        batch_size);                                                  \
   }
 
-#ifdef FBGEMM_GPU_MEMCHECK
-      const auto func_name = "keyed_jagged_index_select_dim1";
-#endif
       AT_DISPATCH_ALL_TYPES_AND2(
           at::ScalarType::Half,
           at::ScalarType::BFloat16,
@@ -313,12 +303,10 @@ class KeyedJaggedIndexSelectDim1GPUOp
                                     output_weights,
                                     weights.value())
                               });
-                          C10_CUDA_KERNEL_LAUNCH_CHECK();
                         } else {
                           // has_weights = false, passing output and input as
                           // dummy tensors for weights
                           LAUNCH_KERNEL(false, scalar_t, output, values)
-                          C10_CUDA_KERNEL_LAUNCH_CHECK();
                         }
                       });
                 });
@@ -425,10 +413,6 @@ class KeyedJaggedIndexSelectDim1GPUOp
     // binary_search_range which takes raw pointers as arguments
     const auto grad_offsets_contig = grad_offsets.expect_contiguous();
 
-#ifdef FBGEMM_GPU_MEMCHECK
-    const auto func_name = "keyed_jagged_index_add_dim1";
-#endif
-
     if (grid_size != 0) {
       AT_DISPATCH_ALL_TYPES_AND2(
           at::ScalarType::Half,
@@ -445,28 +429,22 @@ class KeyedJaggedIndexSelectDim1GPUOp
                       indices.scalar_type(),
                       "keyed_jagged_index_add_dim1_wrapper_3",
                       [&] {
-                        keyed_jagged_index_add_dim1_kernel<<<
+                        FBGEMM_LAUNCH_KERNEL(
+                            (keyed_jagged_index_add_dim1_kernel<
+                                scalar_t,
+                                index_t,
+                                offset_t>),
                             grid_size,
                             kMaxThreads,
                             0,
-                            at::cuda::getCurrentCUDAStream()>>>(
-                            MAKE_PTA_WITH_NAME(
-                                func_name, grad_input, scalar_t, 1, 64),
-                            MAKE_PTA_WITH_NAME(
-                                func_name, grad, scalar_t, 1, 64),
-                            MAKE_PTA_WITH_NAME(
-                                func_name,
-                                *grad_offsets_contig,
-                                offset_t,
-                                1,
-                                32),
-                            MAKE_PTA_WITH_NAME(
-                                func_name, indices, index_t, 1, 32),
-                            MAKE_PTA_WITH_NAME(
-                                func_name, output_offsets, offset_t, 1, 32),
+                            at::cuda::getCurrentCUDAStream(),
+                            PTA_B(grad_input, scalar_t, 1, 64),
+                            PTA_B(grad, scalar_t, 1, 64),
+                            PTA_B(*grad_offsets_contig, offset_t, 1, 32),
+                            PTA_B(indices, index_t, 1, 32),
+                            PTA_B(output_offsets, offset_t, 1, 32),
                             num_batches,
                             output_batch_size);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
           });

@@ -20,7 +20,7 @@
 #include "fbgemm/Fbgemm.h"
 #include "fbgemm/SimdUtils.h"
 #include "fbgemm/Utils.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
@@ -51,7 +51,7 @@ static vector<vector<int>> GetInputs_() {
   return input_dims;
 }
 
-vector<int> prefetch_distances{0, 16, 1000000};
+static vector<int> prefetch_distances{0, 16, 1000000};
 
 namespace {
 
@@ -68,7 +68,7 @@ class RowWiseSparseAdagradFusedTest : public testing::TestWithParam<tuple<
 
 constexpr float DEFAULT_TOL = 1.0e-6;
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     RowWiseSparseAdagradFusedTest,
     ::testing::Combine(
@@ -87,18 +87,15 @@ INSTANTIATE_TEST_CASE_P(
 
 TEST_P(RowWiseSparseAdagradFusedTest, rowwiseTest) {
   vector<vector<int>> inputs(GetInputs_());
-  bool isWeightFp16, useStochasticRounding, isIndex64b, isOffset64b,
-      use_offsets, use_grad_stride;
-  int prefetch;
-  EmbeddingSpMDMCornerCase corner_case;
-  tie(isWeightFp16,
-      useStochasticRounding,
-      isIndex64b,
-      isOffset64b,
-      prefetch,
-      use_offsets,
-      corner_case,
-      use_grad_stride) = GetParam();
+  auto
+      [isWeightFp16,
+       useStochasticRounding,
+       isIndex64b,
+       isOffset64b,
+       prefetch,
+       use_offsets,
+       corner_case,
+       use_grad_stride] = GetParam();
 
   if (!isWeightFp16 && useStochasticRounding) {
     // stochastic rounding makes sense only for fp16 weight
@@ -132,8 +129,8 @@ TEST_P(RowWiseSparseAdagradFusedTest, rowwiseTest) {
     for (size_t i = 0; i < h.size(); ++i) {
       h_ref[i] = h[i] = values_gen(generator);
     }
-    for (size_t i = 0; i < g.size(); ++i) {
-      g[i] = values_gen(generator);
+    for (float& i : g) {
+      i = values_gen(generator);
     }
 
     vector<int64_t> lengths, offsets, indices;
@@ -201,7 +198,7 @@ TEST_P(RowWiseSparseAdagradFusedTest, rowwiseTest) {
         lr);                                                                  \
   } while (0)
 
-    bool success, success_ref;
+    bool success = false, success_ref = false;
     if (isWeightFp16) {
       if (isOffset64b) {
         if (isIndex64b) {

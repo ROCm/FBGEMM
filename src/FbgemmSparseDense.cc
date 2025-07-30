@@ -11,11 +11,8 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
-#include <cstdio>
 #include <cstring>
 #include <memory>
-#include <sstream>
 #include <vector>
 
 #include "fbgemm/Utils.h"

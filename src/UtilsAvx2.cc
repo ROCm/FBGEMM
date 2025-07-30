@@ -10,12 +10,10 @@
     (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
 #include <immintrin.h>
 #endif
-#include "./TransposeUtils.h"
-#include "./TransposeUtilsAvx2.h"
+#include "./TransposeUtils.h" // @manual
+#include "./TransposeUtilsAvx2.h" // @manual
 
-namespace fbgemm {
-
-namespace internal {
+namespace fbgemm::internal {
 
 template <>
 void transpose_avx2(
@@ -338,6 +336,4 @@ void transpose_avx2(
   }
 }
 
-} // namespace internal
-
-} // namespace fbgemm
+} // namespace fbgemm::internal

@@ -10,6 +10,7 @@ import itertools
 import os
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -29,7 +30,10 @@ except ImportError:
             super().__init__()
 
 
-from fbgemm_gpu.experimental.gen_ai.quantize_ops import get_quantize_ops, QuantizeOpBase
+from fbgemm_gpu.experimental.gen_ai.bench.quantize_ops import (
+    get_quantize_ops,
+    QuantizeOpBase,
+)
 
 
 def generate_group_tensor(G, M):
@@ -72,19 +76,26 @@ def get_llama_shapes() -> List[Tuple[int, int, int, int]]:
 
     llama_shapes = []
     for M in [1, 16, 32, 64, 96, 128, 16384]:
-        # Add shapes for llama 70B
+        # Add shapes for llama3 70B
         llama_shapes += [
             (1, M, 1280, 8192),
             (1, M, 8192, 1024),
             (1, M, 7168, 8192),
             (1, M, 8192, 3584),
         ]
-        # Add shapes for llama 405B
+        # Add shapes for llama3 405B
         llama_shapes += [
             (1, M, 13312, 6656),
             (1, M, 13312, 16384),
             (1, M, 16384, 6656),
             (1, M, 16384, 16384),
+        ]
+        # Add shapes for llama4 Scout/Maverick (17Bx{16,128})
+        llama_shapes += [
+            (1, M, 896, 5120),
+            (1, M, 5120, 640),
+            (1, M, 2048, 5120),
+            (1, M, 5120, 1024),
         ]
 
     return llama_shapes
@@ -370,6 +381,7 @@ def plot_benchmark(results: List[Dict[str, Any]], output_dir: str) -> None:
     ax.tick_params(axis="x", labelsize=3)
     img_fn = os.path.join(output_dir, "quantize_ops_benchmark.png")
     plot.savefig(img_fn, dpi=300)
+    print(f"Plot saved to {img_fn}")
 
 
 def collect_kernels_to_profile(kernels: Optional[List[str]]) -> List[QuantizeOpBase]:
@@ -436,24 +448,33 @@ def main(args: Any):
             else:
                 K = [int(k) for k in args.K.strip().split(",")]
             # List all shapes for simplicity.
-            MNK = list(itertools.product(B, M, N, K))
+            if args.pair_NK:
+                if len(N) != len(K):
+                    raise Exception("N and K must be the same length in pair_NK mode.")
+                NK = zip(N, K)
+                MNK = list(
+                    (B, M, N, K) for (B, M, (N, K)) in itertools.product(B, M, NK)
+                )
+            else:
+                MNK = list(itertools.product(B, M, N, K))
     # When groups is provided transform shapes into grouped format.
     if args.groups:
-        groups = int(args.groups)
+        groups = [int(g) for g in args.groups.strip().split(",")]
         if args.total_M:
-            M = generate_group_tensor(groups, int(args.total_M))
             MNK = [
                 [
-                    [b] * groups,
-                    generate_group_tensor(groups, int(args.total_M)),
-                    [n] * groups,
-                    [k] * groups,
+                    [b] * g,
+                    generate_group_tensor(g, int(args.total_M)),
+                    [n] * g,
+                    [k] * g,
                 ]
+                for g in groups
                 for b, _, n, k in MNK
             ]
         else:
             MNK = [
-                [[b] * groups, [m] * groups, [n] * groups, [k] * groups]
+                [[b] * g, [m] * g, [n] * g, [k] * g]
+                for g in groups
                 for b, m, n, k in MNK
             ]
 
@@ -478,9 +499,12 @@ def main(args: Any):
         benchmark_results.append(quantize_measurements)
     if args.export_csv or args.plot:
         os.makedirs(args.output_dir, exist_ok=True)
-        print("csv and images will be saved to " + args.output_dir)
     if args.export_csv:
-        csv_file = os.path.join(args.output_dir, "quantize_ops_benchmark.csv")
+        datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_file = os.path.join(
+            args.output_dir, f"quantize_ops_benchmark_{datetime_str}.csv"
+        )
+        print(f"CSV saved to {csv_file}")
         # Export results to a CSV file.
         df = pd.DataFrame(benchmark_results)
         df.to_csv(csv_file, index=False)
@@ -542,6 +566,12 @@ def invoke_main() -> None:
         "--K", default=None, help="Comma separated list of K values to benchmark."
     )
     parser.add_argument(
+        "--pair_NK",
+        default=False,
+        action="store_true",
+        help="If set, instead of benchmarking cartesian product of N * K, benchmark consecutive NK pairs together.",
+    )
+    parser.add_argument(
         "--grouped",
         default=False,
         action="store_true",
@@ -551,7 +581,7 @@ def invoke_main() -> None:
     parser.add_argument(
         "--groups",
         default=None,
-        help="If set with grouped mode, repeat input shapes this many times.",
+        help="If set with grouped mode, repeat input shapes this many times. Comma separated list of groups to benchmark",
     )
     parser.add_argument(
         "--total_M",

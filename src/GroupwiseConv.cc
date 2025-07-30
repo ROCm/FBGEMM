@@ -7,18 +7,14 @@
  */
 
 #define FBGEMM_EXPORTS
-#include "./GroupwiseConv.h"
-#include <asmjit/asmjit.h>
+#include "./GroupwiseConv.h" // @manual
 #include <cpuinfo.h>
 #include <array>
 #include <iostream>
-#include <map>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
-#include "./CodeGenHelpers.h"
-#include "./RefImplementations.h"
-#include "./TransposeUtils.h"
+#include "./CodeGenHelpers.h" // @manual
 #include "fbgemm/Fbgemm.h"
 #include "fbgemm/QuantUtilsAvx512.h"
 #include "fbgemm/SimdUtils.h"
@@ -28,7 +24,7 @@ namespace fbgemm {
 using namespace std;
 
 template <int SPATIAL_DIM>
-void calculateRowOffsets(
+static void calculateRowOffsets(
     const conv_param_t<SPATIAL_DIM>& conv_param,
     const uint8_t* activations,
     int32_t* rowOffsetBuf,
@@ -51,7 +47,7 @@ void calculateRowOffsets(
         for (int s = 0; s < conv_param.K[1]; ++s) {
           int w_in = -W_PAD + w * conv_param.stride[1] + s;
           for (int c = 0; c < C_per_G; ++c) {
-            int a_val;
+            int a_val = 0;
             if (h_in < 0 || h_in >= IH || w_in < 0 || w_in >= IW) {
               a_val = a_zero_point;
             } else {
@@ -68,7 +64,7 @@ void calculateRowOffsets(
 }
 
 template <int SPATIAL_DIM = 2>
-kernel_sig_t getKernelSig(
+static kernel_sig_t getKernelSig(
     const conv_param_t<SPATIAL_DIM>& conv_param,
     bool isAZeroPointZero,
     bool needRowOffset,
@@ -105,7 +101,7 @@ kernel_sig_t getKernelSig(
 }
 
 template <int SPATIAL_DIM = 2>
-jit_conv_kernel_fp getOrCreateConvKernel(
+static jit_conv_kernel_fp getOrCreateConvKernel(
     const conv_param_t<SPATIAL_DIM>& conv_param,
     int a_zero_point,
     bool needRowOffset,
@@ -218,7 +214,7 @@ jit_conv_kernel_fp GenConvKernel<SPATIAL_DIM, INST_SET>::getOrCreate() {
   scratchReg2_ = a->gpz(13);
 
   func_.init(
-      asmjit::FuncSignatureT<
+      asmjit::FuncSignature::build<
           void,
           uint8_t*,
           int8_t*,
@@ -227,7 +223,7 @@ jit_conv_kernel_fp GenConvKernel<SPATIAL_DIM, INST_SET>::getOrCreate() {
           int32_t,
           int32_t,
           int32_t,
-          int32_t*>(asmjit::CallConvId::kHost),
+          int32_t*>(),
       a->environment());
 
   frame_.init(func_);
@@ -300,15 +296,15 @@ jit_conv_kernel_fp GenConvKernel<SPATIAL_DIM, INST_SET>::getOrCreate() {
 
   a->emitEpilog(frame_);
 
-  jit_conv_kernel_fp fn;
-  asmjit::Error err;
+  jit_conv_kernel_fp fn = nullptr;
+  asmjit::Error err = 0;
   {
     unique_lock<mutex> lock(this->rtMutex_);
     err = this->runtime().add(&fn, &code);
   }
 
   if (err) {
-    cout << "Error: in fn add" << endl;
+    cout << "Error: in fn add" << '\n';
     return nullptr;
   }
 
@@ -809,7 +805,7 @@ void fbgemmGroupwiseConv(
  * This function does exactly the same compute as the JIT'ed kernel
  */
 template <int SPATIAL_DIM>
-void kernel_compute(
+static void kernel_compute(
     const conv_param_t<SPATIAL_DIM>& conv_p,
     const uint8_t* in_acts,
     int8_t* wghts,
@@ -880,7 +876,7 @@ void kernel_compute(
 }
 
 template <typename processOutputType, typename outT, typename inT>
-void dispatchOutputProcessing(
+static void dispatchOutputProcessing(
     const processOutputType& outProcess,
     int32_t* rowOffsetBuf,
     outT* out,
@@ -890,7 +886,7 @@ void dispatchOutputProcessing(
     int ld_in,
     int groups,
     int C_per_G,
-    true_type) {
+    true_type /*unused*/) {
   constexpr QuantizationGranularity Q_GRAN = processOutputType::QGRANType;
   constexpr int FUSE_RELU = processOutputType::RELU_FUSED;
   bool b_symmetric = (Q_GRAN == QuantizationGranularity::TENSOR &&
@@ -1025,10 +1021,9 @@ void fbgemmGroupwiseConv(
   int G_together = PackWeightMatrixForGConv<int8_t, int32_t, SPATIAL_DIM>::
       numOfGroupsTogether(conv_param);
 
-  if (SPATIAL_DIM == 1) {
+  if constexpr (SPATIAL_DIM == 1) {
     throw std::runtime_error("Groupwise 1D not implemented!");
-  }
-  if (SPATIAL_DIM == 2) {
+  } else if constexpr (SPATIAL_DIM == 2) {
     // Parallelization:
     int64_t batch_start = 0;
     int64_t batch_end = MB;
@@ -1147,7 +1142,7 @@ void fbgemmGroupwiseConv(
       } // for each g
     } // for each i
   } else {
-    assert(SPATIAL_DIM == 3 && "Unsupported SPATIAL_DIM");
+    static_assert(SPATIAL_DIM == 3, "Unsupported SPATIAL_DIM");
 
     conv_param_t<> conv_p_2d(
         conv_param.MB,
@@ -1204,7 +1199,7 @@ void fbgemmGroupwiseConv(
         isBottomEdgeIncluded,
         isTopBottomEdgeSame,
         true);
-    jit_conv_kernel_fp fpConv;
+    jit_conv_kernel_fp fpConv = nullptr;
 #endif
 
     int ih_start = 0;
@@ -1369,8 +1364,8 @@ template FBGEMM_API int rowOffsetBufferSizeGConv<3>(
   INSTANTIATE_SPATIAL_DIM(RELU, QuantizationGranularity::GROUP)  \
   INSTANTIATE_SPATIAL_DIM(RELU, QuantizationGranularity::OUT_CHANNEL)
 
-INSTANTIATE_Q_GRANS(false);
-INSTANTIATE_Q_GRANS(true);
+INSTANTIATE_Q_GRANS(false)
+INSTANTIATE_Q_GRANS(true)
 
 #undef INSTANTIATE_Q_GRANS
 #undef INSTANTIATE_SPATIAL_DIM

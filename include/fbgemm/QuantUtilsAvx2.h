@@ -9,8 +9,8 @@
 #pragma once
 
 #include <cstdint>
-#include "./FbgemmBuild.h"
-#include "./UtilsAvx2.h"
+#include "./FbgemmBuild.h" // @manual
+#include "./UtilsAvx2.h" // @manual
 
 /// @defgroup fbgemm-quant-utils-avx2 Quantization Utilities (AVX2)
 ///
@@ -71,7 +71,7 @@ void FusedQuantizeDequantizeAvx2(
 ///
 /// Random number generator in [0, 9] based on
 /// <a href="https://www.jstatsoft.org/v08/i14/paper">this paper</a>.
-uint32_t FBGEMM_API Xor128(void);
+uint32_t FBGEMM_API Xor128();
 
 /// @ingroup fbgemm-quant-utils-avx2
 ///

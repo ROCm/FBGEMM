@@ -55,6 +55,9 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {%- endif %}
     const uint32_t shfl_sync_mask,
     const int32_t max_vecs_per_thread,
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}
     {{ args.split_ref_kernel_args | replace_pta_namespace() | join(",\n    ") }}
 ) {
     constexpr auto kIsInt8 = std::is_same_v<emb_t, uint8_t>;
@@ -66,7 +69,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     emb_t* __restrict__ weights {nullptr};
     cache_t* __restrict__ cache_weights {nullptr};
     int32_t D_emb = D;
-    if (kIsInt8) {
+    if constexpr (kIsInt8) {
         D_emb += kINT8QparamsBytes;
     }
     const auto weights_placement = static_cast<PlacementType>(weights_placements[t]);
@@ -112,6 +115,10 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
             qparams_template = weight_row_template.load_qparams();
         }
     }
+
+    {%- if not ssd %}
+    [[maybe_unused]] constexpr auto enable_optimizer_offloading = false;
+    {%- endif %}
 
     {{ split_precomputation }}
 

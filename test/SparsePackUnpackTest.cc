@@ -7,9 +7,9 @@
  */
 
 #include <gtest/gtest.h>
-#include <iostream>
+#include <cmath>
 
-#include "bench/BenchUtils.h"
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/FbgemmSparse.h"
 #include "fbgemm/spmmUtils.h"
 
@@ -19,7 +19,7 @@ using namespace fbgemm;
 // tuple represents N and K
 class packUnpackTest : public testing::TestWithParam<tuple<int, int, float>> {};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     packUnpackTest,
     ::testing::Combine(
@@ -32,9 +32,7 @@ INSTANTIATE_TEST_CASE_P(
  * Test for packing/unpacking
  */
 TEST_P(packUnpackTest, sparseUnpackTest) {
-  int N, K;
-  float fnz;
-  tie(N, K, fnz) = GetParam();
+  auto [N, K, fnz] = GetParam();
 
   // wData is dense
   auto wData = getRandomBlockSparseMatrix<int8_t>(N, K, fnz, 1, 4);

@@ -6,8 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <cmath>
-#include <cstdio>
 #include <numeric>
 #include <random>
 
@@ -17,16 +15,15 @@
 
 #include <gtest/gtest.h>
 
-#include "./TestUtils.h"
-#include "bench/AlignedVec.h"
-#include "bench/BenchUtils.h"
+#include "bench/AlignedVec.h" // @manual
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/Fbgemm.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
 
-vector<QuantizationGranularity> qGranularityVals{
+static vector<QuantizationGranularity> qGranularityVals{
     QuantizationGranularity::TENSOR,
     QuantizationGranularity::GROUP,
     QuantizationGranularity::OUT_CHANNEL};
@@ -36,7 +33,7 @@ class fbgemmIm2colTest
     : public testing::TestWithParam<tuple<QuantizationGranularity, bool>> {};
 }; // namespace
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     fbgemmIm2colTest,
     ::testing::Combine(
@@ -79,15 +76,15 @@ static void Im2colTest(bool b_symmetric) {
       aligned_vector<uint8_t> Cint8_fb(Cint32_ref.size());
 
       int ncols_per_quant_group = conv_p.OC;
-      if (Q_GRAN == QuantizationGranularity::GROUP) {
+      if constexpr (Q_GRAN == QuantizationGranularity::GROUP) {
         ncols_per_quant_group = conv_p.OC / conv_p.G;
-      } else if (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
+      } else if constexpr (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
         ncols_per_quant_group = 1;
       }
-      int32_t Aint8_zero_point;
+      int32_t Aint8_zero_point = 0;
       aligned_vector<int32_t> Bint8_zero_point(
           conv_p.OC / ncols_per_quant_group);
-      if (is_same<ACC_T, int32_t>::value) {
+      if constexpr (is_same_v<ACC_T, int32_t>) {
         randFill<uint8_t>(Aint8, 0, 80);
         Aint8_zero_point = 43;
         randFill<int8_t>(Bint8, -16, 16);
@@ -236,8 +233,8 @@ static void Im2colTest(bool b_symmetric) {
 }
 
 TEST_P(fbgemmIm2colTest, Acc32Test) {
-  QuantizationGranularity q_granularity;
-  bool b_symmetric;
+  QuantizationGranularity q_granularity{};
+  bool b_symmetric = false;
   tie(q_granularity, b_symmetric) = GetParam();
   if (q_granularity == QuantizationGranularity::TENSOR) {
     Im2colTest<int32_t, QuantizationGranularity::TENSOR>(b_symmetric);
@@ -249,8 +246,8 @@ TEST_P(fbgemmIm2colTest, Acc32Test) {
 }
 
 TEST_P(fbgemmIm2colTest, Acc16Test) {
-  QuantizationGranularity q_granularity;
-  bool b_symmetric;
+  QuantizationGranularity q_granularity{};
+  bool b_symmetric = false;
   tie(q_granularity, b_symmetric) = GetParam();
   if (q_granularity == QuantizationGranularity::TENSOR) {
     Im2colTest<int16_t, QuantizationGranularity::TENSOR>(b_symmetric);
@@ -262,7 +259,7 @@ TEST_P(fbgemmIm2colTest, Acc16Test) {
 }
 
 template <QuantizationGranularity Q_GRAN>
-void SConvTest() {
+static void SConvTest() {
   for (auto conv_p : shapes) {
     for (int groups : {1, 4}) {
       if (conv_p.IC % groups != 0 || conv_p.OC % groups != 0) {
@@ -280,12 +277,12 @@ void SConvTest() {
       aligned_vector<uint8_t> Cint8_fb(Cint32_ref.size());
 
       int ncols_per_quant_group = conv_p.OC;
-      if (Q_GRAN == QuantizationGranularity::GROUP) {
+      if constexpr (Q_GRAN == QuantizationGranularity::GROUP) {
         ncols_per_quant_group = conv_p.OC / conv_p.G;
-      } else if (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
+      } else if constexpr (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
         ncols_per_quant_group = 1;
       }
-      int32_t Aint8_zero_point;
+      int32_t Aint8_zero_point = 0;
       aligned_vector<int32_t> Bint8_zero_point(
           conv_p.OC / ncols_per_quant_group);
       randFill<uint8_t>(Aint8, 0, 5);
@@ -471,8 +468,8 @@ void SConvTest() {
 }
 
 TEST_P(fbgemmIm2colTest, SConvTest) {
-  QuantizationGranularity q_granularity;
-  bool b_symmetric;
+  QuantizationGranularity q_granularity{};
+  bool b_symmetric = false;
   tie(q_granularity, b_symmetric) = GetParam();
   // b_symmetric ignored for now
   if (q_granularity == QuantizationGranularity::TENSOR) {
@@ -580,15 +577,15 @@ static void Im2col3DTest(bool b_symmetric) {
       aligned_vector<uint8_t> Cint8_fb(Cint32_ref.size());
 
       int ncols_per_quant_group = conv_p.OC;
-      if (Q_GRAN == QuantizationGranularity::GROUP) {
+      if constexpr (Q_GRAN == QuantizationGranularity::GROUP) {
         ncols_per_quant_group = conv_p.OC / conv_p.G;
-      } else if (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
+      } else if constexpr (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
         ncols_per_quant_group = 1;
       }
-      int32_t Aint8_zero_point;
+      int32_t Aint8_zero_point = 0;
       aligned_vector<int32_t> Bint8_zero_point(
           conv_p.OC / ncols_per_quant_group);
-      if (is_same<ACC_T, int32_t>::value) {
+      if constexpr (is_same_v<ACC_T, int32_t>) {
         randFill<uint8_t>(Aint8, 0, 80);
         Aint8_zero_point = 43;
         randFill<int8_t>(Bint8, -16, 16);
@@ -744,8 +741,8 @@ static void Im2col3DTest(bool b_symmetric) {
 }
 
 TEST_P(fbgemmIm2colTest, 3DAcc32Test) {
-  QuantizationGranularity q_granularity;
-  bool b_symmetric;
+  QuantizationGranularity q_granularity{};
+  bool b_symmetric = false;
   tie(q_granularity, b_symmetric) = GetParam();
   if (q_granularity == QuantizationGranularity::TENSOR) {
     Im2col3DTest<int32_t, QuantizationGranularity::TENSOR>(b_symmetric);
@@ -757,8 +754,8 @@ TEST_P(fbgemmIm2colTest, 3DAcc32Test) {
 }
 
 TEST_P(fbgemmIm2colTest, 3DAcc16Test) {
-  QuantizationGranularity q_granularity;
-  bool b_symmetric;
+  QuantizationGranularity q_granularity{};
+  bool b_symmetric = false;
   tie(q_granularity, b_symmetric) = GetParam();
   if (q_granularity == QuantizationGranularity::TENSOR) {
     Im2col3DTest<int16_t, QuantizationGranularity::TENSOR>(b_symmetric);

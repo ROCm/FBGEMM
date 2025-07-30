@@ -14,22 +14,22 @@
 #include <gtest/gtest.h>
 
 #include "./QuantizationHelpers.h"
-#include "./TestUtils.h"
-#include "bench/BenchUtils.h"
+#include "./TestUtils.h" // @manual
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/Fbgemm.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
 
-vector<QuantizationGranularity> qGranularityVals{
+static vector<QuantizationGranularity> qGranularityVals{
     QuantizationGranularity::TENSOR,
     QuantizationGranularity::GROUP,
     QuantizationGranularity::OUT_CHANNEL};
 
 // clang-format off
 template <int SPATIAL_DIM = 1>
-static typename std::enable_if<SPATIAL_DIM == 1, vector<conv_param_t<1>>>::type
+static std::enable_if_t<SPATIAL_DIM == 1, vector<conv_param_t<1>>>
 GetShapes_() {
   vector<conv_param_t<1>> shapes = {
     // MB, IC, OC, {IW}, G, {KW}, {stride_w}, {pad_l,pad_r}, {dilation_w}
@@ -66,7 +66,7 @@ GetShapes_() {
 
 // clang-format off
 template <int SPATIAL_DIM = 2>
-static typename std::enable_if<SPATIAL_DIM == 2, vector<conv_param_t<2>>>::type
+static std::enable_if_t<SPATIAL_DIM == 2, vector<conv_param_t<2>>>
 GetShapes_() {
   vector<conv_param_t<>> shapes = {
     // MB, IC, OC, {IH, IW}, G, {KH, KW}, {stride_h, stride_w}, {pad_t, pad_l,
@@ -165,7 +165,7 @@ class UniConvQGranTest
 }; // namespace
 
 // Combine only allows at most 10 generators.
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     uniConvTest,
     ::testing::Combine(
@@ -180,7 +180,7 @@ INSTANTIATE_TEST_CASE_P(
         ::testing::ValuesIn({1, 2}), // stride
         ::testing::ValuesIn({0, 1, 2}))); // pad
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     UniConvQGranTest,
     ::testing::Combine(
@@ -193,8 +193,7 @@ INSTANTIATE_TEST_CASE_P(
  * Test for conv packing
  */
 TEST_P(uniConvTest, packingTest) {
-  int MB, IC, OC, IT, IH, IW, G, kernel, stride, pad;
-  tie(MB, IC, OC, IT, IH, IW, G, kernel, stride, pad) = GetParam();
+  auto [MB, IC, OC, IT, IH, IW, G, kernel, stride, pad] = GetParam();
 
   conv_param_t<1> conv_p_1d(
       MB, IC, OC, {IW}, G, {kernel}, {stride}, {pad, pad});
@@ -452,8 +451,7 @@ TEST_P(uniConvTest, packingTest) {
  * Test for packing/unpacking
  */
 TEST_P(uniConvTest, packUnpackTest) {
-  int MB, IC, OC, IT, IH, IW, G, kernel, stride, pad;
-  tie(MB, IC, OC, IT, IH, IW, G, kernel, stride, pad) = GetParam();
+  auto [MB, IC, OC, IT, IH, IW, G, kernel, stride, pad] = GetParam();
 
   conv_param_t<1> conv_p_1d(
       MB, IC, OC, {IW}, G, {kernel}, {stride}, {pad, pad});
@@ -606,13 +604,13 @@ TEST(uniConvTest, cornerCases) {
 }
 
 template <int SPATIAL_DIM, typename ACC_T>
-bool takeDirectConvPath(const conv_param_t<SPATIAL_DIM>& conv_p) {
+static bool takeDirectConvPath(const conv_param_t<SPATIAL_DIM>& conv_p) {
   // Note: Direct convolutions (2D) are optimized for
   // filter size: 2 x 1 to 2 x 6,  transposed conv,
   // in_channel % 8 == 0, out_channel % 8 == 0
   // stride = 1 or 2
   // padding = 0 ( non-zero padding will be supported soon)
-  bool ret = std::is_same<ACC_T, std::int32_t>::value && conv_p.transposed &&
+  bool ret = std::is_same_v<ACC_T, std::int32_t> && conv_p.transposed &&
       conv_p.G == 1 && conv_p.IC % 8 == 0 && conv_p.OC % 8 == 0 &&
       std::all_of(
                  conv_p.stride.begin(),
@@ -638,7 +636,7 @@ bool takeDirectConvPath(const conv_param_t<SPATIAL_DIM>& conv_p) {
  */
 
 template <int SPATIAL_DIM = 2>
-void runRequantizeTest(
+static void runRequantizeTest(
     QuantizationGranularity q_granularity,
     bool a_symmetric,
     bool b_symmetric,
@@ -975,10 +973,7 @@ void runRequantizeTest(
 }
 
 TEST_P(UniConvQGranTest, requantizeTest) {
-  QuantizationGranularity q_granularity;
-  bool a_symmetric, b_symmetric;
-  bool test_bias, test_float_bias;
-  tie(q_granularity, a_symmetric, b_symmetric, test_bias, test_float_bias) =
+  auto [q_granularity, a_symmetric, b_symmetric, test_bias, test_float_bias] =
       GetParam();
 
   runRequantizeTest<1>(

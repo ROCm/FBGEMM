@@ -71,14 +71,6 @@ void adjust_block_bucketize_sparse_features_kernel_launch_configs_based_on_smem(
   grid_dims->x = cuda_calc_xblock_count(lengths_size, block_dims->y);
 }
 
-template <typename func_t>
-void increase_gpu_max_dynamic_shared_memory(func_t kernel, const int max_smem) {
-  TORCH_CHECK(max_smem > 0);
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
-      (void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_smem));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 // Kernel for bucketize lengths, with the Block distribution (vs. cyclic,
 // block-cyclic distribution). Used for bucketize sparse feature, especially for
 // checkpointing with row-wise partition (sparse_feature is partitioned
@@ -191,7 +183,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_pooled_sparse_features_cuda
     const index_t* const __restrict__ block_bucketize_pos_concat,
     const index_t* const __restrict__ block_bucketize_pos_offsets,
     const index_t* const __restrict__ indices_to_lb,
-    const bool keep_orig_idx) {
+    const bool keep_orig_idx,
+    const bool* const __restrict__ keep_orig_idx_per_feature) {
   using uindex_t = std::make_unsigned_t<index_t>;
   const auto bt_start = blockIdx.x * blockDim.y + threadIdx.y;
   const auto stride = gridDim.x * blockDim.y;
@@ -220,6 +213,12 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_pooled_sparse_features_cuda
         total_num_blocks == nullptr ? my_size : total_num_blocks[t];
     const index_t global_idx_size = blk_size * global_num_blks;
     const index_t local_idx_size = blk_size * local_num_blks;
+    auto keep_idx = keep_orig_idx;
+    if (keep_orig_idx_per_feature != nullptr) {
+      // When keep_orig_idx_per_feature is set, override global
+      // keep_orig_idx settings
+      keep_idx = keep_orig_idx_per_feature[t];
+    }
     for (auto i = rowstart + threadIdx.x; i < rowend; i += blockDim.x) {
       // We have use cases using none-hashed raw indices that can be either
       // negative or larger than embedding table hash_size (blk_size *
@@ -233,7 +232,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_pooled_sparse_features_cuda
       if (!use_block_bucketize_pos) { // uniform bucket sizes
         p = idx < global_idx_size ? idx / local_idx_size
                                   : (idx % global_num_blks) / local_num_blks;
-        if (keep_orig_idx) {
+        if (keep_idx) {
           new_idx = idx;
         } else if (idx < global_idx_size) {
           new_idx = idx % local_idx_size;
@@ -243,7 +242,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_pooled_sparse_features_cuda
       } else { // variable bucket sizes
         uindex_t lb = indices_to_lb[i];
         p = lb < my_size ? lb : idx % my_size;
-        if (keep_orig_idx) {
+        if (keep_idx) {
           new_idx = idx;
         } else if (blk_size == 0) {
           new_idx = idx / global_num_blks;
@@ -307,7 +306,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sequence_sparse_features_cu
     const index_t* const __restrict__ block_bucketize_pos_concat,
     const index_t* const __restrict__ block_bucketize_pos_offsets,
     const index_t* const __restrict__ indices_to_lb,
-    const bool keep_orig_idx) {
+    const bool keep_orig_idx,
+    const bool* const __restrict__ keep_orig_idx_per_feature) {
   using uindex_t = std::make_unsigned_t<index_t>;
   using uoffset_t = std::make_unsigned_t<offset_t>;
   CUDA_KERNEL_LOOP(b_t, lengths_size) {
@@ -324,6 +324,12 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sequence_sparse_features_cu
     offset_t rowend = offsets_data[b_t];
     const auto use_block_bucketize_pos =
         (block_bucketize_pos_concat != nullptr);
+    auto keep_idx = keep_orig_idx;
+    if (keep_orig_idx_per_feature != nullptr) {
+      // When keep_orig_idx_per_feature is set, override global
+      // keep_orig_idx settings
+      keep_idx = keep_orig_idx_per_feature[t];
+    }
     for (index_t i = rowstart; i < rowend; ++i) {
       // We have use cases using none-hashed raw indices that can be either
       // negative or larger than embedding table hash_size (blk_size *
@@ -337,7 +343,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sequence_sparse_features_cu
       if (!use_block_bucketize_pos) {
         p = idx < global_idx_size ? idx / local_idx_size
                                   : (idx % global_num_blks) / local_num_blks;
-        if (keep_orig_idx) {
+        if (keep_idx) {
           new_idx = idx;
         } else if (idx < global_idx_size) {
           new_idx = idx % local_idx_size;
@@ -347,7 +353,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sequence_sparse_features_cu
       } else {
         uindex_t lb = indices_to_lb[i];
         p = lb < my_size ? lb : idx % my_size;
-        if (keep_orig_idx) {
+        if (keep_idx) {
           new_idx = idx;
         } else if (blk_size == 0) {
           new_idx = idx / global_num_blks;
@@ -455,7 +461,10 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                             block_bucketize_pos.has_value()                      \
                                 ? indices_to_lb.data_ptr<index_t>()              \
                                 : static_cast<index_t*>(nullptr),                \
-                            keep_orig_idx);                                      \
+                            keep_orig_idx,                                       \
+                            keep_orig_idx_per_feature.has_value()                \
+                                ? keep_orig_idx_per_feature->data_ptr<bool>()    \
+                                : static_cast<bool*>(nullptr));                  \
                     C10_CUDA_KERNEL_LAUNCH_CHECK();                              \
                   });                                                            \
             });                                                                  \
@@ -514,7 +523,10 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                       block_bucketize_pos.has_value()                               \
                           ? indices_to_lb.data_ptr<index_t>()                       \
                           : static_cast<index_t*>(nullptr),                         \
-                      keep_orig_idx);                                               \
+                      keep_orig_idx,                                                \
+                      keep_orig_idx_per_feature.has_value()                         \
+                          ? keep_orig_idx_per_feature->data_ptr<bool>()             \
+                          : static_cast<bool*>(nullptr));                           \
               C10_CUDA_KERNEL_LAUNCH_CHECK();                                       \
             });                                                                     \
       });
@@ -542,7 +554,7 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                             index_t,                                             \
                             scalar_t>;                                           \
                     if (smem_size > smem_adjust_threshold) {                     \
-                      increase_gpu_max_dynamic_shared_memory(                    \
+                      utils::cuda::set_max_dynamic_smem(                         \
                           block_bucketize_kernel, max_smem);                     \
                     }                                                            \
                     block_bucketize_kernel<<<                                    \
@@ -577,7 +589,10 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                         block_bucketize_pos.has_value()                          \
                             ? indices_to_lb.data_ptr<index_t>()                  \
                             : static_cast<index_t*>(nullptr),                    \
-                        keep_orig_idx);                                          \
+                        keep_orig_idx,                                           \
+                        keep_orig_idx_per_feature.has_value()                    \
+                            ? keep_orig_idx_per_feature->data_ptr<bool>()        \
+                            : static_cast<bool*>(nullptr));                      \
                     C10_CUDA_KERNEL_LAUNCH_CHECK();                              \
                   });                                                            \
             });                                                                  \
@@ -602,7 +617,7 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                       index_t,                                                      \
                       std::nullptr_t>;                                              \
               if (smem_size > smem_adjust_threshold) {                              \
-                increase_gpu_max_dynamic_shared_memory(                             \
+                utils::cuda::set_max_dynamic_smem(                                  \
                     block_bucketize_kernel, max_smem);                              \
               }                                                                     \
               block_bucketize_kernel<<<                                             \
@@ -637,13 +652,17 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                   block_bucketize_pos.has_value()                                   \
                       ? indices_to_lb.data_ptr<index_t>()                           \
                       : static_cast<index_t*>(nullptr),                             \
-                  keep_orig_idx);                                                   \
+                  keep_orig_idx,                                                    \
+                  keep_orig_idx_per_feature.has_value()                             \
+                      ? keep_orig_idx_per_feature->data_ptr<bool>()                 \
+                      : static_cast<bool*>(nullptr));                               \
               C10_CUDA_KERNEL_LAUNCH_CHECK();                                       \
             });                                                                     \
       });
 
 // This function partitions sparse features
-// continuously along the sparse dimension into my_size blocks
+// continuously along the sparse dimension into
+// my_size blocks
 std::tuple<
     Tensor,
     Tensor,
@@ -664,7 +683,8 @@ _block_bucketize_sparse_features_cuda(
     const int64_t max_B,
     const std::optional<std::vector<at::Tensor>>& block_bucketize_pos,
     const bool return_bucket_mapping,
-    const bool keep_orig_idx) {
+    const bool keep_orig_idx,
+    const std::optional<Tensor>& keep_orig_idx_per_feature) {
   TENSORS_ON_SAME_CUDA_GPU_IF_NOT_OPTIONAL(lengths, indices);
 
   CUDA_DEVICE_GUARD(lengths);
@@ -740,8 +760,9 @@ _block_bucketize_sparse_features_cuda(
     at::Tensor sizes_vec =
         at::tensor(sizes_, at::TensorOptions().dtype(indices_contig.dtype()));
     block_bucketize_pos_offsets = asynchronous_exclusive_cumsum_cpu(
-        sizes_vec); // expect sizes_vec to be a small tensor, using cpu instead
-                    // of gpu for cumsum
+        sizes_vec); // expect sizes_vec to be a
+                    // small tensor, using cpu
+                    // instead of gpu for cumsum
     block_bucketize_pos_offsets = block_bucketize_pos_offsets.to(
         block_bucketize_pos_concat.device(), true);
   }
@@ -896,8 +917,8 @@ _block_bucketize_sparse_features_cuda(
 #undef LAUNCH_BLOCK_BUCKETIZE_POOLED_SPARSE_FEATURES_CUDA_KERNEL_2_WITHOUT_WEIGHT
 
 // This function partitions sparse features
-// continuously along the sparse dimension into my_size
-// blocks
+// continuously along the sparse dimension into
+// my_size blocks
 DLL_PUBLIC std::tuple<
     Tensor,
     Tensor,
@@ -916,7 +937,8 @@ block_bucketize_sparse_features_cuda(
     const int64_t max_B,
     const std::optional<std::vector<at::Tensor>>& block_bucketize_pos,
     const bool keep_orig_idx,
-    const std::optional<Tensor>& total_num_blocks) {
+    const std::optional<Tensor>& total_num_blocks,
+    const std::optional<at::Tensor>& keep_orig_idx_per_feature) {
   Tensor new_lengths;
   Tensor new_indices;
   std::optional<Tensor> new_weights;
@@ -942,12 +964,14 @@ block_bucketize_sparse_features_cuda(
           max_B,
           block_bucketize_pos,
           false,
-          keep_orig_idx);
+          keep_orig_idx,
+          keep_orig_idx_per_feature);
   return {new_lengths, new_indices, new_weights, new_pos, unbucketize_permute};
 }
 
 // This function partitions sparse features
-// continuously along the sparse dimension into my_size blocks
+// continuously along the sparse dimension into
+// my_size blocks
 DLL_PUBLIC std::tuple<
     Tensor,
     Tensor,
@@ -968,7 +992,8 @@ block_bucketize_sparse_features_inference_cuda(
     const std::optional<std::vector<at::Tensor>>& block_bucketize_pos,
     const bool return_bucket_mapping,
     const bool keep_orig_idx,
-    const std::optional<Tensor>& total_num_blocks) {
+    const std::optional<Tensor>& total_num_blocks,
+    const std::optional<at::Tensor>& keep_orig_idx_per_feature) {
   return _block_bucketize_sparse_features_cuda(
       lengths,
       indices,
@@ -982,7 +1007,8 @@ block_bucketize_sparse_features_inference_cuda(
       max_B,
       block_bucketize_pos,
       return_bucket_mapping,
-      keep_orig_idx);
+      keep_orig_idx,
+      keep_orig_idx_per_feature);
 }
 
 DLL_PUBLIC Tensor populate_bucketized_permute_cuda(

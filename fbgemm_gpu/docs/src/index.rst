@@ -45,6 +45,7 @@ Table of Contents
    :maxdepth: 1
    :caption: General Info
 
+   general/Releases
    general/Contributing
    general/documentation/Overview
    general/ContactUs
@@ -100,6 +101,7 @@ Table of Contents
    fbgemm_gpu/cpp-api/ssd_embedding_ops
    fbgemm_gpu/cpp-api/experimental_ops
    fbgemm_gpu/cpp-api/feature_gates
+   fbgemm_gpu/cpp-api/faster_hash_ops
 
 .. toctree::
    :maxdepth: 1

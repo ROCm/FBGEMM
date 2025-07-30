@@ -24,7 +24,11 @@ DEVICE_INLINE void vec_copy_with_implicit_type_cast(
     const uint64_t src_bound) {
   // TODO: Use vector load/store if address aligns with the vector type
   const src_t* const src = reinterpret_cast<src_t*>(src_addr);
+#ifdef __HIP_PLATFORM_AMD__
+#pragma unroll 4
+#else
 #pragma unroll
+#endif
   for (uint64_t i = 0; i < VEC_WIDTH && src_offset + i < src_bound; i++) {
     dst[dst_offset + i] = src[src_offset + i];
   }
@@ -90,7 +94,7 @@ __launch_bounds__(kMaxThreads) void tbe_input_combine_with_length_kernel(
                          lengths_start + src_idx,
                          lengths_end - lengths_start);
 
-  if (per_sample_weights_addrs) {
+  if (per_sample_weights_addrs && per_sample_weights_addrs[list_id] > 0) {
     vec_copy_with_implicit_type_cast<float, float, VEC_WIDTH>(
         combined_weights,
         per_sample_weights_addrs[list_id],
@@ -124,16 +128,18 @@ std::tuple<Tensor, Tensor, Tensor> tbe_input_combine_with_length_cuda(
   Tensor combined_lengths =
       at::empty({static_cast<int64_t>(total_lengths)}, int_options);
   // combined_weights is a float tensor
-  Tensor combined_weights = at::empty(
-      {per_sample_weights_addrs ? static_cast<int64_t>(total_indices)
-                                : static_cast<int64_t>(0)},
+  Tensor combined_weights = at::ones(
+      {per_sample_weights_addrs ? static_cast<int64_t>(total_indices) : 0},
       at::TensorOptions()
           .dtype(at::kFloat)
           .device(at::kCUDA, at::cuda::current_device()));
 
-  // Each thread loads 4 elements (rule of thumb; should work well with 32-bit
-  // inputs)
-  constexpr uint32_t VEC_WIDTH = 4;
+// Each thread loads VEC_WIDTH elements (tuned for specific hardware)
+#ifdef __HIP_PLATFORM_AMD__
+  constexpr uint32_t VEC_WIDTH = 32;
+#else
+  constexpr uint32_t VEC_WIDTH = 8;
+#endif
   constexpr uint32_t NUM_WARPS_PER_BLOCK = kMaxThreads / kWarpSize;
   const auto num_warps_per_list =
       div_round_up(max_list_size, kWarpSize * VEC_WIDTH);

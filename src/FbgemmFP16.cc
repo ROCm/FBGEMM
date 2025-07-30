@@ -11,14 +11,14 @@
 #include <cmath>
 #include <utility>
 
-#include "./FbgemmFP16UKernelsAvx2.h"
-#include "./FbgemmFP16UKernelsAvx512.h"
-#include "./FbgemmFP16UKernelsAvx512_256.h"
+#include "./FbgemmFP16UKernelsAvx2.h" // @manual
+#include "./FbgemmFP16UKernelsAvx512.h" // @manual
+#include "./FbgemmFP16UKernelsAvx512_256.h" // @manual
 #ifdef __aarch64__
-#include "./FbgemmFP16UKernelsSve128.h"
+#include "./FbgemmFP16UKernelsSve128.h" // @manual
 #endif
 #ifdef FBGEMM_ENABLE_KLEIDIAI
-#include "./KleidiAIFP16UKernelsNeon.h"
+#include "./KleidiAIFP16UKernelsNeon.h" // @manual
 #endif
 #include "fbgemm/Fbgemm.h"
 #include "fbgemm/FbgemmFPCommon.h"
@@ -125,7 +125,9 @@ constexpr kernel_array_t<float16> kernel_fp16_avx512 = {
 } // namespace
 
 template <>
-const isa_descriptor<float16>& getIsaHandlers(inst_set_t isa, float16) {
+const isa_descriptor<float16>& getIsaHandlers(
+    inst_set_t isa,
+    float16 /*unused*/) {
   static isa_descriptor<float16> avx2_descriptor =
       std::make_tuple(kernel_fp16_avx2, partition_avx2);
   static isa_descriptor<float16> avx512_descriptor =

@@ -10,31 +10,31 @@
 #include <array>
 #include <cassert>
 #include <cstdlib>
-#include <iostream>
 #include <numeric>
 #include <random>
 
 #include <gtest/gtest.h>
 #ifdef _OPENMP
 #include <omp.h>
+#include <cmath>
 #endif
 
-#include "./TestUtils.h"
-#include "bench/BenchUtils.h"
+#include "./TestUtils.h" // @manual
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/FbgemmI8Spmdm.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
 
-std::vector<float> densities{0.0001f, 0.001f, 0.01f, 0.1f, 1.0f};
+static std::vector<float> densities{0.0001f, 0.001f, 0.01f, 0.1f, 1.0f};
 
 namespace {
 class fbgemmSPMDMTest
     : public testing::TestWithParam<std::tuple<float, bool, bool>> {};
 } // namespace
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     Instance0,
     fbgemmSPMDMTest,
     ::testing::Combine(
@@ -51,8 +51,8 @@ TEST_P(fbgemmSPMDMTest, TestsSpMDM) {
       {14 * 14 * 2, 4, 2},
   };
 
-  float density;
-  bool accumulation, test_ld;
+  float density = NAN;
+  bool accumulation = false, test_ld = false;
   tie(density, accumulation, test_ld) = GetParam();
 
   for (const auto& shape : shapes) {

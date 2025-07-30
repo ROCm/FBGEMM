@@ -6,18 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <algorithm>
-#include <numeric> // for accumulate and iota
-#include <ostream>
 #include <random>
-#include <stdexcept>
 
 #include <gtest/gtest.h>
+#include <cmath>
 
 #include "./EmbeddingSpMDMTestUtils.h"
 #include "fbgemm/Fbgemm.h"
 #include "fbgemm/FbgemmConvert.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
@@ -64,9 +61,9 @@ class IndexRemapTest
     : public testing::TestWithParam<tuple<int, int, int, bool, bool>> {};
 } // namespace
 
-vector<int> prefetch_distances = {0, 16, 1000000};
+static vector<int> prefetch_distances = {0, 16, 1000000};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     EmbeddingSpMDMTest,
     ::testing::Combine(
@@ -83,7 +80,7 @@ INSTANTIATE_TEST_CASE_P(
         ::testing::Values(FLOAT, FLOAT16, BFLOAT16),
         ::testing::Values(FLOAT, FLOAT16, BFLOAT16)));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     rowwiseSparseEmbeddingSpMDMTest,
     ::testing::Combine(
@@ -98,7 +95,7 @@ INSTANTIATE_TEST_CASE_P(
             OUT_OF_BOUND_INDICES,
             UNMATCHED_NUM_INDICES_AND_LENGTHS_SUM)));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     IndexRemapTest,
     ::testing::Combine(
@@ -121,12 +118,7 @@ TEST_P(EmbeddingSpMDMTest, basicTest) {
   bool use_offsets = bool_dist(generator);
   bool use_output_input_stride = bool_dist(generator);
   bool test_thread_local = bool_dist(generator);
-  int prefetch;
-  EmbeddingSpMDMWeightChoice weight_choice;
-  EmbeddingSpMDMCornerCase corner_case;
-  EmbeddingSpMDMInputDtypeChoice in_type;
-  EmbeddingSpMDMOutputDtypeChoice out_type;
-  tie(prefetch, weight_choice, corner_case, in_type, out_type) = GetParam();
+  auto [prefetch, weight_choice, corner_case, in_type, out_type] = GetParam();
   bool is_wt_positional = weight_choice == POSITIONAL_WEIGHTED;
   bool use_weight = weight_choice != UNWEIGHTED;
   bool isFp16 = in_type == FLOAT16;
@@ -228,7 +220,7 @@ TEST_P(EmbeddingSpMDMTest, basicTest) {
       FloatToBfloat16_ref(&sentry_value, &output_bf16[i], 1);
     }
 
-    bool success, success_ref;
+    bool success = false, success_ref = false;
 
 #define TEST_BASE(                                             \
     table,                                                     \
@@ -404,7 +396,7 @@ TEST_P(EmbeddingSpMDMTest, basicTest) {
       if (is_output_float)
         return output[offset];
       else if (is_output_bfloat16) {
-        float v;
+        float v = NAN;
         Bfloat16ToFloat_ref(&output_bf16[offset], &v, 1);
         return v;
       } else
@@ -415,7 +407,7 @@ TEST_P(EmbeddingSpMDMTest, basicTest) {
       if (is_output_float)
         return output_ref[offset];
       else if (is_output_bfloat16) {
-        float v;
+        float v = NAN;
         Bfloat16ToFloat_ref(&output_ref_bf16[offset], &v, 1);
         return v;
       } else
@@ -460,10 +452,7 @@ TEST_P(rowwiseSparseEmbeddingSpMDMTest, rowwiseSparseTest) {
   bool normalize_by_lengths = bool_dist(generator);
   bool use_offsets = bool_dist(generator);
   bool is_output_float = bool_dist(generator);
-  int prefetch;
-  EmbeddingSpMDMWeightChoice weight_choice;
-  EmbeddingSpMDMCornerCase corner_case;
-  tie(prefetch, weight_choice, corner_case) = GetParam();
+  auto [prefetch, weight_choice, corner_case] = GetParam();
   bool is_wt_positional = weight_choice == POSITIONAL_WEIGHTED;
   bool use_weight = weight_choice != UNWEIGHTED;
 
@@ -488,8 +477,8 @@ TEST_P(rowwiseSparseEmbeddingSpMDMTest, rowwiseSparseTest) {
     // Create embedding table
     vector<float> embedding_table(num_compressed_rows * embedding_dim);
     normal_distribution<float> embedding_distribution;
-    for (size_t i = 0; i < embedding_table.size(); ++i) {
-      embedding_table[i] = embedding_distribution(generator);
+    for (float& i : embedding_table) {
+      i = embedding_distribution(generator);
     }
     vector<float16> embedding_table_fp16;
     if (isFp16) {
@@ -526,7 +515,7 @@ TEST_P(rowwiseSparseEmbeddingSpMDMTest, rowwiseSparseTest) {
 
     vector<float>& output_ref = use_weight ? output_slws_ref : output_sls_ref;
     vector<float>& output = use_weight ? output_slws : output_sls;
-    bool success, success_ref;
+    bool success = false, success_ref = false;
 
     if (isOffset64b) {
       if (isIndex64b) {
@@ -828,9 +817,7 @@ TEST_P(rowwiseSparseEmbeddingSpMDMTest, rowwiseSparseTest) {
 }
 
 TEST_P(IndexRemapTest, basicTest) {
-  int batch_size, num_rows, avg_len;
-  bool isIndex64b, per_sample_weights;
-  tie(batch_size, num_rows, avg_len, isIndex64b, per_sample_weights) =
+  auto [batch_size, num_rows, avg_len, isIndex64b, per_sample_weights] =
       GetParam();
   constexpr float sparsity = 0.5;
 

@@ -7,9 +7,8 @@
  */
 
 #pragma once
-#include <asmjit/asmjit.h>
+#include <asmjit/x86.h> // @manual
 #include <cpuinfo.h>
-#include <cassert>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -17,7 +16,7 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
-#include "./CodeCache.h"
+#include "./CodeCache.h" // @manual
 #include "fbgemm/ConvUtils.h"
 #include "fbgemm/Fbgemm.h"
 #include "fbgemm/Utils.h"
@@ -80,8 +79,8 @@ class DirectConvCodeGenBase {
       x86::Emitter* a,
       int rowRegs,
       int colRegs,
-      x86::Gp C_Offset,
-      x86::Gp ldcReg,
+      const x86::Gp& C_Offset,
+      const x86::Gp& ldcReg,
       bool accum);
 
   /**
@@ -93,9 +92,9 @@ class DirectConvCodeGenBase {
       x86::Emitter* a,
       int rowRegs,
       int colRegs,
-      x86::Gp C_offset,
-      x86::Gp o1XocReg,
-      x86::Gp ldcReg,
+      const x86::Gp& C_offset,
+      const x86::Gp& o1XocReg,
+      const x86::Gp& ldcReg,
       bool accum);
 
   /**
@@ -113,9 +112,9 @@ class DirectConvCodeGenBase {
       int NR) {
     std::ostringstream oss;
     oss << "directconv_";
-    if (std::is_same<accT, std::int16_t>::value) {
+    if constexpr (std::is_same_v<accT, std::int16_t>) {
       oss << "acc16_";
-    } else if (std::is_same<accT, std::int32_t>::value) {
+    } else if constexpr (std::is_same_v<accT, std::int32_t>) {
       oss << "acc32_";
     } else {
       oss << "unknown_";
@@ -124,13 +123,13 @@ class DirectConvCodeGenBase {
         << "_NC-" + std::to_string(nc) << "_NCB-" + std::to_string(NCB)
         << "_KCB-" + std::to_string(KCB) << "_MR-" + std::to_string(MR)
         << "_NR-" + std::to_string(NR);
-    if (instSet == inst_set_t::avx512_vnni) {
+    if constexpr (instSet == inst_set_t::avx512_vnni) {
       oss << "_avx512vnni";
-    } else if (instSet == inst_set_t::avx512) {
+    } else if constexpr (instSet == inst_set_t::avx512) {
       oss << "_avx512";
-    } else if (instSet == inst_set_t::avx512_ymm) {
+    } else if constexpr (instSet == inst_set_t::avx512_ymm) {
       oss << "_avx512_ymm";
-    } else if (instSet == inst_set_t::avx2) {
+    } else if constexpr (instSet == inst_set_t::avx2) {
       oss << "_avx2";
     }
     oss << ".txt";
@@ -167,9 +166,9 @@ class DirectConvCodeGenBase {
   template <inst_set_t instSet>
   void genComputeBlock(
       x86::Emitter* a,
-      x86::Gp buffer_A,
-      x86::Gp buffer_B,
-      x86::Gp B_pf,
+      const x86::Gp& buffer_A,
+      const x86::Gp& buffer_B,
+      const x86::Gp& B_pf,
       int rowRegs,
       int colRegs,
       int lda);
@@ -179,9 +178,9 @@ class DirectConvCodeGenBase {
   template <inst_set_t instSet>
   void genComputeBlockDirectConv(
       x86::Emitter* a,
-      x86::Gp buffer_A,
-      x86::Gp buffer_B,
-      x86::Gp B_pf,
+      const x86::Gp& buffer_A,
+      const x86::Gp& buffer_B,
+      const x86::Gp& B_pf,
       int rowRegs,
       int colRegs,
       int strideXich);
@@ -192,10 +191,10 @@ class DirectConvCodeGenBase {
   template <inst_set_t instSet>
   void genComputeBlockDirectConvTrans(
       x86::Emitter* a,
-      x86::Gp buffer_A,
-      x86::Gp buffer_B,
-      x86::Gp icReg,
-      x86::Gp C_offset,
+      const x86::Gp& buffer_A,
+      const x86::Gp& buffer_B,
+      const x86::Gp& icReg,
+      const x86::Gp& C_offset,
       int rowRegs,
       int colRegs);
 

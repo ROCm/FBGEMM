@@ -34,25 +34,38 @@ def int4_row_quantize_zp(
     group_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     n_bit = 4  # Number of target bits.
-    to_quant = x.reshape(-1, group_size).to(torch.float)
+    # Split input into chunks of group_size. This approach allows K that isnt divisible by group_size.
+    to_quant = torch.split(x.to(torch.float), group_size, dim=-1)
 
-    max_val = to_quant.amax(dim=1, keepdim=True)
-    min_val = to_quant.amin(dim=1, keepdim=True)
+    max_val = [chunk.amax(dim=1, keepdim=True) for chunk in to_quant]
+    min_val = [chunk.amin(dim=1, keepdim=True) for chunk in to_quant]
     max_int = 2**n_bit - 1
     min_int = 0
-    scales = (max_val - min_val).clamp(min=1e-6) / max_int
+    scales = [
+        (max_chunk - min_chunk).clamp(min=1e-6) / max_int
+        for max_chunk, min_chunk in zip(max_val, min_val)
+    ]
 
-    zeros = min_val + scales * (2 ** (n_bit - 1))
+    zeros = [
+        min_chunk + scale_chunk * (2 ** (n_bit - 1))
+        for min_chunk, scale_chunk in zip(min_val, scales)
+    ]
 
-    out = to_quant.sub(min_val).div(scales).round().clamp_(min_int, max_int)
+    out = [
+        chunk.sub(min_chunk).div(scale_chunk).round().clamp_(min_int, max_int)
+        for chunk, min_chunk, scale_chunk in zip(to_quant, min_val, scales)
+    ]
 
     # Recenter output and move to int8.
-    out = (out - 2 ** (n_bit - 1)).to(dtype=torch.int8).reshape(x.shape)
+    out = [(chunk - 2 ** (n_bit - 1)).to(dtype=torch.int8) for chunk in out]
+
+    # Recombine chunks.
+    out = torch.cat(out, dim=-1)
 
     # Cutlass expects column major layout for scale and zero point,
     # so we transpose here and make them contiguous.
-    scales = scales.view(x.shape[0], -1).t().contiguous()
-    zeros = zeros.view(x.shape[0], -1).t().contiguous()
+    scales = torch.cat(scales, dim=-1).t().contiguous()
+    zeros = torch.cat(zeros, dim=-1).t().contiguous()
 
     return out, scales, zeros
 
@@ -72,20 +85,26 @@ def int4_row_quantize(
         group_scale (Tensor): [K / group_size, N] FP32 Scale per group.
     """
     n_bit = 4  # Number of target bits.
-    to_quant = x.reshape(-1, group_size).to(torch.float)
+    # Split input into chunks of group_size. This approach allows K that isnt divisible by group_size.
+    to_quant = torch.split(x.to(torch.float), group_size, dim=-1)
 
-    max_val = torch.abs(to_quant).amax(dim=1, keepdim=True)
+    max_val = [torch.abs(chunk).amax(dim=-1, keepdim=True) for chunk in to_quant]
     max_int = 2 ** (n_bit - 1)
     min_int = -(2 ** (n_bit - 1))
-    scales = max_val.clamp(min=1e-6) / max_int
+    scales = [chunk.clamp(min=1e-6) / max_int for chunk in max_val]
 
-    out = to_quant.div(scales).round().clamp_(min_int, max_int - 1)
+    out = [
+        chunk.div(chunk_scale).round().clamp_(min_int, max_int - 1)
+        for chunk, chunk_scale in zip(to_quant, scales)
+    ]
+    # Recombine chunks.
+    out = torch.cat(out, dim=-1)
 
     # Cast to int8 and restore shape.
-    out = out.to(dtype=torch.int8).reshape(x.shape)
+    out = out.to(dtype=torch.int8)
 
     # Scales should be in [num_groups, N] layout.
-    scales = scales.view(x.shape[0], -1).t().contiguous()
+    scales = torch.cat(scales, dim=-1).t().contiguous()
 
     return out, scales
 
@@ -109,8 +128,6 @@ def quantize_int4_preshuffle(
         scales is a tuple of row_scale ([N]) and group_scale ([K / group_size, 8, N]). When BF16 is
         used, scales is a tuple of group_scale([K / group_size, N]) and group_zero ([K / group_size, N])
     """
-    # Check that K is divisible by group size.
-    assert w.shape[-1] % group_size == 0, "K must be divisible by group size."
 
     def _quantize(
         w: torch.Tensor, dtype: str = "fp8"
@@ -164,7 +181,52 @@ def quantize_int4_preshuffle(
     return wq, scales
 
 
-def scaled_fp4_quant(
+def shuffle_slice(
+    x: torch.Tensor, dim: int, start: int, length: int, dtype: str = "fp8"
+) -> torch.Tensor:
+    """
+    Helper function to slice a preshuffled int4 tensor. This is needed since the shuffling
+    reorders rows based on the size of the input. Slicing a tensor shuffled for a larger input
+    is no longer valid. We must reorder the tensor to the appropriate size then slice.
+    Args:
+        x (Tensor): [N, K // 2] Preshuffled int4 tensor.
+        dim (int): Dimension to slice.
+        start (int): Start of slice.
+        length (int): Number of elements to slice in the original [N, K] dimension.
+        dtype (str): Type of corresponding activations. Must be fp8 or bf16.
+    Returns:
+        sliced (Tensor): [stop-start, K // 2] Sliced tensor.
+    """
+    # Get the size of the input tensor.
+    assert dim in [x.ndim - 2, x.ndim - 1], "Only slicing along N or K is supported."
+    assert length % 16 == 0, "Slicing must be a multiple of 16."
+    orig_shape = x.shape
+    N = x.shape[-2]
+    K = x.shape[-1]
+    # Tile shape is based on the activation dtype.
+    assert dtype in ("fp8", "bf16"), "Only fp8 and bf16 activations supported."
+    # Handle slice along M
+    if dim == x.ndim - 2:
+        tile_shape = 8 if dtype == "fp8" else 16
+        block_size = N // length
+        # View the shape in terms of shuffled tiles then permute to allow slicing.
+        x_s = x.view(-1, tile_shape, block_size, length // tile_shape, K)
+        x_s = x_s.permute(0, 2, 1, 3, 4).contiguous().view(-1, N, K)
+        out_slice = x_s.narrow(1, start, length)
+        # Reshape back to original shape.
+        return out_slice.view(*orig_shape[:-2], length, K)
+    # Handle slice along K
+    else:
+        outer_dim = x.view(-1, N, K).shape[0]
+        x_s = x.view(outer_dim, -1, length // 2)
+        row_factor = x_s.shape[1] * (length // 2) // K
+        # Take slices of rows corresponding to column slice.
+        return x_s.narrow(1, start * 2 * K // length, row_factor).view(
+            *orig_shape[:-2], N, length // 2
+        )
+
+
+def scale_nvfp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -216,3 +278,31 @@ def scaled_fp4_quant(
     torch.ops.fbgemm.scaled_fp4_quant(output, input, output_scale, input_global_scale)
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
+
+
+def ck_preshuffle(src: torch.Tensor, NXdl: int = 16) -> torch.Tensor:
+    """
+    Applies shuffling to make weights more efficient for use with CK kernels.
+    Args:
+        src (torch.Tensor): Input tensor with dtype float8_e4m3fnuz.
+        NXdl (int): Wave tile size along N.
+    Returns:
+        torch.Tensor: The shuffled tensor.
+    """
+    # Check input datatype
+    if src.dtype != torch.float8_e4m3fnuz:
+        raise TypeError("Input must be type float8_e4m3fnuz.")
+    N, K = src.shape
+    KPack = 16
+    NLane = NXdl
+    KLane = 64 // NLane
+    K0 = K // (KLane * KPack)
+    # Reshape src to enable the required permutation
+    # Original shape: (N, K)
+    # Desired intermediate shape for permutation: (N0, NLane, K0, KLane, KPack)
+    src = src.reshape(N // NLane, NLane, K0, KLane, KPack)
+    # Apply permutation: (N0, NLane, K0, KLane, KPack) -> (N0, K0, KLane, NLane, KPack)
+    dst = src.permute(0, 2, 3, 1, 4).contiguous()
+    # Reshape to original input shape.
+    dst = dst.reshape(N, K)
+    return dst

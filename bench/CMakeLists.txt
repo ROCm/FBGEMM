@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.21 FATAL_ERROR)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -21,10 +21,6 @@ endif()
 
 if (USE_SANITIZER)
     message(WARNING "USING SANITIZER IN TEST")
-endif()
-
-if (${OpenMP_FOUND})
-  message(STATUS "OpenMP_LIBRARIES= ${OpenMP_CXX_LIBRARIES}")
 endif()
 
 if (${MKL_FOUND})
@@ -45,24 +41,16 @@ macro(add_benchmark BENCHNAME)
     ../test/EmbeddingSpMDMTestUtils.cc
   )
 
-  target_compile_options(
-    ${BENCHNAME}
-    PRIVATE
-    "-m64" "-mavx2" "-mfma" "-masm=intel"
-  )
+  if(NOT MSVC)
+    target_compile_options(
+      ${BENCHNAME}
+      PRIVATE
+      "-m64" "-mavx2" "-mfma" "-masm=intel"
+    )
+  endif()
 
   target_link_libraries(${BENCHNAME} fbgemm)
-  add_dependencies(${BENCHNAME} fbgemm)
 
-  if (USE_SANITIZER)
-    target_compile_options(${BENCHNAME} PRIVATE
-      "-fsanitize=${USE_SANITIZER}" "-fno-omit-frame-pointer")
-    target_link_options(${BENCHNAME} PRIVATE "-fsanitize=${USE_SANITIZER}")
-  endif()
-
-  if(${OpenMP_FOUND})
-    target_link_libraries(${BENCHNAME} "${OpenMP_CXX_LIBRARIES}")
-  endif()
 
   if(${MKL_FOUND})
     target_include_directories(${BENCHNAME} PRIVATE "${MKL_INCLUDE_DIR}")
@@ -99,9 +87,5 @@ if(FBGEMM_BUILD_BENCHMARKS)
 
   add_dependencies(run_benchmarks
     ${BENCHMARKS})
-
-  set_source_files_properties(
-    bench/GEMMsBenchmark.cc
-    PROPERTIES COMPILE_FLAGS "-Wno-unused-variable")
 
 endif()

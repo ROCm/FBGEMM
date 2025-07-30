@@ -44,7 +44,9 @@ class FbgemmGpuBuild:
         )
         parser.add_argument(
             "--debug",
-            action="store_true",
+            type=str,
+            choices=["0", "1", "2"],
+            default="0",
             help="Enable DEBUG features in compilation such as PyTorch device-side assertions.",
         )
         parser.add_argument(
@@ -55,7 +57,7 @@ class FbgemmGpuBuild:
         parser.add_argument(
             "--build-target",
             type=str,
-            choices=["default", "genai"],
+            choices=["default", "genai", "hstu"],
             default="default",
             help="The FBGEMM build target to build.",
         )
@@ -103,6 +105,11 @@ class FbgemmGpuBuild:
         print(f"[SETUP.PY] Other arguments: {other_args}")
         return FbgemmGpuBuild(setup_py_args, other_args)
 
+    def is_fbpkg_build(self) -> bool:
+        # UNIFIED_FBPKG_NAME is set in build scripts for internal FBPKG build
+        # environments
+        return os.environ.get("UNIFIED_FBPKG_NAME") is not None
+
     def nova_flag(self) -> Optional[int]:
         if "BUILD_FROM_NOVA" in os.environ:
             if str(os.getenv("BUILD_FROM_NOVA")) == "0":
@@ -111,6 +118,9 @@ class FbgemmGpuBuild:
                 return 1
         else:
             return None
+
+    def debug_level(self) -> int:
+        return int(self.args.debug)
 
     def nova_non_prebuild_step(self) -> bool:
         # When running in Nova workflow context, the actual package build is run
@@ -125,7 +135,12 @@ class FbgemmGpuBuild:
         return self.args.build_variant
 
     def package_name(self) -> str:
-        pkg_name: str = "fbgemm_gpu_genai" if self.target() == "genai" else "fbgemm_gpu"
+        if self.target() == "genai":
+            pkg_name: str = "fbgemm_gpu_genai"
+        elif self.target() == "hstu":
+            pkg_name: str = "fbgemm_gpu_hstu"
+        else:
+            pkg_name: str = "fbgemm_gpu"
 
         if self.nova_flag() is None:
             # If running outside of Nova workflow context, append the channel
@@ -273,10 +288,15 @@ class FbgemmGpuBuild:
                 ["-DCMAKE_VERBOSE_MAKEFILE=ON", "-DCMAKE_EXPORT_COMPILE_COMMANDS=TRUE"]
             )
 
-        if self.args.debug:
+        if self.debug_level() >= 1:
             # Enable torch device-side assertions for CUDA and HIP
             # https://stackoverflow.com/questions/44284275/passing-compiler-options-in-cmake-command-line
             cxx_flags.extend(["-DTORCH_USE_CUDA_DSA", "-DTORCH_USE_HIP_DSA"])
+
+        if self.debug_level() >= 2:
+            # Enable keeping debug symbols
+            cxx_flags.extend(["-g", "-O0"])
+            cmake_args.extend(["-DCMAKE_BUILD_TYPE=Debug", "-DCMAKE_STRIP=:"])
 
         print(f"[SETUP.PY] Setting the FBGEMM build target: {self.target()} ...")
         cmake_args.append(f"-DFBGEMM_BUILD_TARGET={self.target()}")
@@ -308,8 +328,15 @@ class FbgemmGpuBuild:
             )
 
         if self.args.use_fb_only:
-            print("[SETUP.PY] Building the FB ONLY operators of FBGEMM_GPU ...")
+            # Include FB-internal code into the build
+            print("[SETUP.PY] Include FB-internal code into the build ...")
             cmake_args.append("-DUSE_FB_ONLY=ON")
+
+        if self.is_fbpkg_build():
+            # NOTE: Some FB-internal code explicitly require an FB-internal
+            # environment to build, such as code that depends on NCCLX
+            print("[SETUP.PY] Setting FBPKG build flag ...")
+            cmake_args.append("-DFBGEMM_FBPKG_BUILD=ON")
 
         if self.args.cxxprefix:
             logging.debug("[SETUP.PY] Setting CMake flags ...")
@@ -317,17 +344,43 @@ class FbgemmGpuBuild:
 
             cxx_flags.extend(
                 [
-                    "-fopenmp=libgomp",
                     "-stdlib=libstdc++",
                     f"-I{path}/include",
                 ]
+                + (
+                    # Starting from ROCm 6.4, HIP clang complains about
+                    # -fopenmp=libgomp being an invalid fopenmp-target
+                    []
+                    if self.variant() == "rocm"
+                    else ["-fopenmp=libgomp"]
+                )
             )
+
             cmake_args.extend(
                 [
                     f"-DCMAKE_C_COMPILER={path}/bin/cc",
                     f"-DCMAKE_CXX_COMPILER={path}/bin/c++",
                 ]
             )
+
+        if self.variant() == "rocm":
+            cxx_flags.extend(
+                [
+                    f"-DROCM_VERSION={RocmUtils.version_int()}",
+                ]
+            )
+
+            if self.nova_flag() is None:
+                cxx_flags.extend(
+                    [
+                        # For the ROCm case on non-Nova, an explicit link to
+                        # libtbb is required, or the following error is
+                        # encountered on library load:
+                        #
+                        # undefined symbol: _ZN3tbb6detail2r117deallocate_memoryEPv
+                        "-ltbb",
+                    ]
+                )
 
         cmake_args.extend(
             [
@@ -343,6 +396,22 @@ class FbgemmGpuBuild:
 
         print(f"[SETUP.PY] Passing CMake arguments: {cmake_args}")
         return cmake_args
+
+
+class RocmUtils:
+    """ROCm Utilities"""
+
+    @classmethod
+    def version_int(cls) -> int:
+        version_string = os.environ.get("BUILD_ROCM_VERSION")
+        if not version_string:
+            raise ValueError("BUILD_ROCM_VERSION is not set in the environment!")
+
+        version_arr = version_string.split(".")
+        if len(version_arr) < 2:
+            raise ValueError("BUILD_ROCM_VERSION is not in X.Y format!")
+
+        return int(f"{version_arr[0]:<02}{version_arr[1]:<03}")
 
 
 class CudaUtils:

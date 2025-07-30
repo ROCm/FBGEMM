@@ -217,14 +217,13 @@ at::Tensor _bf16i4bf16(
   at::Tensor workspace =
       at::empty(workspace_size, X.options().dtype(at::kByte));
 
-  // Check the problem size is supported or not
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    throw std::runtime_error("cutlass cannot implement");
-  }
+  // TODO shuffled argument checking is stricter than it needs to be.
+  // For example it complains when K isnt divisible by group size despite
+  // that not being an actual restriction. We adopt a dont-ask-dont-tell
+  // approach to argument verification for now.
 
   // Initialize CUTLASS kernel with arguments and workspace pointer
-  status = gemm.initialize(arguments, workspace.data_ptr());
+  cutlass::Status status = gemm.initialize(arguments, workspace.data_ptr());
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error("cutlass cannot initialize");
   }
@@ -261,8 +260,13 @@ at::Tensor bf16i4bf16_dispatch(
       "and be contiguous on GPU.");
   // Make sure group scales and zeros are in proper format.
   TORCH_CHECK(
-      w_scale_group.dim() == 2 && w_scale_group.size(1) == N,
-      "Group scales are expected to have shape [num_groups, N].");
+      w_scale_group.dim() == 2 && w_scale_group.size(1) == N &&
+          w_scale_group.is_cuda() && w_scale_group.is_contiguous(),
+      "Group scales are expected to have shape [num_groups, N] and be contiguous on GPU.");
+  TORCH_CHECK(
+      w_zero_group.dim() == 2 && w_zero_group.size(1) == N &&
+          w_zero_group.is_cuda() && w_zero_group.is_contiguous(),
+      "Group zeros are expected to have shape [num_groups, N] and be contiguous on GPU.");
 
   // Allocate output or return an empty tensor if input is empty.
   if (M == 0 || N == 0 || K == 0) {

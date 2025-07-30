@@ -50,8 +50,24 @@ at::Tensor f4f4bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor global_scale,
-    bool use_mx = false);
+    std::optional<at::Tensor> global_scale = std::nullopt,
+    bool use_mx = true);
+std::vector<at::Tensor> f4f4bf16_grouped(
+    at::TensorList XQ,
+    at::TensorList WQ,
+    at::TensorList x_scale,
+    at::TensorList w_scale,
+    std::optional<at::TensorList> global_scale = std::nullopt,
+    bool use_mx = true);
+at::Tensor f4f4bf16_grouped_stacked(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor M_sizes,
+    std::optional<at::Tensor> global_scale = std::nullopt,
+    std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
+    bool use_mx = true);
 at::Tensor f8f8bf16(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -74,6 +90,32 @@ at::Tensor bf16bf16bf16_grouped_dynamic(
 at::Tensor
 bf16bf16bf16_grouped_stacked(at::Tensor X, at::Tensor W, at::Tensor M_sizes);
 at::Tensor f8f8bf16_rowwise(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    std::optional<at::Tensor> bias = std::nullopt,
+    bool use_fast_accum = true);
+at::Tensor f8f8f16_rowwise(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    std::optional<at::Tensor> bias = std::nullopt,
+    bool use_fast_accum = true);
+at::Tensor f8f8bf16_groupwise(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale);
+at::Tensor f8f8bf16_rowwise_preshuffle(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    std::optional<at::Tensor> bias = std::nullopt,
+    bool use_fast_accum = true);
+at::Tensor f8f8f16_rowwise_preshuffle(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
@@ -119,6 +161,12 @@ at::Tensor f8f8bf16_rowwise_grouped_dynamic(
     at::Tensor w_scale,
     at::Tensor zero_start_index_M,
     bool zeroing_output_tensor = true);
+at::Tensor f8f8bf16_groupwise_grouped(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor M_sizes);
 at::Tensor f8f8bf16_blockwise(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -182,6 +230,11 @@ at::Tensor bf16i4bf16_rowwise(
     at::Tensor W,
     at::Tensor w_scale_group,
     at::Tensor w_zero_group);
+at::Tensor bf16i4bf16_shuffled_batched(
+    at::Tensor X,
+    at::Tensor WQ,
+    at::Tensor w_scale,
+    at::Tensor w_zp);
 at::Tensor bf16i4bf16_rowwise_batched(
     at::Tensor X,
     at::Tensor WQ,
@@ -226,104 +279,11 @@ void scaled_fp4_quant(
     at::Tensor const& output_sf,
     at::Tensor const& input_sf);
 
-TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
-  m.set_python_module("fbgemm_gpu.experimental.gen_ai.quantize_ops");
-
-#ifndef USE_ROCM
-  // TODO: on AMD this throws "Undefined symbol" when loading
-  // quantize_ops with
-  // torch.ops.load_library, similar to below for quantize_fp8_per_tensor
-  m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
-  m.def(
-      "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor global_scale, bool use_mx=False) -> Tensor");
-  m.def(
-      "f8f8bf16(Tensor XQ, Tensor WQ, Tensor scale, bool use_fast_accum=True) -> Tensor");
-  m.def(
-      "f8f8bf16_cublas(Tensor A, Tensor B, Tensor? Ainvs=None, Tensor? Binvs=None, bool use_fast_accum=True, Tensor(a!)? output=None) -> Tensor");
-  m.def(
-      "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");
-  m.def(
-      "f8i4bf16_shuffled(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group) -> Tensor");
-  m.def(
-      "bf16i4bf16_shuffled(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
-  m.def(
-      "f8i4bf16_shuffled_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group, Tensor M_sizes) -> Tensor");
-  m.def(
-      "bf16i4bf16_shuffled_grouped(Tensor X, Tensor WQ, Tensor w_scale_group, Tensor w_zero_group, Tensor M_sizes) -> Tensor");
-  m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
-  m.def("preshuffle_i4(Tensor WQ, Tensor w_scale) -> (Tensor, Tensor)");
-  m.def("bf16_fast_gemv(Tensor X, Tensor W) -> Tensor");
-  m.def("bf16fp8bf16_fast_gemv(Tensor X, Tensor W, Tensor w_scale) -> Tensor");
-  m.def(
-      "fp8fp8bf16_fast_gemv(Tensor X, Tensor W, Tensor x_scale, Tensor w_scale, bool is_batched=False) -> Tensor");
-  m.def("f8f8bf16_lite(Tensor XQ, Tensor WQ, Tensor scale) -> Tensor");
-  m.def(
-      "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
-  m.def(
-      "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
-  m.def(
-      "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");
-  m.impl("i8i8bf16_dynamic", i8i8bf16_dynamic);
-#endif
-  m.def("bf16bf16bf16_grouped(Tensor[] X, Tensor[] W) -> Tensor[]");
-  m.def("bf16bf16bf16_grouped_cat(Tensor[] X, Tensor[] W) -> Tensor");
-  m.def(
-      "bf16bf16bf16_grouped_dynamic(Tensor X, Tensor W, Tensor zero_start_index_M) -> Tensor");
-  m.def(
-      "bf16bf16bf16_grouped_stacked(Tensor X, Tensor W, Tensor M_sizes) -> Tensor");
-  m.def(
-      "f8f8bf16_blockwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, int block_m=128, int block_n=128, int block_k=128) -> Tensor");
-  m.def(
-      "f8f8bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
-  m.def(
-      "f8f8bf16_rowwise_out(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor(a!) output, Tensor? bias=None, bool use_fast_accum=True) -> ()");
-  m.def(
-      "f8f8bf16_rowwise_batched(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True, Tensor(a!)? output=None) -> Tensor");
-  m.def(
-      "f8f8bf16_rowwise_grouped(Tensor[] XQ, Tensor[] WQ, Tensor[] x_scale, Tensor[] w_scale) -> Tensor[]");
-  m.def(
-      "f8f8bf16_rowwise_grouped_cat(Tensor[] XQ, Tensor[] WQ, Tensor[] x_scale, Tensor[] w_scale) -> Tensor");
-  m.def(
-      "f8f8bf16_rowwise_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
-  m.def(
-      "f8f8bf16_rowwise_grouped_dynamic(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor zero_start_index_M, bool zeroing_output_tensor=True) -> Tensor");
-  m.def(
-      "f8f8bf16_tensorwise(Tensor XQ, Tensor WQ, float scale, bool use_fast_accum=True) -> Tensor");
-  m.def("per_tensor_quantize_i8(Tensor X, float scale) -> Tensor");
-  m.impl("per_tensor_quantize_i8", per_tensor_quantize_i8);
-  m.def("per_tensor_dynamic_quantize_i8(Tensor X) -> (Tensor, Tensor)");
-  m.impl("per_tensor_dynamic_quantize_i8", per_tensor_dynamic_quantize_i8);
-
-  m.def("silu_mul_quantize_i8(Tensor X1, Tensor X2, float scale) -> Tensor");
-  m.impl("silu_mul_quantize_i8", silu_mul_quantize_i8);
-
-  m.def(
-      "quantize_fp8_per_tensor(Tensor input, Tensor? bs=None, Tensor? scale_ub=None, bool stochastic_rounding=False) -> Tensor[]");
-  m.def(
-      "quantize_fp8_per_row(Tensor input, Tensor? bs=None, Tensor? scale_ub=None, ScalarType? output_dtype=None, bool stochastic_rounding = False) -> Tensor[] ");
-
-  m.def(
-      "quantize_fp8_per_col(Tensor input, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor[]");
-
-  m.def(
-      "get_fp8_per_tensor_scale(Tensor input, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor");
-  m.impl("get_fp8_per_tensor_scale", get_fp8_per_tensor_scale);
-
-  m.def(
-      "quantize_fp8_per_tensor_fixed_scale(Tensor input, Tensor scale, Tensor? bs=None, bool stochatic_rounding=False) -> Tensor");
-  m.impl(
-      "quantize_fp8_per_tensor_fixed_scale",
-      quantize_fp8_per_tensor_fixed_scale);
-
-  m.def(
-      "scaled_fp4_quant(Tensor! output, Tensor input, Tensor! output_scale, Tensor input_scale) -> ()");
-  m.impl("scaled_fp4_quant", scaled_fp4_quant);
-
-#ifdef USE_ROCM
-  m.def("flush_icache_hip() -> ()");
-  m.impl("flush_icache_hip", flush_icache_ck);
-#endif
-}
+std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
+    at::Tensor input,
+    std::optional<at::Tensor> static_scales,
+    std::optional<at::Tensor> bs, // batch size
+    std::optional<at::Tensor> scale_ub); // scale upperbound
 
 TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
   m.impl("f8f8bf16_blockwise", f8f8bf16_blockwise);
@@ -342,10 +302,21 @@ TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
   m.impl("bf16bf16bf16_grouped_dynamic", bf16bf16bf16_grouped_dynamic);
   m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
+  m.impl("per_tensor_quantize_i8", per_tensor_quantize_i8);
+  m.impl("per_tensor_dynamic_quantize_i8", per_tensor_dynamic_quantize_i8);
+  m.impl("silu_mul_quantize_i8", silu_mul_quantize_i8);
+  m.impl("get_fp8_per_tensor_scale", get_fp8_per_tensor_scale);
+  m.impl(
+      "quantize_fp8_per_tensor_fixed_scale",
+      quantize_fp8_per_tensor_fixed_scale);
 
 #ifndef USE_ROCM
+  m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
+  m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
+  m.impl("f4f4bf16_grouped", f4f4bf16_grouped);
+  m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16_fast_gemv", bf16_fast_gemv);
@@ -358,9 +329,21 @@ TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
   m.impl("f8i4bf16_shuffled_grouped", f8i4bf16_shuffled_grouped);
   m.impl("bf16i4bf16_shuffled_grouped", bf16i4bf16_shuffled_grouped);
   m.impl("preshuffle_i4", preshuffle_i4);
+  m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise);
   m.impl("scaled_fp4_quant", scaled_fp4_quant);
+  m.impl("i8i8bf16_dynamic", i8i8bf16_dynamic);
+  m.impl("fake_quantize_nvfp4_per_tensor", fake_quantize_nvfp4_per_tensor);
+#endif
+
+#ifdef USE_ROCM
+  m.impl("flush_icache_hip", flush_icache_ck);
+#endif
+#ifdef USE_ROCM
+  m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
+  m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
+  m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
 #endif
 }
 
@@ -382,8 +365,12 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
   m.impl("bf16bf16bf16_grouped_dyanmic", bf16bf16bf16_grouped_dynamic);
   m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
 #ifndef USE_ROCM
+  m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
+  m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
+  m.impl("f4f4bf16_grouped", f4f4bf16_grouped);
+  m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16_fast_gemv", bf16_fast_gemv);
@@ -396,9 +383,11 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
   m.impl("f8i4bf16_shuffled_grouped", f8i4bf16_shuffled_grouped);
   m.impl("bf16i4bf16_shuffled_grouped", bf16i4bf16_shuffled_grouped);
   m.impl("preshuffle_i4", preshuffle_i4);
+  m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise);
   m.impl("scaled_fp4_quant", scaled_fp4_quant);
+  m.impl("fake_quantize_nvfp4_per_tensor", fake_quantize_nvfp4_per_tensor);
 #endif
 }
 
@@ -408,9 +397,9 @@ at::Tensor i8i8bf16_meta(
     at::Tensor WQ, // INT8
     double scale,
     int64_t split_k) {
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  auto Y = at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -419,11 +408,11 @@ at::Tensor f4f4bf16_meta(
     at::Tensor WQ, // FP4
     at::Tensor /* x_scale */,
     at::Tensor /* w_scale */,
-    at::Tensor /* global_scale */,
+    std::optional<at::Tensor> /* global_scale = std::nullopt */,
     bool /* use_mx */) {
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  auto Y = at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -434,9 +423,35 @@ at::Tensor f8f8bf16_rowwise_meta(
     at::Tensor /* w_scale */,
     std::optional<at::Tensor> /* bias = std::nullopt */,
     bool /* use_fast_accum = true */) {
+  int64_t x_dims = XQ.dim();
+  int64_t w_dims = WQ.dim();
+  TORCH_CHECK(
+      (x_dims == 2 || x_dims == 3) && (w_dims == 2),
+      "The dim of XQ must be 2 or 3, and dim of WQ must be 2");
+  at::Tensor Y;
+  if (x_dims == 2) {
+    const at::SymInt M = XQ.sym_size(0);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  } else {
+    const at::SymInt B = XQ.sym_size(0);
+    const at::SymInt M = XQ.sym_size(1);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({B, M, N}, XQ.options().dtype(at::kBFloat16));
+  }
+  return Y;
+}
+
+at::Tensor f8f8f16_rowwise_meta(
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // FP8
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */,
+    std::optional<at::Tensor> /* bias = std::nullopt */,
+    bool /* use_fast_accum = true */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
-  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kHalf));
   return Y;
 }
 
@@ -459,10 +474,10 @@ at::Tensor f8f8bf16_rowwise_batched_meta(
     std::optional<at::Tensor> /* bias = std::nullopt */,
     bool /* use_fast_accum = true */,
     std::optional<at::Tensor> /* output = std::nullopt */) {
-  int B = XQ.size(0);
-  int M = XQ.size(1);
-  int N = WQ.size(1);
-  auto Y = at::empty({B, M, N}, XQ.options().dtype(at::kBFloat16));
+  const at::SymInt B = XQ.sym_size(0);
+  const at::SymInt M = XQ.sym_size(1);
+  const at::SymInt N = WQ.sym_size(1);
+  auto Y = at::empty_symint({B, M, N}, XQ.options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -474,19 +489,40 @@ at::Tensor f8f8bf16_blockwise_meta(
     int64_t /* block_m = 128*/,
     int64_t /* block_n = 128*/,
     int64_t /* block_k = 128*/) {
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  auto Y = at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
+  int64_t x_dims = XQ.dim();
+  int64_t w_dims = WQ.dim();
+  TORCH_CHECK(
+      (x_dims == 2 || x_dims == 3) && (w_dims == 2),
+      "The dim of XQ must be 2 or 3, and dim of WQ must be 2");
+  at::Tensor Y;
+  if (x_dims == 2) {
+    const at::SymInt M = XQ.sym_size(0);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  } else {
+    const at::SymInt B = XQ.sym_size(0);
+    const at::SymInt M = XQ.sym_size(1);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({B, M, N}, XQ.options().dtype(at::kBFloat16));
+  }
   return Y;
 }
 
 std::vector<at::Tensor> quantize_fp8_per_tensor_meta(
-    at::Tensor X,
-    std::optional<at::Tensor> bs,
+    at::Tensor input,
+    std::optional<at::Tensor> /* bs */,
     std::optional<at::Tensor> /*scale_ub*/,
     const bool /*stochastic_rounding*/) {
-  auto Y = at::empty_like(X, X.options().dtype(torch_fp8_e4m3));
-  auto scale = at::empty({}, X.options().dtype(at::kBFloat16));
+  int dims = input.dim();
+  TORCH_CHECK(dims == 2 || dims == 3, "The dim of input should be 2 or 3");
+  at::Tensor Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
+  at::Tensor scale;
+  if (dims <= 2) {
+    scale = at::empty_symint({}, input.options().dtype(at::kFloat));
+  } else {
+    const at::SymInt B = input.sym_size(0);
+    scale = at::empty_symint({B}, input.options().dtype(at::kFloat));
+  }
   return {Y, scale};
 }
 
@@ -552,13 +588,26 @@ at::Tensor fp8fp8bf16_fast_gemv_meta(
 }
 
 at::Tensor f8f8bf16_tensorwise_meta(
-    at::Tensor X,
-    at::Tensor W,
-    double scale,
-    bool use_fast_accum = true) {
-  const at::SymInt M = X.sym_size(0);
-  const at::SymInt N = W.sym_size(0);
-  auto Y = at::empty_symint({M, N}, X.options().dtype(at::kBFloat16));
+    at::Tensor XQ,
+    at::Tensor WQ,
+    double /* scale */,
+    bool /* use_fast_accum = true */) {
+  int64_t x_dims = XQ.dim();
+  int64_t w_dims = WQ.dim();
+  TORCH_CHECK(
+      (x_dims == 2 || x_dims == 3) && (w_dims == 2),
+      "The dim of XQ must be 2 or 3, and dim of WQ must be 2");
+  at::Tensor Y;
+  if (x_dims == 2) {
+    const at::SymInt M = XQ.sym_size(0);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  } else {
+    const at::SymInt B = XQ.sym_size(0);
+    const at::SymInt M = XQ.sym_size(1);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({B, M, N}, XQ.options().dtype(at::kBFloat16));
+  }
   return Y;
 }
 
@@ -572,12 +621,47 @@ at::Tensor f8f8bf16_lite_meta(at::Tensor X, at::Tensor W, at::Tensor scale) {
 at::Tensor f8i4bf16_rowwise_meta(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // INT4
-    at::Tensor x_scale,
-    at::Tensor w_scale,
-    at::Tensor w_zp) {
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  auto Y = at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */,
+    at::Tensor /* w_zp */) {
+  int64_t x_dims = XQ.dim();
+  int64_t w_dims = WQ.dim();
+  TORCH_CHECK(
+      (x_dims == 2 || x_dims == 3) && (w_dims == 2),
+      "The dim of X must be 2 or 3, and dim of W must be 2");
+  at::Tensor Y;
+  if (x_dims == 2) {
+    const at::SymInt M = XQ.sym_size(0);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  } else {
+    const at::SymInt B = XQ.sym_size(0);
+    const at::SymInt M = XQ.sym_size(1);
+    const at::SymInt N = WQ.sym_size(0);
+    Y = at::empty_symint({B, M, N}, XQ.options().dtype(at::kBFloat16));
+  }
+  return Y;
+}
+
+std::tuple<at::Tensor, at::Tensor> preshuffle_i4_meta(
+    at::Tensor WQ,
+    at::Tensor w_scale) {
+  auto WS = at::empty_like(w_scale);
+  if (w_scale.dtype() != at::kBFloat16) {
+    WS = at::empty({w_scale.size(0), 8, w_scale.size(1)}, w_scale.options());
+  }
+  return {at::empty_like(WQ), WS};
+}
+
+at::Tensor f8i4bf16_shuffled_meta(
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // INT4
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */,
+    at::Tensor /* w_scale_group */) {
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -587,9 +671,35 @@ at::Tensor bf16i4bf16_rowwise_meta(
     at::Tensor /*  w_scale_group */,
     at::Tensor /* w_zero_group */
 ) {
-  int M = X.size(0);
-  int N = W.size(0);
-  auto Y = at::empty({M, N}, X.options().dtype(at::kBFloat16));
+  int64_t x_dims = X.dim();
+  int64_t w_dims = W.dim();
+  TORCH_CHECK(
+      (x_dims == 2 || x_dims == 3) && (w_dims == 2),
+      "The dim of XQ must be 2 or 3, and dim of WQ must be 2");
+  at::Tensor Y;
+  if (x_dims == 2) {
+    const at::SymInt M = X.sym_size(0);
+    const at::SymInt N = W.sym_size(0);
+    Y = at::empty_symint({M, N}, X.options().dtype(at::kBFloat16));
+  } else {
+    const at::SymInt B = X.sym_size(0);
+    const at::SymInt M = X.sym_size(1);
+    const at::SymInt N = W.sym_size(0);
+    Y = at::empty_symint({B, M, N}, X.options().dtype(at::kBFloat16));
+  }
+  return Y;
+}
+
+at::Tensor bf16i4bf16_shuffled_batched_meta(
+    at::Tensor X, // BF16
+    at::Tensor W, // INT4
+    at::Tensor /* w_scale_group */,
+    at::Tensor /* w_zero_group */
+) {
+  const at::SymInt B = X.sym_size(0);
+  const at::SymInt M = X.sym_size(1);
+  const at::SymInt N = W.sym_size(1);
+  auto Y = at::empty_symint({B, M, N}, X.options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -599,22 +709,31 @@ at::Tensor bf16i4bf16_rowwise_batched_meta(
     at::Tensor /* w_scale_group */,
     at::Tensor /* w_zero_group */
 ) {
-  int B = X.size(0);
-  int M = X.size(1);
-  int N = W.size(1);
-  auto Y = at::empty({B, M, N}, X.options().dtype(at::kBFloat16));
+  const at::SymInt B = X.sym_size(0);
+  const at::SymInt M = X.sym_size(1);
+  const at::SymInt N = W.sym_size(1);
+  auto Y = at::empty_symint({B, M, N}, X.options().dtype(at::kBFloat16));
   return Y;
 }
 
 std::vector<at::Tensor> quantize_fp8_per_row_meta(
     at::Tensor input,
-    std::optional<at::Tensor> bs,
-    std::optional<at::Tensor> scale_ub,
+    std::optional<at::Tensor> /* bs */,
+    std::optional<at::Tensor> /* scale_ub */,
     std::optional<c10::ScalarType> /* output_dtype */,
     bool /* stochastic_rounding */) {
-  const at::SymInt M = input.sym_size(0);
-  auto Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
-  auto scale = at::empty_symint({M}, input.options().dtype(at::kFloat));
+  int dims = input.dim();
+  TORCH_CHECK(dims == 2 || dims == 3, "The dim of input should be 2 or 3");
+  at::Tensor Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
+  at::Tensor scale;
+  if (dims == 2) {
+    const at::SymInt M = input.sym_size(0);
+    scale = at::empty_symint({M}, input.options().dtype(at::kFloat));
+  } else {
+    const at::SymInt B = input.sym_size(0);
+    const at::SymInt M = input.sym_size(1);
+    scale = at::empty_symint({B, M}, input.options().dtype(at::kFloat));
+  }
   return {Y, scale};
 }
 
@@ -630,9 +749,18 @@ std::vector<at::Tensor> quantize_fp8_per_col_meta(
     at::Tensor input,
     std::optional<at::Tensor> /* bs */,
     std::optional<at::Tensor> /* scale_ub */) {
-  const at::SymInt M = input.sym_size(0);
-  auto Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
-  auto scale = at::empty_symint({M}, input.options().dtype(at::kFloat));
+  int dims = input.dim();
+  TORCH_CHECK(dims == 2 || dims == 3, "The dim of input should be 2 or 3");
+  at::Tensor Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
+  at::Tensor scale;
+  if (dims == 2) {
+    const at::SymInt M = input.sym_size(0);
+    scale = at::empty_symint({M}, input.options().dtype(at::kFloat));
+  } else {
+    const at::SymInt B = input.sym_size(0);
+    const at::SymInt M = input.sym_size(1);
+    scale = at::empty_symint({B, M}, input.options().dtype(at::kFloat));
+  }
   return {Y, scale};
 }
 
@@ -652,10 +780,11 @@ at::Tensor bf16bf16bf16_grouped_dynamic_meta(
     at::Tensor X,
     at::Tensor W,
     at::Tensor /* zero_start_index_M */) {
-  int G = X.size(0);
-  int M = X.size(1);
-  int N = W.size(1);
-  at::Tensor Y = at::empty({G, M, N}, X[0].options().dtype(at::kBFloat16));
+  const at::SymInt G = X.sym_size(0);
+  const at::SymInt M = X.sym_size(1);
+  const at::SymInt N = W.sym_size(1);
+  at::Tensor Y =
+      at::empty_symint({G, M, N}, X[0].options().dtype(at::kBFloat16));
   return Y;
 }
 
@@ -680,9 +809,17 @@ TORCH_LIBRARY_IMPL(fbgemm, Meta, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched_meta);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise_meta);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise_meta);
+  m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched_meta);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched_meta);
   m.impl("f8f8bf16_lite", f8f8bf16_lite_meta);
   m.impl("scaled_fp4_quant", scaled_fp4_quant_meta);
+  m.impl("preshuffle_i4", preshuffle_i4_meta);
+  m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled_meta);
+#endif
+#ifdef USE_ROCM
+  m.impl("f8f8f16_rowwise", f8f8f16_rowwise_meta);
+  m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_meta);
+  m.impl("f8f8f16_rowwise_preshuffle", f8f8f16_rowwise_meta);
 #endif
 }
 

@@ -14,13 +14,13 @@
 
 #include <gtest/gtest.h>
 
-#include "bench/BenchUtils.h"
+#include "bench/BenchUtils.h" // @manual
 #include "fbgemm/FbgemmFP32.h"
 #include "test/FBGemmFPTest.h"
 
 using FBGemmFP32Test = fbgemm::FBGemmFPTest<float>;
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     FBGemmFP32Test,
     ::testing::Values(

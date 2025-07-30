@@ -9,12 +9,14 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 
-#include "fbgemm_gpu/utils/device_properties.cuh"
+#include "fbgemm_gpu/utils/kernel_execution_timer.cuh"
 #include "fbgemm_gpu/utils/source_context.h"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
 
+#include <memory>
 #include <type_traits>
 
 namespace fbgemm_gpu::utils {
@@ -90,15 +92,13 @@ decltype(auto) check_kernel_arg(const SourceContext& context, T&& arg) {
 template <
     bool EnableDSA = false,
     bool EnableBarrierIsolation = false,
-    bool EnableNaNChecks = false>
+    bool EnableNaNChecks = false,
+    bool EnableExecutionTimer = false>
 struct KernelLauncher {
   const SourceContext context;
 
-  constexpr inline KernelLauncher(
-      const source_location& location,
-      const std::string_view& summary,
-      const std::string_view& secondaryLocation) noexcept
-      : context(SourceContext(location, summary, secondaryLocation)) {}
+  constexpr inline KernelLauncher(const SourceContext& ctx) noexcept
+      : context(ctx) {}
 
   constexpr inline void checkGridSizesInRange(
       const cudaDeviceProp& properties,
@@ -176,7 +176,13 @@ struct KernelLauncher {
     TORCH_CHECK(
         threads_per_block <= properties.maxThreadsPerBlock,
         context.description(),
-        ": Threads per block ",
+        ": [block dim ",
+        block.x,
+        " x ",
+        block.y,
+        " x ",
+        block.z,
+        "] Threads per block ",
         threads_per_block,
         " is greater than the limit of ",
         properties.maxThreadsPerBlock);
@@ -186,15 +192,28 @@ struct KernelLauncher {
     // automatically work around problem like CUDA does (V100 or newer
     // architectures), see:
     //    https://github.com/ROCm/hip/issues/2253
+    //    https://rocm.docs.amd.com/projects/HIP/en/docs-develop/reference/hip_runtime_api/modules/occupancy.html
     const uint64_t total_threads = U64(grid.x) * U64(grid.y) * U64(grid.z) *
         U64(block.x) * U64(block.y) * U64(block.z);
 
     TORCH_CHECK(
         total_threads < U64(std::numeric_limits<uint32_t>::max()),
         context.description(),
-        ": Total number of threads ",
+        " [grid dim ",
+        grid.x,
+        " x ",
+        grid.y,
+        " x ",
+        grid.z,
+        "] [block dim ",
+        block.x,
+        " x ",
+        block.y,
+        " x ",
+        block.z,
+        "]: Total number of threads ",
         total_threads,
-        " is greater than the limit of 2^32");
+        " is greater than the HIP limit of 2^32");
 #endif
   }
 
@@ -227,18 +246,54 @@ struct KernelLauncher {
         "]");
   }
 
+  inline void kernelLaunchCheck() const {
+    // This is a replacement for C10_CUDA_KERNEL_LAUNCH_CHECK() that adds more
+    // context information to the error message.  See:
+    //  https://github.com/pytorch/pytorch/blob/main/c10/cuda/CUDAException.cpp
+
+    const auto cuda_error = cudaGetLastError();
+
+    const auto cuda_kernel_failure =
+        c10::cuda::CUDAKernelLaunchRegistry::get_singleton_ref().has_failed();
+
+    if (C10_LIKELY(cuda_error == cudaSuccess && !cuda_kernel_failure)) {
+      return;
+    }
+
+    // Inject the context information into the error message on CUDA failures
+    TORCH_CHECK(
+        false,
+        context.description(),
+        " CUDA Error: ",
+        cudaGetErrorString(cuda_error),
+#ifdef __HIPCC__
+        // c10::cuda::get_cuda_check_suffix has only been recently added to
+        // Torch HIPify mappings, so wrap with __HIPCC__ until the mapping land
+        // in PyTorch OSS.
+        //
+        // TODO: Remove when HIPify mappings are updated in PyTorch OSS
+        c10::hip::get_hip_check_suffix(),
+#else
+        c10::cuda::get_cuda_check_suffix(),
+#endif
+        "\n",
+        c10::cuda::c10_retrieve_device_side_assertion_info());
+  }
+
   template <typename KernelFunc, typename... Args>
-  inline void launch_kernel(
+  inline auto launch_kernel(
       const KernelFunc& kernel,
       const dim3 grid,
       const dim3 block,
       const size_t shared_mem_per_block,
       const c10::cuda::CUDAStream stream,
-      Args&&... args) const {
+      Args&&... args) const
+      -> std::conditional_t<EnableExecutionTimer, float, void> {
     // Fetch device properties from the stream information
     const auto device = stream.device_index();
-    const auto properties = get_device_properties(device);
+    const auto properties = *at::cuda::getDeviceProperties(device);
     const auto streamId = stream.id();
+    [[maybe_unused]] std::unique_ptr<KernelExecutionTimer> timer = nullptr;
 
     // Check that the grid sizes are within the range per the device associated
     // with the compute stream
@@ -270,6 +325,13 @@ struct KernelLauncher {
       cudaDeviceSynchronize();
     }
 
+    // If execution timer is enabled, initialize and start the CUDAEvents-based
+    // timer prior to kernel launch
+    if constexpr (EnableExecutionTimer) {
+      timer = std::make_unique<KernelExecutionTimer>(stream);
+      timer->start();
+    }
+
     if constexpr (EnableDSA) {
       // This launch code here is essentially the same as the contents of
       // TORCH_USE_CUDA_DSA macro, but with the addition of kernel argument
@@ -284,7 +346,7 @@ struct KernelLauncher {
           transform_kernel_arg(context, std::forward<Args>(args))...,
           launch_registry.get_uvm_assertions_ptr_for_current_device(),
           launch_registry.insert(
-              context.location.file_name(),
+              context.dsa_file_descriptor_.data(),
               context.location.function_name(),
               context.location.line(),
               context.summary.data(),
@@ -297,14 +359,21 @@ struct KernelLauncher {
           transform_kernel_arg(context, std::forward<Args>(args))...);
     }
 
+    // If execution timer is enabled, stop the CUDAEvents-based timer
+    if constexpr (EnableExecutionTimer) {
+      timer->stop();
+    }
+
     // If barrier isolation is enabled, synchronize the stream again to wait for
     // kernel execution to complete
     if constexpr (EnableBarrierIsolation) {
       cudaDeviceSynchronize();
     }
 
-    // Check for CUDA errors
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // Check for CUDA errors.  This is a replacement for
+    // C10_CUDA_KERNEL_LAUNCH_CHECK() that adds more context information to the
+    // error message.
+    kernelLaunchCheck();
 
     // If NaN checks are enabled, run post-kernel verifications on all kernel
     // arguments that are tensors
@@ -312,6 +381,11 @@ struct KernelLauncher {
       const auto summary = std::string(context.summary) + " (post-execution)";
       (check_kernel_arg(context.withSummary(summary), std::forward<Args>(args)),
        ...);
+    }
+
+    // If execution timer is enabled, return the elapsed time in milliseconds
+    if constexpr (EnableExecutionTimer) {
+      return timer->elapsedMillis();
     }
   }
 };
@@ -321,11 +395,41 @@ struct KernelLauncher {
 } // namespace fbgemm_gpu::utils
 
 ////////////////////////////////////////////////////////////////////////////////
-// General Kernel Launch Macros for FBGEMM GPU Kernels
+// Enable Kernel Barrier Isolation
 //
-// This macro is used to launch GPU kernels in FBGEMM GPU codebase. It runs a
-// set of constraint checks on kernel parameters and and tensor arguments, and
-// throws descriptive errors on constraint failures.
+// When this flag is defined, kernel's execution is isolated from other GPU
+// processes that might otherwise have been running concurrently.  This acts as
+// a performance profiling tool used in conjunction with trace inspection to
+// determine whether a kernel's regression might be due to other GPU processes
+// competing for memory bandwidth that is causing the kernel slowdown, which can
+// be especially relevant when data accessed by the kernel is in UVM.
+////////////////////////////////////////////////////////////////////////////////
+
+#ifdef FBGEMM_GPU_ISOLATE_KERNEL_LAUNCH
+#define _FKL_BLOCKING_ true
+#else
+#define _FKL_BLOCKING_ false
+#endif
+
+////////////////////////////////////////////////////////////////////////////////
+// Enable Tensor Value Checks
+//
+// When defined, tensors that are passed into the kernel launcher via TA_B() or
+// PTA_B() will be checked for NaN and Inf values.  This is an expensive check
+// and is meant to be used for debugging.
+////////////////////////////////////////////////////////////////////////////////
+
+#ifdef FBGEMM_GPU_TENSORCHECK
+#define _FKL_TENSORCHECK_ true
+#else
+#define _FKL_TENSORCHECK_ false
+#endif
+
+////////////////////////////////////////////////////////////////////////////////
+// Kernel Launcher Macros for FBGEMM GPU Kernels
+//
+// This macro simplifies the construction and execution of KernelLauncher
+// instances by wrapping the kernel launches into simple-to-use macros.
 //
 // NOTES:
 //
@@ -342,44 +446,33 @@ struct KernelLauncher {
 //  macro.
 ////////////////////////////////////////////////////////////////////////////////
 
-#ifdef __TEMPLATE_SOURCE_FILE__
-#define _FKL_TFILE_ __TEMPLATE_SOURCE_FILE__
-#else
-#define _FKL_TFILE_ ""
-#endif
-
-#ifdef FBGEMM_GPU_ISOLATE_KERNEL_LAUNCH
-#define _FKL_BLOCKING_ true
-#else
-#define _FKL_BLOCKING_ false
-#endif
-
-#ifdef FBGEMM_GPU_TENSORCHECK
-#define _FKL_TENSORCHECK_ true
-#else
-#define _FKL_TENSORCHECK_ false
-#endif
-
 #define FBGEMM_LAUNCH_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
   ([&] {                                                                    \
-    using source_location = fbgemm_gpu::utils::source_location;             \
-    constexpr auto location = source_location::current();                   \
+    constexpr auto context = SOURCE_CONTEXT_CURRENT(KERNEL);                \
     decltype(KERNEL)& kernel = KERNEL;                                      \
                                                                             \
     return fbgemm_gpu::utils::                                              \
-        KernelLauncher<false, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(           \
-               location, #KERNEL, _FKL_TFILE_)                              \
+        KernelLauncher<false, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(context)   \
             .launch_kernel(kernel, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
   }())
 
 #define FBGEMM_LAUNCH_DSA_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)    \
   ([&] {                                                                    \
-    using source_location = fbgemm_gpu::utils::source_location;             \
-    constexpr auto location = source_location::current();                   \
+    constexpr auto context = SOURCE_CONTEXT_CURRENT(KERNEL);                \
     decltype(KERNEL)& kernel = KERNEL;                                      \
                                                                             \
     return fbgemm_gpu::utils::                                              \
-        KernelLauncher<true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(            \
-               location, #KERNEL, _FKL_TFILE_)                              \
+        KernelLauncher<true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(context)    \
+            .launch_kernel(kernel, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
+  }())
+
+#define FBGEMM_TIME_KERNEL_RUN(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)      \
+  ([&] {                                                                    \
+    constexpr auto context = SOURCE_CONTEXT_CURRENT(KERNEL);                \
+    decltype(KERNEL)& kernel = KERNEL;                                      \
+                                                                            \
+    return fbgemm_gpu::utils::                                              \
+        KernelLauncher<false, _FKL_BLOCKING_, _FKL_TENSORCHECK_, true>(     \
+               context)                                                     \
             .launch_kernel(kernel, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
   }())

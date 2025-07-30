@@ -8,11 +8,11 @@
 
 #pragma once
 
-#include "./FbgemmBuild.h"
-#include "./QuantUtilsAvx2.h"
-#include "./QuantUtilsNeon.h"
-#include "./Types.h"
-#include "./Utils.h"
+#include "./FbgemmBuild.h" // @manual
+#include "./QuantUtilsAvx2.h" // @manual
+#include "./QuantUtilsNeon.h" // @manual
+#include "./Types.h" // @manual
+#include "./Utils.h" // @manual
 
 #include <algorithm>
 #include <cassert>
@@ -68,7 +68,7 @@ T Quantize(
     std::int32_t zero_point,
     float scale,
     int result_precision,
-    bool result_is_signed = std::is_signed<T>::value) {
+    bool result_is_signed = std::is_signed_v<T>) {
   // Note: We want to multiply with src with inv_scale instead of
   // dividing src by scale. The same is done in vector code and
   // at other places.
@@ -87,7 +87,7 @@ T Quantize(
   // and nearbyint(2.5) is 2.0
   // Adding zero_point before or after rounding can make a difference
   // in exactly halfway cases.
-  if (LEGACY) {
+  if constexpr (LEGACY) {
     transformed_val = std::nearbyint(zero_point + transformed_val);
   } else {
     transformed_val = zero_point + std::nearbyint(transformed_val);
@@ -162,7 +162,7 @@ void Dequantize(
     const TensorQuantizationParams& qparams,
     int thread_id = 0,
     int num_threads = 1) {
-  int64_t i_begin, i_end;
+  int64_t i_begin = 0, i_end = 0;
   fbgemmPartition1D(thread_id, num_threads, len, i_begin, i_end);
   for (int64_t i = i_begin; i < i_end; i++) {
     dst[i] = Dequantize(src[i], qparams);

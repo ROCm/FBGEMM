@@ -70,6 +70,10 @@ def _get_varseq_batch_seqpos(
     return varseq_batch, varseq_seqpos
 
 
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.device_count() == 0,
+    "CUDA is not available or no GPUs detected",
+)
 class KVCacheTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -355,6 +359,182 @@ class KVCacheTests(unittest.TestCase):
 
     @settings(deadline=None)
     @given(
+        MAX_T=st.sampled_from([8000, 16384]),
+        N_KVH_L=st.sampled_from([1, 2]),
+    )
+    @unittest.skipIf(
+        not torch.cuda.is_available() or not HAS_XFORMERS or not torch.version.hip,
+        "Skip when no AMD GPU or xformers is not available",
+    )
+    def test_fp8_kv_e4m3fn_convert_to_e4m3fnuz(self, MAX_T: int, N_KVH_L: int) -> None:
+        N_H_L = 2
+        B = 2
+        D_H = 128
+
+        def signed_to_binary(value: torch.Tensor, bits: int) -> str:
+            if value >= 0:
+                return bin(value)[2:].zfill(bits)
+            else:
+                unsigned_value = (1 << bits) + value
+                return bin(unsigned_value)[2:].zfill(bits)
+
+        qparam_offset = 0
+
+        # Init K to all 1s
+        cache_fp8x4_k = torch.full(
+            size=(N_H_L, B, MAX_T, N_KVH_L, int(D_H) + qparam_offset),
+            fill_value=0x01,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+
+        # Choose random elements to set to negative zero, 0x80
+        cache_fp8x4_k_flat = cache_fp8x4_k.flatten()
+        random_indices = torch.randperm(cache_fp8x4_k_flat.size(0))[
+            : cache_fp8x4_k_flat.size(0) // 2
+        ]
+        cache_fp8x4_k_flat[random_indices] = 0x80
+        cache_fp8x4_k = cache_fp8x4_k_flat.reshape(cache_fp8x4_k.shape)
+
+        # Expected K has +0 in place of -0
+        cache_fp8x4_k_expected_flat = cache_fp8x4_k_flat.clone()
+        cache_fp8x4_k_expected_flat[random_indices] = 0x00
+        cache_fp8x4_k_expected = cache_fp8x4_k_expected_flat.reshape(
+            cache_fp8x4_k.shape
+        )
+
+        # Repeat for V
+        cache_fp8x4_v = torch.full(
+            size=(N_H_L, B, MAX_T, N_KVH_L, int(D_H) + qparam_offset),
+            fill_value=0x01,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        cache_fp8x4_v_flat = cache_fp8x4_v.flatten()
+        random_indices = torch.randperm(cache_fp8x4_v_flat.size(0))[
+            : cache_fp8x4_v_flat.size(0) // 2
+        ]
+        cache_fp8x4_v_flat[random_indices] = 0x80
+        cache_fp8x4_v = cache_fp8x4_v_flat.reshape(cache_fp8x4_v.shape)
+        cache_fp8x4_v_expected_flat = cache_fp8x4_v_flat.clone()
+        cache_fp8x4_v_expected_flat[random_indices] = 0x00
+        cache_fp8x4_v_expected = cache_fp8x4_v_expected_flat.reshape(
+            cache_fp8x4_v.shape
+        )
+
+        num_fp16_vals = N_H_L * B * MAX_T * N_KVH_L * 2
+        fp16_max = 65504.0
+        scale_ub = fp16_max / 2
+        # Rand tensor of -1s and 1s
+        signs = torch.randint(
+            0, 2, (num_fp16_vals,), dtype=torch.int, device=self.device
+        )
+        signs = signs * 2 - 1
+        # Rand tensor of (0, 1) fp16 values
+        qparam_fp16x2_k = torch.rand(
+            num_fp16_vals, dtype=torch.float16, device=self.device
+        )
+        # Scale (0, 1) values up to scale_ub and randomize signs
+        assert torch.all(qparam_fp16x2_k <= 1.0)
+        assert torch.all(qparam_fp16x2_k >= 0.0)
+        assert torch.all(signs <= 1.0)
+        assert torch.all(signs >= -1.0)
+        qparam_fp16x2_k = qparam_fp16x2_k * scale_ub * signs
+
+        # If running on AMD -0.0*2.0=0.0, so remove -0s so we can directly match
+        qparam_fp16x2_k = torch.where(
+            qparam_fp16x2_k != -0.0,
+            qparam_fp16x2_k,
+            0.0,
+        )
+
+        # Reshape
+        qparam_fp16x2_k = qparam_fp16x2_k.reshape((N_H_L, B, MAX_T, N_KVH_L, 2))
+
+        # Generate expected tensor by multiplying scale values by 2
+        qparam_fp16x2_k_expected = qparam_fp16x2_k.clone()
+        qparam_fp16x2_k_expected[:, :, :, :, 0] = (
+            qparam_fp16x2_k_expected[:, :, :, :, 0] * 2.0
+        )
+
+        assert torch.all(qparam_fp16x2_k <= scale_ub)
+        assert torch.all(qparam_fp16x2_k > -scale_ub)
+        assert torch.all(qparam_fp16x2_k_expected <= fp16_max)
+        assert torch.all(qparam_fp16x2_k_expected > -fp16_max)
+
+        qparam_fp16x2_k = qparam_fp16x2_k.view(torch.int32)
+        qparam_fp16x2_k_expected = qparam_fp16x2_k_expected.view(torch.int32)
+
+        # Repeat for v
+        signs = torch.randint(
+            0, 2, (num_fp16_vals,), dtype=torch.int, device=self.device
+        )
+        signs = signs * 2 - 1
+        qparam_fp16x2_v = torch.rand(
+            num_fp16_vals, dtype=torch.float16, device=self.device
+        )
+
+        assert torch.all(qparam_fp16x2_v <= 1.0)
+        assert torch.all(qparam_fp16x2_v >= 0.0)
+        assert torch.all(signs <= 1.0)
+        assert torch.all(signs >= -1.0)
+
+        qparam_fp16x2_v = qparam_fp16x2_v * scale_ub * signs
+
+        qparam_fp16x2_v = torch.where(
+            qparam_fp16x2_v != -0.0,
+            qparam_fp16x2_v,
+            0.0,
+        )
+
+        qparam_fp16x2_v = qparam_fp16x2_v.reshape((N_H_L, B, MAX_T, N_KVH_L, 2))
+        qparam_fp16x2_v_expected = qparam_fp16x2_v.clone()
+        qparam_fp16x2_v_expected[:, :, :, :, 0] = (
+            qparam_fp16x2_v_expected[:, :, :, :, 0] * 2.0
+        )
+
+        assert torch.all(qparam_fp16x2_v <= scale_ub)
+        assert torch.all(qparam_fp16x2_v > -scale_ub)
+        assert torch.all(qparam_fp16x2_v_expected <= fp16_max)
+        assert torch.all(qparam_fp16x2_v_expected > -fp16_max)
+
+        qparam_fp16x2_v = qparam_fp16x2_v.view(torch.int32)
+        qparam_fp16x2_v_expected = qparam_fp16x2_v_expected.view(torch.int32)
+
+        qparam_fp16x2_k_before = qparam_fp16x2_k.clone()
+        qparam_fp16x2_v_before = qparam_fp16x2_v.clone()
+        torch.ops.fbgemm.convert_e4m3fn_kv_cache_to_e4m3fnuz_inplace(
+            cache_fp8x4_k, cache_fp8x4_v, qparam_fp16x2_k, qparam_fp16x2_v
+        )
+        assert torch.equal(cache_fp8x4_k, cache_fp8x4_k_expected)
+        assert torch.equal(cache_fp8x4_v, cache_fp8x4_v_expected)
+
+        def log_differences(
+            original: torch.Tensor, got: torch.Tensor, expected: torch.Tensor
+        ) -> None:
+            o = original.flatten()
+            g = got.flatten()
+            e = expected.flatten()
+            differing_indices = torch.nonzero(g != e, as_tuple=True)
+            for index in zip(*differing_indices):
+                logger.error(
+                    f"Index {index}: tensor_orign = {signed_to_binary(o[index], 32)} tensor_got = {signed_to_binary(g[index], 32)}, tensor_expected = {signed_to_binary(e[index], 32)}"
+                )
+
+        if not torch.equal(qparam_fp16x2_k, qparam_fp16x2_k_expected):
+            log_differences(
+                qparam_fp16x2_k_before, qparam_fp16x2_k, qparam_fp16x2_k_expected
+            )
+            assert torch.equal(qparam_fp16x2_k, qparam_fp16x2_k_expected)
+
+        if not torch.equal(qparam_fp16x2_v, qparam_fp16x2_v_expected):
+            log_differences(
+                qparam_fp16x2_v_before, qparam_fp16x2_v, qparam_fp16x2_v_expected
+            )
+            assert torch.equal(qparam_fp16x2_v, qparam_fp16x2_v_expected)
+
+    @settings(deadline=None)
+    @given(
         prefill=st.booleans(),
         rope_theta=st.sampled_from([None, 10000.0]),
         MAX_T=st.sampled_from([4000, 8192]),
@@ -601,7 +781,8 @@ class KVCacheTests(unittest.TestCase):
 
         func = (
             torch.compile(
-                torch.ops.fbgemm.rope_qkv_varseq_prefill, backend=self.compile_backend
+                torch.ops.fbgemm.rope_qkv_varseq_prefill,
+                backend=self.compile_backend,
             )
             if prefill
             else torch.compile(

@@ -8,10 +8,40 @@
 
 # shellcheck disable=SC1091,SC2128
 . "$( dirname -- "$BASH_SOURCE"; )/utils_base.bash"
+. "$( dirname -- "$BASH_SOURCE"; )/fbgemm_gpu_test.bash"
 
 ################################################################################
 # FBGEMM_GPU Test Helper Functions
 ################################################################################
+
+setup_fbgemm_gpu_bench () {
+  env_name="$1"
+
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
+
+  # shellcheck disable=SC2086
+  fbgemm_build_variant=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__variant__)")
+  echo "[BENCH] Determined FBGEMM_GPU variant from installation: ${fbgemm_build_variant}"
+
+  if [ "$fbgemm_build_variant" == "rocm" ]; then
+    echo "[BENCH] Configuring for ROCm-based benchmarking ..."
+    __configure_fbgemm_gpu_test_rocm
+  fi
+
+  if [[ $MACHINE_NAME == 'aarch64' ]]; then
+    # NOTE: Setting KMP_DUPLICATE_LIB_OK silences the error about multiple
+    # OpenMP being linked when FBGEMM_GPU is compiled under Clang on aarch64
+    # machines:
+    #   https://stackoverflow.com/questions/53014306/error-15-initializing-libiomp5-dylib-but-found-libiomp5-dylib-already-initial
+    echo "[TEST] Platform is aarch64; will set KMP_DUPLICATE_LIB_OK ..."
+    # shellcheck disable=SC2086
+    print_exec conda env config vars set ${env_prefix} KMP_DUPLICATE_LIB_OK=1
+  fi
+
+  # shellcheck disable=SC2086
+  print_exec conda env config vars set ${env_prefix} TORCH_SHOW_CPP_STACKTRACES=1
+}
 
 run_tbe_microbench () {
   local env_name="$1"
@@ -30,61 +60,46 @@ run_tbe_microbench () {
     # shellcheck disable=SC2155
     local env_prefix=$(env_name_or_prefix "${env_name}")
 
-    if [ "$embedding_location" == "hbm" ]; then
-      local managed="device"
-    elif [ "$embedding_location" == "uvm" ]; then
-      local managed="managed"
-    fi
-
-    # Old TBE benchmark script
-    # shellcheck disable=SC2086
-    print_exec conda run --no-capture-output ${env_prefix} python tbe/split_table_batched_embeddings_benchmark.py device \
-      --batch-size 13107 \
-      --embedding-dim 256 \
-      --iters 400 \
-      --warmup-runs 50 \
-      --alpha 1.15 \
-      --bag-size 55 \
-      --weights-precision fp16 \
-      --cache-precision "${cache_type}" \
-      --output-dtype fp16 \
-      --managed="${managed}" \
-      --num-embeddings 10000000 \
-      --num-tables 1 \
-      --row-wise
-
-    # New TBE benchmark script
-    #
     # Invoke `python tbe/tbe_training_benchmark.py device --help` for
     # documentation on all available flags
     # shellcheck disable=SC2086
     print_exec conda run --no-capture-output ${env_prefix} python tbe/tbe_training_benchmark.py device \
-      --bench-iterations 400 \
-      --bench-warmup-iterations 50 \
-      --bench-num-requests 10 \
-      --tbe-batch-size 13107 \
-      --tbe-embedding-dim 256 \
-      --tbe-pooling-size 55 \
-      --tbe-num-embeddings 10000000 \
-      --tbe-num-tables 1 \
-      --emb-weights-dtype fp16 \
-      --emb-cache-dtype "${cache_type}" \
-      --emb-output-dtype fp16 \
-      --emb-location "${managed}" \
-      --row-wise
+        --tbe-batch-size 13107 \
+        --tbe-embedding-dim 256 \
+        --tbe-pooling-size 55 \
+        --tbe-num-embeddings 10000000 \
+        --tbe-num-tables 1 \
+        --tbe-indices-zipf 1.0 1.15 \
+        --emb-weights-dtype fp16 \
+        --emb-cache-dtype "${cache_type}" \
+        --emb-output-dtype fp16 \
+        --emb-location "${embedding_location}" \
+        --emb-pooling-mode sum \
+        --row-wise \
+        --bench-iterations 100 \
+        --bench-warmup-iterations 50 \
+        --bench-export-trace --bench-trace-url "test_${cache_type}_${embedding_location}.json"
   }
 
   pushd fbgemm_gpu/bench || return 1
 
   local cache_types=(
-    # fp16
+    fp16
     fp32
   )
 
-  local embedding_locations=(
-    # uvm
-    hbm
-  )
+
+  if  [ "${BUILD_VARIANT}" == "cpu" ]; then
+    local embedding_locations=(
+      host
+    )
+  else
+    local embedding_locations=(
+      managed_caching
+      managed
+      device
+    )
+  fi
 
   for cache_type in "${cache_types[@]}"; do
     for embedding_location in "${embedding_locations[@]}"; do

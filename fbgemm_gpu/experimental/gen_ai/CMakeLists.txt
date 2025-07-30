@@ -5,43 +5,82 @@
 # LICENSE file in the root directory of this source tree.
 
 ################################################################################
+# CMake Prelude
+################################################################################
+
+cmake_minimum_required(VERSION 3.21 FATAL_ERROR)
+
+set(CMAKEMODULES ${CMAKE_CURRENT_LIST_DIR}/../../../cmake/modules)
+include(${CMAKEMODULES}/Utilities.cmake)
+include(${CMAKEMODULES}/GpuCppLibrary.cmake)
+
+# CUDA Setup
+include(${CMAKEMODULES}/CudaSetup.cmake)
+
+# ROCm and HIPify Setup
+include(${CMAKEMODULES}/RocmSetup.cmake)
+
+set(CMAKE_VERBOSE_MAKEFILE ON)
+
+################################################################################
 # Target Sources
 ################################################################################
 
-file(GLOB experimental_gen_ai_cpp_source_files_cpu
-  src/quantize/*.cpp)
+glob_files_nohip(experimental_gen_ai_cpp_source_files_cpu
+  src/attention/*.cpp
+  src/coalesce/*.cpp
+  src/moe/*.cpp
+  src/quantize/*.cpp
+  src/quantize/common/*.cpp)
 
-file(GLOB experimental_gen_ai_cpp_source_files_gpu
+glob_files_nohip(experimental_gen_ai_cpp_source_files_gpu
+  src/attention/*.cu
+  src/coalesce/*.cu
+  src/moe/*.cu
   src/quantize/*.cu)
 
 if(FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
-  file(GLOB tmp_list_cpu
-    src/attention/*.cpp
-    src/coalesce/*.cpp
+  glob_files_nohip(tmp_list_cpu
     src/comm/*.cpp
-    src/gather_scatter/*.cpp
-    src/kv_cache/*.cpp
-    src/moe/*.cpp)
+    src/gather_scatter/*.cpp)
 
-  file(GLOB tmp_list_gpu
-    src/attention/*.cu
-    src/coalesce/*.cu
+  glob_files_nohip(tmp_list_gpu
     src/comm/*.cu
-    src/gather_scatter/*.cu
-    src/kv_cache/*.cu
-    src/moe/*.cu)
+    src/gather_scatter/*.cu)
 
-  list(APPEND experimental_gen_ai_cpp_source_files_cpu ${tmp_list_cpu})
-  list(APPEND experimental_gen_ai_cpp_source_files_gpu ${tmp_list_gpu})
+  # TODO: kv_cache sources need to be updated with proper CUDA_VERSION ifdef
+  # wrapping before this if-clause can be removed
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+    glob_files_nohip(tmp_list_cpu2
+      src/kv_cache/*.cpp)
+
+    glob_files_nohip(tmp_list_gpu2
+      src/kv_cache/*.cu)
+  endif()
+
+  list(APPEND experimental_gen_ai_cpp_source_files_cpu ${tmp_list_cpu} ${tmp_list_cpu2})
+  list(APPEND experimental_gen_ai_cpp_source_files_gpu ${tmp_list_gpu} ${tmp_list_gpu2})
 endif()
 
-# Set the source file for FB only CPP
-if(USE_FB_ONLY AND (FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA))
-  file(GLOB fb_only_sources_cpu
+# Include FB-internal code into the build
+if(USE_FB_ONLY
+  AND (FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
+  AND (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0))
+  glob_files_nohip(fb_only_sources_cpu
       fb/src/*/*.cpp)
 
-  file(GLOB fb_only_sources_gpu
+  glob_files_nohip(fb_only_sources_gpu
       fb/src/*/*.cu)
+
+  if(NOT FBGEMM_FBPKG_BUILD)
+    # NOTE: Some FB-internal code explicitly require an FB-internal
+    # environment to build, such as code that depends on NCCLX
+    list(FILTER fb_only_sources_cpu
+      EXCLUDE REGEX "fb/src/tensor_parallel(/.*)*\\.cpp$")
+
+    list(FILTER fb_only_sources_gpu
+      EXCLUDE REGEX "fb/src/tensor_parallel(/.*)*\\.cu$")
+  endif()
 
   list(APPEND experimental_gen_ai_cpp_source_files_cpu ${fb_only_sources_cpu})
   list(APPEND experimental_gen_ai_cpp_source_files_gpu ${fb_only_sources_gpu})
@@ -62,19 +101,44 @@ file(GLOB_RECURSE experimental_gen_ai_cpp_source_files_hip
   src/quantize/ck_extensions/*.hip
   src/quantize/ck_extensions/**/*.hip)
 
+# Filter out MoE sources for ROCm for now
+list(FILTER experimental_gen_ai_cpp_source_files_hip
+  EXCLUDE REGEX "src/quantize/ck_extensions/fused_moe(/.*)*\\.hip$")
 
 ################################################################################
 # Build Shared Library
 ################################################################################
 
+# Customizations for PyTorch build integration
+IF(DEFINED CAFFE2_THIRD_PARTY_ROOT)
+  # Remove "experimental" from the library name
+  set(FBGEMM_GENAI_LIB_NAME fbgemm_gpu_gen_ai)
+  # Keep lib prefix
+  set(KEEP_PREFIX ON)
+  # Install the library in the build directory
+  set(DESTINATION ${CMAKE_INSTALL_LIBDIR})
+else()
+  set(FBGEMM_GENAI_LIB_NAME fbgemm_gpu_experimental_gen_ai)
+  set(KEEP_PREFIX OFF)
+  set(DESTINATION "")
+endif()
+
 gpu_cpp_library(
   PREFIX
-    fbgemm_gpu_experimental_gen_ai
+    ${FBGEMM_GENAI_LIB_NAME}
   TYPE
     SHARED
+  DESTINATION
+    ${DESTINATION}
+  KEEP_PREFIX
+    ${KEEP_PREFIX}
   INCLUDE_DIRS
     ${fbgemm_sources_include_directories}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quantize
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quantize/common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/kv_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${FBGEMM_GENAI_INCLUDE_DIRS}
   CPU_SRCS
     ${experimental_gen_ai_cpp_source_files_cpu}
   GPU_SRCS
@@ -82,7 +146,22 @@ gpu_cpp_library(
   CUDA_SPECIFIC_SRCS
     ${experimental_gen_ai_cpp_source_files_cuda}
   HIP_SPECIFIC_SRCS
-    ${experimental_gen_ai_cpp_source_files_hip})
+    ${experimental_gen_ai_cpp_source_files_hip}
+  TORCH_LIBS
+    # Used when building as part of PyTorch
+    ${FBGEMM_GENAI_TORCH_LIBS}
+  HIPCC_FLAGS
+    # Below flags are required for strong CK performance
+    # on certain kernel instances
+    -mllvm
+    # Reduce register spillage on certain kernels
+    -amdgpu-coerce-illegal-types=1
+    -mllvm
+    -enable-post-misched=0
+    -mllvm
+    -greedy-reverse-local-assignment=1
+    -fhip-new-launch-api)
+
 
 
 ################################################################################
@@ -91,11 +170,11 @@ gpu_cpp_library(
 
 add_to_package(
   DESTINATION fbgemm_gpu/experimental/gen_ai
-  TARGETS fbgemm_gpu_experimental_gen_ai)
+  TARGETS ${FBGEMM_GENAI_LIB_NAME})
 
 install(
   DIRECTORY bench
-  DESTINATION fbgemm_gpu/experimental)
+  DESTINATION fbgemm_gpu/experimental/gen_ai)
 
 install(
   DIRECTORY gen_ai

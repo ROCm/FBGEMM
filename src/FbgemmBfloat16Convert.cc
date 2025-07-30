@@ -9,7 +9,7 @@
 #define FBGEMM_EXPORTS
 #include "fbgemm/FbgemmConvert.h"
 
-#include "./RefImplementations.h"
+#include <stdexcept>
 
 #ifdef USE_MKL
 #include <mkl.h>
@@ -19,16 +19,13 @@
 #if __APPLE__
 // not sure whether need to differentiate TARGET_OS_MAC or TARGET_OS_IPHONE,
 // etc.
-#include <Accelerate/Accelerate.h>
+#include <Accelerate/Accelerate.h> // @manual
 #else
-#include <cblas.h>
+#include <cblas.h> // @manual
 #endif
 #endif
 
 #include <cpuinfo.h>
-#include <memory>
-#include <utility>
-#include <vector>
 
 #ifdef FBGEMM_MEASURE_TIME_BREAKDOWN
 double naive_malloc_time = 0.0;

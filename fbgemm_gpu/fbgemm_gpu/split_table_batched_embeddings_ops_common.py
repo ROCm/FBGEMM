@@ -11,7 +11,7 @@
 
 import enum
 from dataclasses import dataclass
-from typing import List, NamedTuple, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -35,6 +35,17 @@ class EmbeddingLocation(enum.IntEnum):
 
     @classmethod
     # pyre-ignore[3]
+    def str_values(cls):
+        return [
+            "device",
+            "managed",
+            "managed_caching",
+            "host",
+            "mtia",
+        ]
+
+    @classmethod
+    # pyre-ignore[3]
     def from_str(cls, key: str):
         lookup = {
             "device": EmbeddingLocation.DEVICE,
@@ -49,6 +60,109 @@ class EmbeddingLocation(enum.IntEnum):
             raise ValueError(f"Cannot parse value into EmbeddingLocation: {key}")
 
 
+class EvictionPolicy(NamedTuple):
+    eviction_trigger_mode: int = (
+        0  # disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual
+    )
+    eviction_strategy: int = (
+        0  # 0: timestamp, 1: counter (feature score), 2: counter (feature score) + timestamp, 3: feature l2 norm
+    )
+    eviction_step_intervals: Optional[int] = (
+        None  # trigger_step_interval if trigger mode is iteration
+    )
+    eviction_mem_threshold_gb: Optional[int] = (
+        None  # eviction trigger condition if trigger mode is mem_util
+    )
+    counter_thresholds: Optional[List[int]] = (
+        None  # count_thresholds for each table if eviction strategy is feature score
+    )
+    ttls_in_mins: Optional[List[int]] = (
+        None  # ttls_in_mins for each table if eviction strategy is timestamp
+    )
+    counter_decay_rates: Optional[List[float]] = (
+        None  # count_decay_rates for each table if eviction strategy is feature score
+    )
+    l2_weight_thresholds: Optional[List[float]] = (
+        None  # l2_weight_thresholds for each table if eviction strategy is feature l2 norm
+    )
+    interval_for_insufficient_eviction_s: int = (
+        # wait at least # seconds before trigger next round of eviction, if last finished eviction is insufficient
+        # insufficient means we didn't evict enough rows, so we want to wait longer time to
+        # avoid another insufficient eviction
+        600
+    )
+    interval_for_sufficient_eviction_s: int = (
+        # wait at least # seconds before trigger next round of eviction, if last finished eviction is sufficient
+        60
+    )
+    meta_header_lens: Optional[List[int]] = None  # metaheader length for each table
+
+    def validate(self) -> None:
+        assert self.eviction_trigger_mode in [0, 1, 2, 3], (
+            "eviction_trigger_mode must be 0, 1, 2, or 3, "
+            f"actual {self.eviction_trigger_mode}"
+        )
+        if self.eviction_trigger_mode == 0:
+            return
+
+        assert self.eviction_strategy in [0, 1, 2, 3], (
+            "eviction_strategy must be 0, 1, 2, or 3, "
+            f"actual {self.eviction_strategy}"
+        )
+        if self.eviction_trigger_mode == 1:
+            assert (
+                self.eviction_step_intervals is not None
+                and self.eviction_step_intervals > 0
+            ), (
+                "eviction_step_intervals must be positive if eviction_trigger_mode is 1, "
+                f"actual {self.eviction_step_intervals}"
+            )
+        elif self.eviction_trigger_mode == 2:
+            assert (
+                self.eviction_mem_threshold_gb is not None
+            ), "eviction_mem_threshold_gb must be set if eviction_trigger_mode is 2"
+
+        if self.eviction_strategy == 0:
+            assert self.ttls_in_mins is not None, (
+                "ttls_in_mins must be set if eviction_strategy is 0, "
+                f"actual {self.ttls_in_mins}"
+            )
+        elif self.eviction_strategy == 1:
+            assert self.counter_thresholds is not None, (
+                "counter_thresholds must be set if eviction_strategy is 1, "
+                f"actual {self.counter_thresholds}"
+            )
+            assert self.counter_decay_rates is not None, (
+                "counter_decay_rates must be set if eviction_strategy is 1, "
+                f"actual {self.counter_decay_rates}"
+            )
+            assert len(self.counter_thresholds) == len(self.counter_decay_rates), (
+                "counter_thresholds and counter_decay_rates must have the same length, "
+                f"actual {self.counter_thresholds} vs {self.counter_decay_rates}"
+            )
+        elif self.eviction_strategy == 2:
+            assert self.counter_thresholds is not None, (
+                "counter_thresholds must be set if eviction_strategy is 2, "
+                f"actual {self.counter_thresholds}"
+            )
+            assert self.counter_decay_rates is not None, (
+                "counter_decay_rates must be set if eviction_strategy is 2, "
+                f"actual {self.counter_decay_rates}"
+            )
+            assert self.ttls_in_mins is not None, (
+                "ttls_in_mins must be set if eviction_strategy is 2, "
+                f"actual {self.ttls_in_mins}"
+            )
+            assert len(self.counter_thresholds) == len(self.counter_decay_rates), (
+                "counter_thresholds and counter_decay_rates must have the same length, "
+                f"actual {self.counter_thresholds} vs {self.counter_decay_rates}"
+            )
+            assert len(self.counter_thresholds) == len(self.ttls_in_mins), (
+                "counter_thresholds and ttls_in_mins must have the same length, "
+                f"actual {self.counter_thresholds} vs {self.ttls_in_mins}"
+            )
+
+
 class KVZCHParams(NamedTuple):
     # global bucket id start and global bucket id end offsets for each logical table,
     # where start offset is inclusive and end offset is exclusive
@@ -56,12 +170,22 @@ class KVZCHParams(NamedTuple):
     # bucket size for each logical table
     # the value indicates corresponding input space for each bucket id, e.g. 2^50 / total_num_buckets
     bucket_sizes: List[int] = []
+    # enable optimizer offloading or not
+    enable_optimizer_offloading: bool = False
+    # when enabled, backend will return whole row(metaheader + weight + optimizer) instead of weight only
+    # can only be enabled when enable_optimizer_offloading is enabled
+    backend_return_whole_row: bool = False
+    eviction_policy: EvictionPolicy = EvictionPolicy()
 
     def validate(self) -> None:
         assert len(self.bucket_offsets) == len(self.bucket_sizes), (
             "bucket_offsets and bucket_sizes must have the same length, "
             f"actual {self.bucket_offsets} vs {self.bucket_sizes}"
         )
+        self.eviction_policy.validate()
+        assert (
+            not self.backend_return_whole_row or self.enable_optimizer_offloading
+        ), "backend_return_whole_row can only be enabled when enable_optimizer_offloading is enabled"
 
 
 class BackendType(enum.IntEnum):

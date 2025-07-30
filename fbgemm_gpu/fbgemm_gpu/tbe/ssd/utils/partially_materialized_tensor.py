@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import functools
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -93,6 +93,12 @@ class PartiallyMaterializedTensor:
     def get_weights_by_ids(self, ids: torch.Tensor) -> torch.Tensor:
         return self._wrapped.get_weights_by_ids(ids)
 
+    def __reduce__(self):
+        return (
+            PartiallyMaterializedTensor,
+            (self._wrapped,),
+        )
+
     def full_tensor(self) -> torch.Tensor:
         """
         This loads the full tensor into memory (may OOM).
@@ -159,6 +165,8 @@ class PartiallyMaterializedTensor:
 
     @property
     def dtype(self) -> torch.dtype:
+        if isinstance(self._wrapped, torch.Tensor):
+            return self._wrapped.dtype
         mapping = {"c10::Half": "half"}
         dtype_str: str = self._wrapped.dtype_str
         dtype_str = mapping.get(dtype_str, dtype_str)
@@ -169,6 +177,8 @@ class PartiallyMaterializedTensor:
 
     @property
     def device(self) -> torch.device:
+        if isinstance(self._wrapped, torch.Tensor):
+            return self._wrapped.device
         device_str: str = self._wrapped.device_str
         device = torch.device(device_str)
         assert isinstance(device, torch.device)
@@ -176,7 +186,8 @@ class PartiallyMaterializedTensor:
 
     @property
     def layout(self) -> torch.layout:
-        pass
+        if isinstance(self._wrapped, torch.Tensor):
+            return self._wrapped.layout
         layout_str_mapping = {
             "SparseCsr": "sparse_csr",
             "Strided": "strided",
@@ -237,6 +248,9 @@ class PartiallyMaterializedTensor:
             return False
 
         return torch.equal(tensor1.full_tensor(), tensor2.full_tensor())
+
+    def get_kvtensor_serializable_metadata(self) -> List[str]:
+        return self._wrapped.get_kvtensor_serializable_metadata()
 
     def __hash__(self):
         return id(self)

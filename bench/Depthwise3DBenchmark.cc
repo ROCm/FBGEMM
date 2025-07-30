@@ -21,7 +21,7 @@
 #include "./BenchUtils.h"
 #include "fbgemm/FbgemmI8DepthwiseAvx2.h"
 #include "fbgemm/Utils.h"
-#include "src/RefImplementations.h"
+#include "src/RefImplementations.h" // @manual
 
 using namespace std;
 using namespace fbgemm;
@@ -212,7 +212,7 @@ int main() {
               if (expected != actual) {
                 cerr << "Depthwise 3x3x3 results differ at (" << n << ", " << t
                      << ", " << h << ", " << w << ", " << g << "). expected "
-                     << (int)expected << " actual " << (int)actual << endl;
+                     << (int)expected << " actual " << (int)actual << '\n';
                 return -1;
               }
               assert(expected == actual);

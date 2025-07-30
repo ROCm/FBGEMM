@@ -8,9 +8,9 @@
 # CMake Prelude
 ################################################################################
 
-cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.21 FATAL_ERROR)
 
-set(CMAKEMODULES ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/modules)
+set(CMAKEMODULES ${CMAKE_CURRENT_LIST_DIR}/../cmake/modules)
 set(FBGEMM_GPU ${CMAKE_CURRENT_SOURCE_DIR})
 set(FBGEMM ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(THIRDPARTY ${FBGEMM}/external)
@@ -25,7 +25,8 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
 
 set(BUILD_TARGET_DEFAULT  "default")
 set(BUILD_TARGET_GENAI    "genai")
-set(BUILD_TARGET_VALUES   "${BUILD_TARGET_DEFAULT};${BUILD_TARGET_GENAI}")
+set(BUILD_TARGET_HSTU     "hstu")
+set(BUILD_TARGET_VALUES   "${BUILD_TARGET_DEFAULT};${BUILD_TARGET_GENAI};${BUILD_TARGET_HSTU}")
 
 if(NOT DEFINED FBGEMM_BUILD_TARGET)
   set(FBGEMM_BUILD_TARGET "${BUILD_TARGET_DEFAULT}")
@@ -102,7 +103,7 @@ endif()
 # Declare CMake project
 project(
   fbgemm_gpu
-  VERSION 1.2.0
+  VERSION 1.3.0
   LANGUAGES ${project_languages})
 
 # AVX Flags Setup - must be set AFTER project declaration
@@ -140,6 +141,7 @@ set(fbgemm_sources_include_directories
   ${THIRDPARTY}/cutlass/include
   ${THIRDPARTY}/cutlass/tools/util/include
   ${THIRDPARTY}/composable_kernel/include
+  ${THIRDPARTY}/composable_kernel/library/include
   ${THIRDPARTY}/json/include
   ${NCCL_INCLUDE_DIRS})
 
@@ -197,6 +199,7 @@ if(FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/example
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental/gen_ai)
 
   # HIPify all .CU and .CUH sources under the current directory (`/fbgemm_gpu`)
@@ -268,14 +271,26 @@ if(FBGEMM_BUILD_TARGET STREQUAL BUILD_TARGET_GENAI)
       (${FBGEMM_BUILD_TARGET}, ${FBGEMM_BUILD_VARIANT})")
   endif()
 
+  if(FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
+    # Add experimental packaging example
+    add_subdirectory(experimental/example)
+  endif()
+
   # Build FBGEMM GenAI
   add_subdirectory(experimental/gen_ai)
 
-  # Add experimental packaging example
-  add_subdirectory(experimental/example)
-
-  # Add Triton GEMM (GenAI) kernels if non-CPU build
+  # Add Triton GEMM kernels
   add_subdirectory(experimental/gemm)
+
+elseif(FBGEMM_BUILD_TARGET STREQUAL BUILD_TARGET_HSTU)
+  if(NOT FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
+    message(FATAL_ERROR
+      "Unsupported (target, variant) combination:
+      (${FBGEMM_BUILD_TARGET}, ${FBGEMM_BUILD_VARIANT})")
+  endif()
+
+  # Build HSTU kernels
+  add_subdirectory(experimental/hstu)
 
 elseif(FBGEMM_BUILD_TARGET STREQUAL BUILD_TARGET_DEFAULT)
   # Build FBGEMM_GPU

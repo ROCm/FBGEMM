@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <cmath>
+
 #include <algorithm>
 #include <climits>
 #include <limits>
@@ -40,7 +42,7 @@ class EmbeddingQuantizeTest
 class EmbeddingQuantizeSBFloatTest
     : public testing::TestWithParam<tuple<int, int>> {};
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     QuantizeGroupwiseTest,
     ::testing::Combine(
@@ -50,17 +52,17 @@ INSTANTIATE_TEST_CASE_P(
         ::testing::ValuesIn({1, 4}), // G
         ::testing::ValuesIn({layout_t::KCX, layout_t::KXC})));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     QuantizeTest,
     ::testing::Values(1, 2, 5, 8, 9, 16, 20, 28, 32, 33));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     FusedQuantizeDequantizeTest,
     ::testing::Values(1, 2, 5, 8, 9, 16, 20, 28, 32, 33));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     EmbeddingQuantizeTest,
     ::testing::Combine(
@@ -68,7 +70,7 @@ INSTANTIATE_TEST_CASE_P(
         ::testing::ValuesIn({1, 2, 3}),
         ::testing::ValuesIn({4, 8, 16, 20, 28, 32, 64, 84})));
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     EmbeddingQuantizeSBFloatTest,
     ::testing::Combine(
@@ -76,7 +78,7 @@ INSTANTIATE_TEST_CASE_P(
         ::testing::ValuesIn({1, 2, 5, 8, 9, 16, 20, 28, 32, 33, 64, 65})));
 
 template <typename T, layout_t LT>
-void ref_impl(
+static void ref_impl(
     const vector<float>& src,
     int K,
     int C,
@@ -90,7 +92,7 @@ void ref_impl(
     for (int g = 0; g < G; ++g) {
       for (int c = 0; c < C / G; ++c) {
         for (int x = 0; x < X; ++x) {
-          float num;
+          float num = NAN;
           if (LT == layout_t::KCX) {
             num = src[(i * C + g * C_per_G + c) * X + x];
           } else {
@@ -111,7 +113,7 @@ void ref_impl(
 }
 
 template <typename T, layout_t LT>
-void runTests(
+static void runTests(
     const vector<float>& src,
     int K,
     int C,
@@ -134,7 +136,7 @@ void runTests(
  * while comparing results.
  */
 template <typename T>
-::testing::AssertionResult isNear(
+static ::testing::AssertionResult isNear(
     const vector<T>& res,
     const vector<T>& res_ref) {
   bool match = true;
@@ -154,7 +156,7 @@ template <typename T>
 }
 
 template <typename T>
-::testing::AssertionResult isQEmbeddingClose(
+static ::testing::AssertionResult isQEmbeddingClose(
     const vector<uint8_t>& res_ref,
     const vector<uint8_t>& res,
     int out_rows,
@@ -179,8 +181,8 @@ template <typename T>
         }
       }
       // compare scale/bias
-      float scaleTest, scaleRef, biasTest, biasRef;
-      if (is_same<T, float16>::value) {
+      float scaleTest = NAN, scaleRef = NAN, biasTest = NAN, biasRef = NAN;
+      if constexpr (is_same_v<T, float16>) {
         // half scale and bias
         scaleTest = cpu_half2float(reinterpret_cast<const float16*>(
             res.data() + i * ld + out_emb_cols)[0]);
@@ -228,9 +230,7 @@ template <typename T>
  * Test for QuantizeGroupwise
  */
 TEST_P(QuantizeGroupwiseTest, quantizeGTest) {
-  int K, C, X, G;
-  layout_t layout;
-  tie(K, C, X, G, layout) = GetParam();
+  auto [K, C, X, G, layout] = GetParam();
 
   random_device rd;
   mt19937 gen(rd());
@@ -297,7 +297,7 @@ TEST_P(QuantizeGroupwiseTest, quantizeGTest) {
 }
 
 template <typename T>
-void runQuantizeTests(
+static void runQuantizeTests(
     const vector<float>& src,
     float scale,
     int zero_point,
@@ -320,7 +320,7 @@ void runQuantizeTests(
  * Test for QuantizeGroupwise
  */
 TEST_P(QuantizeTest, quantizeTest) {
-  int len;
+  int len = 0;
   len = GetParam();
 
   random_device rd;
@@ -431,7 +431,7 @@ TEST(QuantizeTestQParams, chooseQParamsSymmetric) {
 }
 
 template <typename T>
-void runFusedQuantizeDequantizeTests(
+static void runFusedQuantizeDequantizeTests(
     const vector<float>& src,
     float scale,
     int zero_point,
@@ -449,7 +449,7 @@ void runFusedQuantizeDequantizeTests(
 }
 
 TEST_P(FusedQuantizeDequantizeTest, fusedQuantizeDequantizeTest) {
-  int len;
+  int len = 0;
   len = GetParam();
 
   random_device rd;
@@ -560,7 +560,7 @@ class EmbeddingQuantizeFixedNumberTest : public testing::TestWithParam<int> {
       1, 1, 1, 1,               // All the same. Range: 0, min: 1
       -64, -2.75, 61.625, 191,  // Range: 255, min: -64. Picking 61.625 because it differs under FP16 (will become 61.5).
     };
-    assert(float_test_input.size() == row * col);
+    assert(float_test_input.size() == static_cast<size_t>(row * col));
 
     float16_test_input.resize(float_test_input.size());
     std::transform(
@@ -602,7 +602,7 @@ class EmbeddingQuantizeFixedNumberTest : public testing::TestWithParam<int> {
   std::vector<uint8_t> expected_output_float;
 };
 
-INSTANTIATE_TEST_CASE_P(
+INSTANTIATE_TEST_SUITE_P(
     InstantiationName,
     EmbeddingQuantizeFixedNumberTest,
     ::testing::ValuesIn({2, 4, 8}));
@@ -651,8 +651,7 @@ TEST_P(EmbeddingQuantizeFixedNumberTest, embeddingFloatToQuantizedSBHalfTest) {
 
 // Scale and bias are of type float16
 TEST_P(EmbeddingQuantizeTest, embeddingHalfTest) {
-  int bit_rate, rows, cols;
-  tie(bit_rate, rows, cols) = GetParam();
+  auto [bit_rate, rows, cols] = GetParam();
 
   random_device rd;
   mt19937 gen(rd());
@@ -730,8 +729,7 @@ TEST_P(EmbeddingQuantizeTest, embeddingHalfTest) {
 
 // Scale and bias are of type float
 TEST_P(EmbeddingQuantizeSBFloatTest, embeddingFloatTest) {
-  int rows, cols;
-  tie(rows, cols) = GetParam();
+  auto [rows, cols] = GetParam();
 
   random_device rd;
   mt19937 gen(rd());
