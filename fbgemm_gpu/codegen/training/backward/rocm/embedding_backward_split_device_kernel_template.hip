@@ -179,7 +179,7 @@ __device__ void split_tbe_backward_hip_kernel_{{ kdesc }}(
     const int32_t segment_length_mod = segment_length & length_mask;
 
     cache_t grad_acc[dword_per_row];
-    int32_t infos[segment_unroll];
+    uint32_t infos[segment_unroll];
     grad_t grad_data[dword_per_row * segment_prefetch];
     emb_t emb_data[dword_per_row];
     float indice_weights[segment_unroll];
@@ -452,7 +452,7 @@ L_tail_grad_acc:
     }
 
     // load the old emb weight data
-    load_row_per_warp<emb_t, embedding_dim, int64_t>::run(
+    load_row_per_warp<emb_t, embedding_dim, index_t>::run(
         &emb_data[0], emb_idx, p_emb_table, lane_id);
     optimizer_t optimizer(opt_karg);
     optimizer.template update<dword_per_row, segment_split>(grad_acc, emb_data, emb_idx);

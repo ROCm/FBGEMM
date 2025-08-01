@@ -60,7 +60,12 @@ __device__ half llvm_amdgcn_raw_buffer_load_fp16(
     int32x4_t srsrc,
     int32_t voffset,
     int32_t soffset,
-    int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f16");
+    int32_t glc_slc)
+#if defined(__gfx950__)
+      __asm("llvm.amdgcn.raw.buffer.load.i16");
+#else
+      __asm("llvm.amdgcn.raw.buffer.load.f16");
+#endif
 
 __device__ float llvm_amdgcn_raw_buffer_load_fp32(
     int32x4_t srsrc,
@@ -72,7 +77,12 @@ __device__ half2 llvm_amdgcn_raw_buffer_load_fp16x2(
     int32x4_t srsrc,
     int32_t voffset,
     int32_t soffset,
-    int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v2f16");
+    int32_t glc_slc)
+#if defined(__gfx950__)
+      __asm("llvm.amdgcn.raw.buffer.load.i32");
+#else
+      __asm("llvm.amdgcn.raw.buffer.load.v2f16");
+#endif
 
 __device__ void llvm_amdgcn_raw_buffer_store_fp32(
     float vdata,
@@ -214,6 +224,24 @@ struct load_row_per_warp<half, 512, index_t> {
             emb_res, (lane_id + 64 * 3) * sizeof(half2), 0, 0);
   }
 };
+
+template <int32_t embedding_dim, typename index_t>
+struct load_row_per_warp<c10::Half, embedding_dim, index_t> {
+  static __device__ void run(
+      c10::Half* emb_data,
+      index_t row_index,
+      const c10::Half* p_emb_table,
+      int lane_id) {
+        load_row_per_warp<half, embedding_dim, index_t>::run(
+          reinterpret_cast<half*>(emb_data),
+          row_index,
+          reinterpret_cast<const half*>(p_emb_table),
+          lane_id
+        );
+      }
+
+};
+
 
 template <
     typename emb_t,
