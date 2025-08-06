@@ -8,11 +8,13 @@
 # pyre-strict
 
 
+import gzip
 import logging
 import os
 import tempfile
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional
+import yaml
 
 import click
 import numpy as np
@@ -950,6 +952,7 @@ def cache(  # noqa C901
     default="100000",
     help="A comma-separated list of number of embeddings for each table, default is '100000'.",
 )
+<<<<<<< HEAD
 @click.option(
     "--output-dtype",
     type=SparseType,
@@ -959,7 +962,33 @@ def cache(  # noqa C901
 @TbeBenchClickInterface.common_options
 @TbeBenchClickInterface.device_options
 @TbeBenchClickInterface.vbe_options
+=======
+@click.option("--batch-size", default=512)
+@click.option("--embedding-dim-list", type=str, default="128")
+@click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--cache-precision", type=SparseType, default=None)
+@click.option("--stoc", is_flag=True, default=False)
+@click.option("--iters", default=100)
+@click.option("--warmup-runs", default=0)
+@click.option("--managed", default="device")
+@click.option("--num-embeddings-list", type=str, default="100000")
+@click.option("--reuse", default=0.0)
+@click.option("--row-wise/--no-row-wise", default=True)
+@click.option("--weighted", is_flag=True, default=False)
+@click.option("--pooling", type=str, default="sum")
+@click.option("--bounds-check-mode", type=int, default=BoundsCheckMode.NONE.value)
+@click.option("--flush-gpu-cache-size-mb", default=0)
+@click.option("--output-dtype", type=SparseType, default=SparseType.FP32)
+@click.option("--save", type=str, default=None)
+@click.option("--load", type=str, default=None)
+@click.option("--random-weights", is_flag=True, default=False)
+@click.option("--compressed", is_flag=True, default=False)
+@click.option("--slice-min", type=int, default=None)
+@click.option("--slice-max", type=int, default=None)
+@click.pass_context
+>>>>>>> c70d22e4 (Initial sanity check implementation)
 def device_with_spec(  # noqa C901
+    ctx,
     alpha: float,
     bag_size_list: str,
     bag_size_sigma_list: str,
@@ -979,7 +1008,40 @@ def device_with_spec(  # noqa C901
     bounds_check_mode: int,
     flush_gpu_cache_size_mb: int,
     output_dtype: SparseType,
+    save: str,
+    load: str,
+    random_weights: bool,
+    compressed: bool,
+    slice_min: int,
+    slice_max: int,
 ) -> None:
+    if load:
+        with open(f"{load}/params.yaml", "r") as f:
+            ctx.params = yaml.load(f, Loader=yaml.UnsafeLoader)
+            alpha = ctx.params["alpha"]
+            bag_size_list = ctx.params["bag_size_list"]
+            bag_size_sigma_list = ctx.params["bag_size_sigma_list"]
+            batch_size = ctx.params["batch_size"]
+            embedding_dim_list = ctx.params["embedding_dim_list"]
+            weights_precision = ctx.params["weights_precision"]
+            cache_precision = ctx.params["cache_precision"]
+            stoc = ctx.params["stoc"]
+            iters = ctx.params["iters"]
+            warmup_runs = ctx.params["warmup_runs"]
+            managed = ctx.params["managed"]
+            num_embeddings_list = ctx.params["num_embeddings_list"]
+            reuse = ctx.params["reuse"]
+            row_wise = ctx.params["row_wise"]
+            weighted = ctx.params["weighted"]
+            pooling = ctx.params["pooling"]
+            bounds_check_mode = ctx.params["bounds_check_mode"]
+            flush_gpu_cache_size_mb = ctx.params["flush_gpu_cache_size_mb"]
+            output_dtype = ctx.params["output_dtype"]
+            random_weights = ctx.params["random_weights"]
+            compressed = ctx.params["compressed"]
+            slice_min = ctx.params["slice_min"]
+            slice_max = ctx.params["slice_max"]
+            
     np.random.seed(42)
     torch.manual_seed(42)
     B = batch_size
@@ -988,6 +1050,12 @@ def device_with_spec(  # noqa C901
     T = len(Ds)
 
     use_variable_bag_sizes = bag_size_sigma_list != "None"
+    
+    params = ctx.params
+    if save:
+        os.makedirs(f"{save}", exist_ok=True)
+        with open(f"{save}/params.yaml", "w") as f:
+            yaml.dump(params, f, sort_keys=False)
 
     if use_variable_bag_sizes:
         Ls = [int(mu) for mu in bag_size_list.split(",")]
@@ -1066,6 +1134,22 @@ def device_with_spec(  # noqa C901
 
     if weights_precision == SparseType.INT8:
         emb.init_embedding_weights_uniform(-0.0003, 0.0003)
+    elif random_weights:
+        emb.init_embedding_weights_uniform(-1.0, 1.0)
+
+    if save:
+        if compressed:
+            with gzip.open(f"{save}/model_state.pth.gz", "wb") as f:
+                torch.save(emb.state_dict(), f)
+        else:
+            torch.save(emb.state_dict(), f"{save}/model_state.pth")
+
+    if load:
+        if compressed:
+            with gzip.open(f"{load}/model_state.pth.gz", "rb") as f:
+                emb.load_state_dict(torch.load(f))
+        else:
+            emb.load_state_dict(torch.load(f"{load}/model_state.pth"))
 
     nparams = sum(w.numel() for w in emb.split_embedding_weights())
     param_size_multiplier = weights_precision.bit_rate() / 8.0
@@ -1078,52 +1162,68 @@ def device_with_spec(  # noqa C901
         "weights": [[] for _ in range(iters)],
     }
     # row = iter, column = tensor
-    for t, e in enumerate(Es):
-        # (indices, offsets, weights)
-        requests = generate_requests(
-            iters,
-            B,
-            1,
-            Ls[t],
-            e,
-            reuse=reuse,
-            alpha=alpha,
-            weighted=weighted,
-            # pyre-fixme[61]: `sigma_Ls` is undefined, or not always defined.
-            sigma_L=sigma_Ls[t] if use_variable_bag_sizes else None,
-            zipf_oversample_ratio=3 if Ls[t] > 5 else 5,
-            use_cpu=get_available_compute_device() == ComputeDevice.CPU,
-            index_dtype=torch.long,
-            offset_dtype=torch.long,
-        )
-        for i, req in enumerate(requests):
-            indices, offsets, weights = req.unpack_3()
-            all_requests["indices"][i].append(indices)
-            if t > 0:
-                offsets = offsets[1:]  # remove the first element
-                offsets += all_requests["offsets"][i][t - 1][-1]
-            all_requests["offsets"][i].append(offsets)
-            all_requests["weights"][i].append(weights)
+    if load:
+        requests = []
+        for i in range(iters):
+            indices = torch.load(f"{load}/{i}_indices.pt")
+            offsets = torch.load(f"{load}/{i}_offsets.pt")
+            per_sample_weights = torch.load(f"{load}/{i}_per_sample_weights.pt")
+            Bs_per_feature_per_rank = torch.load(f"{load}/{i}_Bs_per_feature_per_rank.pt")
+            requests.append(TBERequest(indices, offsets, per_sample_weights, Bs_per_feature_per_rank))
+    else:
+        for t, e in enumerate(Es):
+            # (indices, offsets, weights)
+            requests = generate_requests(
+                iters,
+                B,
+                1,
+                Ls[t],
+                e,
+                reuse=reuse,
+                alpha=alpha,
+                weighted=weighted,
+                # pyre-fixme[61]: `sigma_Ls` is undefined, or not always defined.
+                sigma_L=sigma_Ls[t] if use_variable_bag_sizes else None,
+                zipf_oversample_ratio=3 if Ls[t] > 5 else 5,
+                use_cpu=get_available_compute_device() == ComputeDevice.CPU,
+                index_dtype=torch.long,
+                offset_dtype=torch.long,
+            )
+            for i, req in enumerate(requests):
+                indices, offsets, weights = req.unpack_3()
+                all_requests["indices"][i].append(indices)
+                if t > 0:
+                    offsets = offsets[1:]  # remove the first element
+                    offsets += all_requests["offsets"][i][t - 1][-1]
+                all_requests["offsets"][i].append(offsets)
+                all_requests["weights"][i].append(weights)
 
-    prev_indices_len = -1
-    requests = []
-    for i in range(iters):
-        indices = torch.concat(all_requests["indices"][i])
-        if prev_indices_len == -1:
-            prev_indices_len = indices.numel()
-        assert (
-            prev_indices_len == indices.numel()
-        ), "Number of indices for every iteration must be the same"
-        offsets = torch.concat(all_requests["offsets"][i])
-        if weighted:
-            weights = torch.concat(all_requests["weights"][i])
-        else:
-            weights = None
-        requests.append(TBERequest(indices, offsets, weights))
+        prev_indices_len = -1
+        requests = []
+        for i in range(iters):
+            indices = torch.concat(all_requests["indices"][i])
+            if prev_indices_len == -1:
+                prev_indices_len = indices.numel()
+            assert (
+                prev_indices_len == indices.numel()
+            ), "Number of indices for every iteration must be the same"
+            offsets = torch.concat(all_requests["offsets"][i])
+            if weighted:
+                weights = torch.concat(all_requests["weights"][i])
+            else:
+                weights = None
+            requests.append(TBERequest(indices, offsets, weights))
 
-    del all_requests
-
+        del all_requests
+    
     assert len(requests) == iters
+    if save:
+        for i in range(iters):
+            req = requests[i]
+            torch.save(req.indices, f"{save}/{i}_indices.pt")
+            torch.save(req.offsets, f"{save}/{i}_offsets.pt")
+            torch.save(req.per_sample_weights, f"{save}/{i}_per_sample_weights.pt")
+            torch.save(req.Bs_per_feature_per_rank, f"{save}/{i}_Bs_per_feature_per_rank.pt")
 
     sum_DLs = sum([d * l for d, l in zip(Ds, Ls)])
     if do_pooling:
@@ -1149,36 +1249,44 @@ def device_with_spec(  # noqa C901
         f"Accessed weights per batch: {B * sum_DLs * param_size_multiplier / 1.0e9: .2f} GB"
     )
 
+    if load is None and save is None:
     # forward
-    time_per_iter = benchmark_requests(
-        requests,
-        lambda indices, offsets, per_sample_weights: emb.forward(
-            indices,
-            offsets,
-            per_sample_weights,
-            feature_requires_grad=feature_requires_grad,
-        ),
-        flush_gpu_cache_size_mb=flush_gpu_cache_size_mb,
-        num_warmups=warmup_runs,
-    )
-    logging.info(
-        f"Forward, B: {B}, "
-        f"Es: {Es}, T: {T}, Ds: {Ds}, Ls: {Ls_str}, W: {weighted}, "
-        f"BW: {read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "  # noqa: B950
-        f"T: {time_per_iter * 1.0e6:.0f}us"
-    )
+        time_per_iter = benchmark_requests(
+            requests,
+            lambda indices, offsets, per_sample_weights: emb.forward(
+                indices,
+                offsets,
+                per_sample_weights,
+                feature_requires_grad=feature_requires_grad,
+            ),
+            flush_gpu_cache_size_mb=flush_gpu_cache_size_mb,
+            num_warmups=warmup_runs,
+        )
+        logging.info(
+            f"Forward, B: {B}, "
+            f"Es: {Es}, T: {T}, Ds: {Ds}, Ls: {Ls_str}, W: {weighted}, "
+            f"BW: {read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "  # noqa: B950
+            f"T: {time_per_iter * 1.0e6:.0f}us"
+        )
 
     if output_dtype == SparseType.INT8:
         # backward bench not representative
         return
 
-    if do_pooling:
-        grad_output = torch.randn(B, sum(Ds)).to(get_device())
+    if load:
+        grad_output = torch.load(f"{load}/grad_output.pt")
     else:
-        # Obtain B * L from indices len
-        # pyre-ignore[19]
-        # pyre-fixme[61]: `D` is undefined, or not always defined.
-        grad_output = torch.randn(requests[0].indices.numel(), D).to(get_device())
+        if do_pooling:
+            grad_output = torch.randn(B, sum(Ds)).to(get_device())
+        else:
+            # Obtain B * L from indices len
+            # pyre-ignore[19]
+            # pyre-fixme[61]: `D` is undefined, or not always defined.
+            grad_output = torch.randn(requests[0].indices.numel(), D).to(get_device())
+    
+    if save:
+        torch.save(grad_output, f"{save}/grad_output.pt")
+    
     # backward
     time_per_iter = benchmark_requests(
         requests,
@@ -1192,6 +1300,12 @@ def device_with_spec(  # noqa C901
         bwd_only=True,
         grad=grad_output,
         num_warmups=warmup_runs,
+        emb=emb,
+        save=save,
+        load=load,
+        compressed=compressed,
+        slice_min=slice_min,
+        slice_max=slice_max,
     )
     logging.info(
         f"Backward, B: {B}, Es: {Es}, T: {T}, Ds: {Ds}, Ls: {Ls_str}, "
