@@ -471,7 +471,7 @@ __device__ __forceinline__ void generic_dpp_reduction(data_t& result) {
 // of trivial operation with an option to use custom operation
 template <typename data_t, typename reduce_op_t, int wave_size = 64>
 __device__ __forceinline__ void dpp_reduction(data_t& result) {
-#if defined(__gfx942__) || defined(__gfx90a__)
+#if defined(__gfx942__) || defined(__gfx90a__ ) || defined(__gfx950__)
   if constexpr (std::is_same_v<reduce_op_t, reduce_op::sum>) {
     DPP_REDUCE_F16_F32(add);
     return;
