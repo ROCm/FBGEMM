@@ -39,7 +39,6 @@ from fbgemm_gpu.tbe.bench import (
     benchmark_requests,
     benchmark_vbe,
     EmbeddingOpsCommonConfigLoader,
-    TbeBenchClickInterface,
     TBEBenchmarkingConfigLoader,
 )
 from fbgemm_gpu.tbe.ssd import SSDTableBatchedEmbeddingBags
@@ -64,57 +63,39 @@ def cli() -> None:
 
 
 @cli.command()
-@TbeBenchClickInterface.common_options
-@TbeBenchClickInterface.device_options
-@TbeBenchClickInterface.table_options
+# recommended value: alpha=1.15 for training and alpha=1.09 for inference
+@click.option("--alpha", default=1.0)
+@click.option("--bag-size", default=20)
+@click.option("--batch-size", default=512)
+@click.option("--embedding-dim", default=128)
+@click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--cache-precision", type=SparseType, default=None)
+@click.option("--stoc", is_flag=True, default=False)
+@click.option("--iters", default=100)
+@click.option("--warmup-runs", default=0)
 @click.option(
-    "--weighted-num-requires-grad",
-    type=int,
-    default=None,
-    help="Number of tables requiring gradient computation for weighted embeddings. Default is None.",
+    "--managed",
+    default="device",
+    type=click.Choice(["device", "managed", "managed_caching"], case_sensitive=False),
 )
-@click.option(
-    "--dense",
-    is_flag=True,
-    default=False,
-    help="Use dense embedding tables. Default is False.",
-)
-@click.option(
-    "--output-dtype",
-    type=SparseType,
-    default=SparseType.FP32,
-    help="Data type of the output embeddings. Default is FP32.",
-)
-@click.option(
-    "--indices-dtype",
-    type=click.Choice(["32", "64"]),
-    default="64",
-    help="Data type for indices, either 32-bit or 64-bit. Default is 64.",
-)
-@click.option(
-    "--requests_data_file",
-    type=str,
-    default=None,
-    help="File path for requests data. Default is None.",
-)
-@click.option(
-    "--indices-file",
-    type=str,
-    default=None,
-    help="Path to the indices file. Default is None.",
-)
-@click.option(
-    "--offsets-file",
-    type=str,
-    default=None,
-    help="Path to the offsets file. Default is None.",
-)
-@click.option(
-    "--export-trace",
-    is_flag=True,
-    default=False,
-    help="Enable export of trace for profiling. Default is False.",
-)
+@click.option("--mixed", is_flag=True, default=False)
+@click.option("--num-embeddings", default=int(1e5))
+@click.option("--num-tables", default=32)
+@click.option("--reuse", default=0.0)
+@click.option("--row-wise/--no-row-wise", default=True)
+@click.option("--weighted", is_flag=True, default=False)
+@click.option("--pooling", type=str, default="sum")
+@click.option("--weighted-num-requires-grad", type=int, default=None)
+@click.option("--bounds-check-mode", type=int, default=BoundsCheckMode.NONE.value)
+@click.option("--flush-gpu-cache-size-mb", default=0)
+@click.option("--dense", is_flag=True, default=False)
+@click.option("--output-dtype", type=SparseType, default=SparseType.FP32)
+@click.option("--indices-dtype", type=click.Choice(["32", "64"]), default="64")
+@click.option("--requests_data_file", type=str, default=None)
+@click.option("--indices-file", type=str, default=None, help="Path to the indices file")
+@click.option("--offsets-file", type=str, default=None, help="Path to the offsets file")
+@click.option("--tables", type=str, default=None)
+@click.option("--export-trace", is_flag=True, default=False)
 @click.option(
     "--trace-url",
     type=str,
@@ -406,12 +387,24 @@ def device(  # noqa C901
 
 
 @cli.command()
-@TbeBenchClickInterface.common_options
-@TbeBenchClickInterface.table_options
+@click.option("--alpha", default=1.0)
+@click.option("--bag-size", default=20)
+@click.option("--batch-size", default=512)
+@click.option("--embedding-dim", default=128)
+@click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--stoc", is_flag=True, default=False)
+@click.option("--iters", default=100)
+@click.option("--warmup-runs", default=0)
+@click.option("--mixed", is_flag=True, default=False)
+@click.option("--num-embeddings", default=int(1e5))
+@click.option("--num-tables", default=32)
+@click.option("--reuse", default=0.1)
 @click.option("--uvm-tables", default=1)
 @click.option("--uvm-bag-size", default=1)
 @click.option("--weighted", is_flag=True, default=False)
+@click.option("--flush-gpu-cache-size-mb", default=0)
 @click.option("--requests_data_file", type=str, default=None)
+@click.option("--tables", type=str, default=None)
 @click.option("--output-dtype", type=SparseType, default=SparseType.FP32)
 @click.option("--use-cache", is_flag=True, default=False)
 @click.option("--cache-algorithm", default="lru")
@@ -735,18 +728,25 @@ def uvm(
 
 
 @cli.command()
-@TbeBenchClickInterface.common_options
-@TbeBenchClickInterface.table_options
+@click.option("--alpha", default=1.0)
+@click.option("--bag-size", default=20)
+@click.option("--batch-size", default=512)
 @click.option("--cache-algorithm", default="lru")
 @click.option("--cache-load-factor", default=0.2)
+@click.option("--embedding-dim", default=128)
+@click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
+@click.option("--stoc", is_flag=True, default=False)
 @click.option("--long-index", is_flag=True, default=False)
-@click.option(
-    "--reuse",
-    default=0.1,  # Overriding the default value to 0.1, @TbeBenchClickInterface.common_options has default value 0.0
-    help="The inter-batch indices reuse rate for the benchmark, default is 0.1.",
-)
+@click.option("--iters", default=100)
+@click.option("--warmup-runs", default=0)
+@click.option("--mixed", is_flag=True, default=False)
+@click.option("--num-embeddings", default=int(1e5))
+@click.option("--num-tables", default=32)
+@click.option("--reuse", default=0.1)
 @click.option("--weighted", is_flag=True, default=False)
+@click.option("--flush-gpu-cache-size-mb", default=0)
 @click.option("--requests_data_file", type=str, default=None)
+@click.option("--tables", type=str, default=None)
 @click.option(
     "--uvm-host-mapped",
     is_flag=True,
@@ -940,29 +940,20 @@ def cache(  # noqa C901
 
 
 @cli.command()
+@click.option("--alpha", default=1.0)
 @click.option(
-    "--embedding-dim-list",
+    "--bag-size-list",
     type=str,
-    default="128",
-    help="A comma-separated list of embedding dimensions for each table. Default is '128'. The number of embedding dimensions will determine the number of tables.",
+    default="20",
 )
 @click.option(
-    "--num-embeddings-list",
+    "--bag-size-sigma-list",
     type=str,
-    default="100000",
-    help="A comma-separated list of number of embeddings for each table, default is '100000'.",
+    default="None",
+    help="A list of bag size standard deviations for generating bag sizes "
+    "(one std per table). If set, the benchmark will treat --bag-size-list as a "
+    "list of bag size means.",
 )
-<<<<<<< HEAD
-@click.option(
-    "--output-dtype",
-    type=SparseType,
-    default=SparseType.FP32,
-    help="The output data type, default is FP32.",
-)
-@TbeBenchClickInterface.common_options
-@TbeBenchClickInterface.device_options
-@TbeBenchClickInterface.vbe_options
-=======
 @click.option("--batch-size", default=512)
 @click.option("--embedding-dim-list", type=str, default="128")
 @click.option("--weights-precision", type=SparseType, default=SparseType.FP32)
@@ -986,7 +977,6 @@ def cache(  # noqa C901
 @click.option("--slice-min", type=int, default=None)
 @click.option("--slice-max", type=int, default=None)
 @click.pass_context
->>>>>>> c70d22e4 (Initial sanity check implementation)
 def device_with_spec(  # noqa C901
     ctx,
     alpha: float,
@@ -1455,7 +1445,6 @@ def vbe(
         output_dtype=embconfig.output_dtype,
         pooling_mode=embconfig.pooling_mode,
         bounds_check_mode=embconfig.bounds_check_mode,
-        device=get_device(),
     ).to(get_device())
 
     all_requests = {
