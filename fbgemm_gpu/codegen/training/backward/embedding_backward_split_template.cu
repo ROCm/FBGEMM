@@ -659,9 +659,9 @@ Tensor {{ embedding_cuda_op }}(
         else {
             // Ensure we're running on a supported CDNA architecture (including MI350)
             TORCH_WARN_ONCE("Running on CDNA architecture");
-        }
+            }
     #endif
-    
+
     {%- if nobag and not is_index_select %}
     auto max_D = D;
     {%- endif %}
@@ -981,7 +981,7 @@ Tensor {{ embedding_cuda_op }}(
                 auto num_long_run_ids = at::zeros({1}, indices.options().dtype(at::kInt));
 
                 const bool use_deterministic_algorithms = at::globalContext().deterministicAlgorithms();
-                const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 1024;
+                const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 4096;
 
                 Tensor long_run_id_to_really_long_run_ids;
                 if (use_deterministic_algorithms) {
@@ -1065,7 +1065,7 @@ Tensor {{ embedding_cuda_op }}(
                     );
 
                     const int32_t cta_per_row_grid_size = std::min(
-                        div_round_up(total_unique_indices, (kMaxThreads/4)),
+                        div_round_up(total_unique_indices,(kMaxThreads/4)),
                         get_max_thread_blocks_());
 
                     FBGEMM_LAUNCH_KERNEL(
@@ -1190,7 +1190,7 @@ Tensor {{ embedding_cuda_op }}(
                           used_shared_bytes);
                     }
 
-                    auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups/4);
 
                     int32_t warp_per_row_grid_size = std::min(
                         div_round_up(total_unique_indices, num_warp_per_row_groups),
@@ -1205,7 +1205,7 @@ Tensor {{ embedding_cuda_op }}(
                     const auto supported_weights_type = dev_weights.scalar_type() == at::ScalarType::Half
                                                       || dev_weights.scalar_type() == at::ScalarType::Float;
 
-                    if (use_hip_kernel && !mixed_D && supported_weights_type && rocm::is_supported_cdna())
+                    if (use_hip_kernel && supported_weights_type && !mixed_D && rocm::is_supported_cdna())
                     {
                         constexpr int segments_per_workgroup = 4;
                         {%- for kDimSize in [64, 128, 160, 192, 256] %}
