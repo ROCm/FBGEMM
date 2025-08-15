@@ -69,3 +69,30 @@ DECL_RADIX_SORT_PAIRS_FN(int32_t, float);
 DECL_RADIX_SORT_PAIRS_FN(int32_t, double);
 
 #undef DECL_RADIX_SORT_PAIRS_FN
+
+
+#pragma once
+#if defined(USE_ROCM)
+
+// ROCm-specific relaxed atomic operations
+template<typename T>
+__device__ __forceinline__ T relaxed_add(T* address, T val) {
+    return __atomic_fetch_add(address, val, __ATOMIC_RELAXED);
+}
+
+template<typename T>
+__device__ __forceinline__ T sync_add(T* address, T val) {
+    return __atomic_fetch_add(address, val, __ATOMIC_ACQ_REL);
+}
+#else
+// Fallback for other platforms
+template<typename T>
+__device__ __forceinline__ T relaxed_add(T* address, T val) {
+    return atomicAdd(address, val);
+}
+
+template<typename T>
+__device__ __forceinline__ T sync_add(T* address, T val) {
+    return atomicAdd(address, val);
+}
+#endif

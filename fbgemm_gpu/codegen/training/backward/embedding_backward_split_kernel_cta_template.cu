@@ -322,10 +322,11 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
             {{
                 generate_optimized_grad_sum_loop_access(
                     """
-                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.x, {grad_vec}.acc.x);
-                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.y, {grad_vec}.acc.y);
-                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.z, {grad_vec}.acc.z);
-                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.w, {grad_vec}.acc.w);
+                    relaxed_add(&temp_grad_accum_ptr[d_vec].acc.x, smem_grad_sum[d_vec].acc.x);
+                    relaxed_add(&temp_grad_accum_ptr[d_vec].acc.y, smem_grad_sum[d_vec].acc.y);
+                    relaxed_add(&temp_grad_accum_ptr[d_vec].acc.z, smem_grad_sum[d_vec].acc.z);
+                    relaxed_add(&temp_grad_accum_ptr[d_vec].acc.w, smem_grad_sum[d_vec].acc.w);
+
                     """
                 )
             }}
@@ -333,7 +334,7 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
             int counter;
             if (threadIdx.x == 0) {
                 __threadfence();
-                counter = gpuAtomicAdd(&grad_accum_counter[really_long_run_id], -1);
+                counter = sync_add(&grad_accum_counter[really_long_run_id], -1);
             }
             counter = SHFL_SYNC(counter, 0);
             // Only the thread block accumulated the gradient last does the weight update.
