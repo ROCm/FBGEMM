@@ -610,7 +610,7 @@ def benchmark_vbe(
         for it, req in enumerate(requests):
 
             indices, offsets, weights = req
-            out = emb(indices, offsets, weights)
+            out = func(indices, offsets, weights)
             torch.cuda.synchronize()
             grad = torch.rand_like(out)
             if compressed:
@@ -645,7 +645,7 @@ def benchmark_vbe(
         for it, req in enumerate(requests):
 
             indices, offsets, weights = req
-            out = emb(indices, offsets, weights)
+            out = func(indices, offsets, weights)
             torch.cuda.synchronize()
             
             if compressed:
