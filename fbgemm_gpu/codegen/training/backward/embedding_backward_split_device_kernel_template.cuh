@@ -32,8 +32,8 @@ template<
 >
 DEVICE_INLINE void store_grad_sum(
     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits>& grad_dev_weights,
-    const Vec4TAcc<cache_t>* grad_sum,
-    const Vec4TAcc<cache_t>* smem_grad_sum,
+    const Vec2TAcc<cache_t>* grad_sum,
+    const Vec2TAcc<cache_t>* smem_grad_sum,
     const int32_t D,
     const int64_t weights_offset,
     const int64_t idx,
@@ -72,8 +72,8 @@ template <
     bool kUseVecBlocking
 >
 DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
-    Vec4TAcc<cache_t>* grad_sum,
-    Vec4TAcc<cache_t>* smem_grad_sum,
+    Vec2TAcc<cache_t>* grad_sum,
+    Vec2TAcc<cache_t>* smem_grad_sum,
     const pta::PackedTensorAccessor64<grad_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits>& grad_output,
     {%- if not nobag or is_index_select %}
     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& D_offsets,
@@ -114,8 +114,6 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
         for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; vec++) {
             grad_sum[vec].acc.x = 0;
             grad_sum[vec].acc.y = 0;
-            grad_sum[vec].acc.z = 0;
-            grad_sum[vec].acc.w = 0;
         }
 
         for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
@@ -160,19 +158,19 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
                     const int32_t d = {{ d }};
                     if (threadIdx.x * VEC_WIDTH < D) {
-                        Vec4TAcc<grad_t> grad_out_vec0 = Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j0 + d]);
-                        Vec4TAcc<grad_t> grad_out_vec1 = sl + j + 1 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j1 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec2 = sl + j + 2 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j2 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec3 = sl + j + 3 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j3 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec4 = sl + j + 4 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j4 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec5 = sl + j + 5 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j5 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec6 = sl + j + 6 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j6 + d]) : Vec4TAcc<grad_t>();
-                        Vec4TAcc<grad_t> grad_out_vec7 = sl + j + 7 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j7 + d]) : Vec4TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec0 = Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j0 + d]);
+                        Vec2TAcc<grad_t> grad_out_vec1 = sl + j + 1 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j1 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec2 = sl + j + 2 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j2 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec3 = sl + j + 3 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j3 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_Vec2 = sl + j + 4 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j4 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec5 = sl + j + 5 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j5 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec6 = sl + j + 6 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j6 + d]) : Vec2TAcc<grad_t>();
+                        Vec2TAcc<grad_t> grad_out_vec7 = sl + j + 7 < sl_end ? Vec2TAcc<grad_t>(&grad_output[0][grad_offset_j7 + d]) : Vec2TAcc<grad_t>();
                         grad_sum[vec].add_(grad_out_vec0);
                         grad_sum[vec].add_(grad_out_vec1);
                         grad_sum[vec].add_(grad_out_vec2);
                         grad_sum[vec].add_(grad_out_vec3);
-                        grad_sum[vec].add_(grad_out_vec4);
+                        grad_sum[vec].add_(grad_out_Vec2);
                         grad_sum[vec].add_(grad_out_vec5);
                         grad_sum[vec].add_(grad_out_vec6);
                         grad_sum[vec].add_(grad_out_vec7);
@@ -200,7 +198,7 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 #pragma unroll kFixedMaxVecsPerThread
                 for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
                     const int32_t d = {{ d }};
-                    Vec4TAcc<grad_t> grad_out_vec(
+                    Vec2TAcc<grad_t> grad_out_vec(
                         {%- if nobag and is_index_select %}
                         // grad_output is 1d
                         &grad_output[grad_offset + l_j * grad_stride + d]

@@ -9,40 +9,40 @@
 ################################################################################
 
 COMMON_OPTIMIZERS = [
-    "adagrad",
+    # "adagrad",
     "rowwise_adagrad",
-    "sgd",
+    # "sgd",
 ]
 
 # To be populated in the subsequent diffs
 CPU_ONLY_OPTIMIZERS = []
 
 GPU_ONLY_OPTIMIZERS = [
-    "adam",
-    "lamb",
-    "lars_sgd",
-    "partial_rowwise_adam",
-    "partial_rowwise_lamb",
-    "none",
-    "rowwise_adagrad_with_counter",
+    # "adam",
+    # "lamb",
+    # "lars_sgd",
+    # "partial_rowwise_adam",
+    # "partial_rowwise_lamb",
+    # "none",
+    # "rowwise_adagrad_with_counter",
 ]
 
 DEPRECATED_OPTIMIZERS = [
-    "approx_sgd",
-    "approx_rowwise_adagrad",
-    "approx_rowwise_adagrad_with_counter",
-    "approx_rowwise_adagrad_with_weight_decay",
-    "rowwise_adagrad_with_weight_decay",
-    "rowwise_weighted_adagrad",
+    # "approx_sgd",
+    # "approx_rowwise_adagrad",
+    # "approx_rowwise_adagrad_with_counter",
+    # "approx_rowwise_adagrad_with_weight_decay",
+    # "rowwise_adagrad_with_weight_decay",
+    # "rowwise_weighted_adagrad",
 ]
 
 # Optimizers with the global_weight_decay support
 GWD_OPTIMIZERS = [
-    "rowwise_adagrad",
+    # "rowwise_adagrad",
 ]
 
 SSD_OPTIMIZERS = [
-    "rowwise_adagrad",
+    # "rowwise_adagrad",
 ]
 
 ALL_OPTIMIZERS = (
@@ -59,32 +59,32 @@ GPU_OPTIMIZERS = COMMON_OPTIMIZERS + GPU_ONLY_OPTIMIZERS
 # Optimizers with the VBE support
 VBE_OPTIMIZERS = [
     "rowwise_adagrad",
-    "rowwise_adagrad_with_counter",
-    "sgd",
-    "dense",
-    "adam",
+    # "rowwise_adagrad_with_counter",
+    # "sgd",
+    # "dense",
+    # "adam",
 ]
 
 # Individual optimizers (not fused with SplitTBE backward)
 DEFUSED_OPTIMIZERS = [
-    "rowwise_adagrad",
+    # "rowwise_adagrad",
 ]
 
 WEIGHT_OPTIONS = [
-    "weighted",
-    "unweighted_nobag",
+    # "weighted",
+    # "unweighted_nobag",
     "unweighted",
 ]
 
 PARTIAL_WEIGHT_OPTIONS = [
-    "weighted",
+    # "weighted",
     "unweighted",
 ]
 
 DENSE_OPTIONS = [
     "split",
-    "dense",
-    "ssd",
+    # "dense",
+    # "ssd",
 ]
 
 ################################################################################
@@ -443,13 +443,13 @@ gen_gpu_files_training_vbe = [
     for wdesc in PARTIAL_WEIGHT_OPTIONS
     for fstring in [
         "gen_embedding_backward_{}_split_{}_vbe_cuda.cu",
-        "gen_embedding_backward_{}_split_{}_vbe_kernel_cta.cu",
+        # "gen_embedding_backward_{}_split_{}_vbe_kernel_cta.cu",
         "gen_embedding_backward_{}_split_{}_vbe_kernel_warp.cu",
     ]
     + (
         [
             "gen_embedding_backward_{}_ssd_{}_vbe_cuda.cu",
-            "gen_embedding_backward_{}_ssd_{}_vbe_kernel_cta.cu",
+            # "gen_embedding_backward_{}_ssd_{}_vbe_kernel_cta.cu",
             "gen_embedding_backward_{}_ssd_{}_vbe_kernel_warp.cu",
         ]
         if optimizer in SSD_OPTIMIZERS
@@ -483,7 +483,7 @@ gen_gpu_files_training = (
         for wdesc in WEIGHT_OPTIONS
         for fstring in [
             "gen_embedding_backward_{}_{}_{}_cuda.cu",
-            "gen_embedding_backward_{}_{}_{}_kernel_cta.cu",
+            # "gen_embedding_backward_{}_{}_{}_kernel_cta.cu",
             "gen_embedding_backward_{}_{}_{}_kernel_warp.cu",
         ]
     ]

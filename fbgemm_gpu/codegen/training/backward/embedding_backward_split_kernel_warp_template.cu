@@ -44,6 +44,7 @@
 
 using Tensor = at::Tensor;
 using namespace fbgemm_gpu;
+using namespace fbgemm_gpu::rocm;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Kernel Template Definition
@@ -160,10 +161,14 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 #else
     const unsigned int shfl_sync_mask = 0xffffffffu;
 #endif
+    {%- if is_rocm %}
+    constexpr int VEC_WIDTH = 2;
+    {%- else %}
     constexpr int VEC_WIDTH = 4;
+    {%- endif %}
     constexpr auto kIsInt8 = std::is_same<emb_t, uint8_t>::value;
 
-    struct SharedMemory<Vec4TAcc<cache_t>> smem;
+    struct SharedMemory<Vec2TAcc<cache_t>> smem;
     const int32_t grad_sum_stride = max_D / VEC_WIDTH;
     auto* smem_grad_sum = (kUseVecBlocking || kIsInt8)
       ? smem.getPointer() + threadIdx.y * grad_sum_stride
@@ -215,7 +220,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         const int32_t SL_per_warp = div_round_up(SL, blockDim.y);
         const int32_t sl_start = 0;
         const int32_t sl_end = SL;
-        Vec4TAcc<cache_t> grad_sum[kFixedMaxVecsPerThread];
+        Vec2TAcc<cache_t> grad_sum[kFixedMaxVecsPerThread];
         constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
         const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
 

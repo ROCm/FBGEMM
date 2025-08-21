@@ -10,6 +10,9 @@
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
+{%- if is_rocm %}
+#include "fbgemm_gpu/utils/rocm/vec2.h"
+{%- endif %}
 
 #define GROUP_REDUCE_ALL_SUM(val, ...) \
   warpReduceAllSum<__VA_ARGS__, kThreadGroupSize>(val, shfl_sync_mask)
@@ -20,6 +23,9 @@
 {%- set locs_or_addrs_idx = "row_idx" if ssd else "cache_idx" %}
 
 using namespace fbgemm_gpu;
+{%- if is_rocm %}
+using namespace fbgemm_gpu::rocm;
+{%- endif %}
 
 template <
     typename emb_t,
@@ -40,9 +46,9 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& weights_placements,
     const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>& weights_offsets,
     const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits>& sorted_{{ locs_or_addrs_tensor }},
-    Vec4TAcc<cache_t>* grad_sum,
-    Vec4TAcc<cache_t>* smem_grad_sum,
-    Vec4TAcc<cache_t>* shared_weight_update_row,
+    Vec2TAcc<cache_t>* grad_sum,
+    Vec2TAcc<cache_t>* smem_grad_sum,
+    Vec2TAcc<cache_t>* shared_weight_update_row,
     const bool stochastic_rounding,
     const at::PhiloxCudaState& stochastic_rounding_philox_args,
     const uint32_t run_id,
@@ -133,8 +139,8 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {{
        generate_optimized_grad_sum_loop_access(
            """
-           Vec4TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
-           Vec4TAcc<cache_t>& grad = {grad_vec};
+           Vec2TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
+           Vec2TAcc<cache_t>& grad = {grad_vec};
            {global_weight_decay_update}
            {split_weight_update}
            if (kIsInt8 && !cache_weights) {
