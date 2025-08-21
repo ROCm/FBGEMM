@@ -11,8 +11,11 @@
 #include <ATen/ATen.h>
 
 #include "fbgemm_gpu/utils/vec4.cuh"
+#include "fbgemm_gpu/utils/rocm/vec2.h"
 
 namespace fbgemm_gpu {
+
+using namespace rocm;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Shared Memory
@@ -52,6 +55,14 @@ struct SharedMemory<Vec4TAcc<float>> {
   __device__ Vec4TAcc<float>* getPointer() {
     extern __shared__ Vec4TAcc<float> s_acc_float_vec_t[];
     return s_acc_float_vec_t;
+  }
+};
+
+template <>
+struct SharedMemory<Vec2TAcc<float>> {
+  __device__ Vec2TAcc<float>* getPointer() {
+    extern __shared__ Vec2TAcc<float> s_acc_float_vec_t2[];
+    return s_acc_float_vec_t2;
   }
 };
 

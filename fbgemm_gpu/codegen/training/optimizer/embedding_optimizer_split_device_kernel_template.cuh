@@ -139,7 +139,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {{
        generate_optimized_grad_sum_loop_access(
            """
-           Vec2TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
+           Vec2TAcc<cache_t> weight_new = weight_row_template.load2(d, qparams_template);
            Vec2TAcc<cache_t>& grad = {grad_vec};
            {global_weight_decay_update}
            {split_weight_update}
@@ -147,7 +147,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
                shared_weight_update_row[d_vec] = weight_new;
            } else {
                // qparams_new not used if type is not int8
-               weight_row_template.store(weight_new, d, qparams_new);
+               //weight_row_template.store(weight_new, d, qparams_new);
            }
            """,
            other_formats={
@@ -171,10 +171,10 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
                 ++vec) {
                 const auto d_vec = vec * kThreadGroupSize + threadIdx.x;
                 const int32_t d = d_vec * VEC_WIDTH;
-                weight_row_template.store(
-                    shared_weight_update_row[d_vec],
-                    d,
-                    qparams_new);
+                // weight_row_template.store(
+                //     shared_weight_update_row[d_vec],
+                //     d,
+                //     qparams_new);
             }
         }
     }

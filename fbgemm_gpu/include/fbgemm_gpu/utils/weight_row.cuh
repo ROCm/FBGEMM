@@ -14,8 +14,11 @@
 #include "fbgemm_gpu/utils/cuda_prelude.cuh"
 #include "fbgemm_gpu/utils/stochastic_rounding.cuh"
 #include "fbgemm_gpu/utils/vec4.cuh"
+#include "fbgemm_gpu/utils/rocm/vec2.h"
 
 namespace fbgemm_gpu {
+
+using namespace rocm;
 
 namespace utils {
 
@@ -62,6 +65,23 @@ DEVICE_INLINE Vec4T<dst_t> dequantize_load(
 
   } else {
     return Vec4T<dst_t>(value);
+  }
+}
+
+template <typename dst_t, typename src_t>
+DEVICE_INLINE Vec2T<dst_t> dequantize_load2(
+    const src_t* value,
+    [[maybe_unused]] const float2 qparams) {
+  if constexpr (
+      std::is_same_v<src_t, uint8_t> &&
+      utils::is_one_of_v<dst_t, float, at::Half>) {
+    Vec2T<dst_t> out;
+    out.acc.x = value[0] * qparams.x + qparams.y;
+    out.acc.y = value[1] * qparams.x + qparams.y;
+    return out;
+
+  } else {
+    return Vec2T<dst_t>(value);
   }
 }
 
@@ -182,6 +202,18 @@ class WeightRow {
       return dequantize_load<reg_t, cache_t>(cache_row_ + d, qparams);
     } else {
       return dequantize_load<reg_t, emb_t>(row_ + d, qparams);
+    }
+  }
+
+  DEVICE_INLINE Vec2T<reg_t> load2(const int32_t d, const float2 qparams) const {
+    // Load from the cache if resident; else load from the embedding table.
+    //
+    // Note: This method assumes that reg_t is of higher precision than cache_t
+    // and emb_t
+    if (cache_row_) {
+      return dequantize_load2<reg_t, cache_t>(cache_row_ + d, qparams);
+    } else {
+      return dequantize_load2<reg_t, emb_t>(row_ + d, qparams);
     }
   }
 

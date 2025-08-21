@@ -121,8 +121,6 @@ def rowwise_adagrad() -> Dict[str, Any]:
     split_weight_update = """
         weight_new.acc.x = correction * weight_new.acc.x - multiplier * grad.acc.x;
         weight_new.acc.y = correction * weight_new.acc.y - multiplier * grad.acc.y;
-        weight_new.acc.z = correction * weight_new.acc.z - multiplier * grad.acc.z;
-        weight_new.acc.w = correction * weight_new.acc.w - multiplier * grad.acc.w;
     """
     split_post_update = """
     if (max_norm > 0.0) {
@@ -134,12 +132,10 @@ def rowwise_adagrad() -> Dict[str, Any]:
              vec < max_vecs && (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
              ++vec) {
             const int32_t d = (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH;
-            Vec4TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
+            Vec2TAcc<cache_t> weight_new = weight_row_template.load2(d, qparams_template);
             weight_sum_square
                 += weight_new.acc.x * weight_new.acc.x
-                + weight_new.acc.y * weight_new.acc.y
-                + weight_new.acc.z * weight_new.acc.z
-                + weight_new.acc.w * weight_new.acc.w;
+                + weight_new.acc.y * weight_new.acc.y;
         }
         const at::acc_type<cache_t, true> weight_norm =
             sqrtf(GROUP_REDUCE_ALL_SUM(weight_sum_square, at::acc_type<cache_t, true>));
@@ -158,8 +154,6 @@ def rowwise_adagrad() -> Dict[str, Any]:
 
                 weight_new.acc.x *= multiplier;
                 weight_new.acc.y *= multiplier;
-                weight_new.acc.z *= multiplier;
-                weight_new.acc.w *= multiplier;
                 weight_row_template.store(weight_new, d, qparams_new); // qparams_new not used if embedding is not int8
             }
         }
@@ -170,20 +164,16 @@ def rowwise_adagrad() -> Dict[str, Any]:
     """
     split_precomputation += generate_optimized_grad_sum_loop_access(
         """
-        const float4* grad = &{grad_vec}.acc;
+        const float2* grad = &{grad_vec}.acc;
         auto gx = grad->x;
         auto gy = grad->y;
-        auto gz = grad->z;
-        auto gw = grad->w;
         if (weight_decay_mode == 1) {
             // L2 regularization
-            Vec4TAcc<cache_t> weight = weight_row_template.load(d, qparams_template);
+            Vec2TAcc<cache_t> weight = weight_row_template.load2(d, qparams_template);
             gx += weight_decay * weight.acc.x;
             gy += weight_decay * weight.acc.y;
-            gz += weight_decay * weight.acc.z;
-            gw += weight_decay * weight.acc.w;
         }
-        g_local_sum_square += gx * gx + gy * gy + gz * gz + gw * gw;
+        g_local_sum_square += gx * gx + gy * gy;
     """
     )
     split_precomputation += """	

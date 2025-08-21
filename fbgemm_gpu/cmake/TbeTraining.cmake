@@ -42,10 +42,10 @@ handle_genfiles_rocm(gen_gpu_files_training)
 handle_genfiles_rocm(gen_gpu_files_training_vbe)
 
 # Index Select
-get_tbe_sources_list(static_cpu_files_index_select)
-get_tbe_sources_list(static_gpu_files_index_select)
-get_tbe_sources_list(gen_gpu_files_index_select)
-handle_genfiles_rocm(gen_gpu_files_index_select)
+#get_tbe_sources_list(static_cpu_files_index_select)
+#get_tbe_sources_list(static_gpu_files_index_select)
+#get_tbe_sources_list(gen_gpu_files_index_select)
+#handle_genfiles_rocm(gen_gpu_files_index_select)
 
 # Generated Python sources
 get_tbe_sources_list(gen_py_files_training)
