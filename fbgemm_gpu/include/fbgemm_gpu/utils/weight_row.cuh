@@ -65,6 +65,23 @@ DEVICE_INLINE Vec4T<dst_t> dequantize_load(
   }
 }
 
+template <typename dst_t, typename src_t>
+DEVICE_INLINE Vec2T<dst_t> dequantize_load2(
+    const src_t* value,
+    [[maybe_unused]] const float2 qparams) {
+  if constexpr (
+      std::is_same_v<src_t, uint8_t> &&
+      utils::is_one_of_v<dst_t, float, at::Half>) {
+    Vec2T<dst_t> out;
+    out.acc.x = value[0] * qparams.x + qparams.y;
+    out.acc.y = value[1] * qparams.x + qparams.y;
+    return out;
+
+  } else {
+    return Vec2T<dst_t>(value);
+  }
+}
+
 template <typename emb_t>
 DEVICE_INLINE float2 load_qparams_from_row(emb_t* qparam_ptr) {
   float2 qparams;
@@ -185,6 +202,18 @@ class WeightRow {
     }
   }
 
+  DEVICE_INLINE Vec2T<reg_t> load2(const int32_t d, const float2 qparams) const {
+    // Load from the cache if resident; else load from the embedding table.
+    //
+    // Note: This method assumes that reg_t is of higher precision than cache_t
+    // and emb_t
+    if (cache_row_) {
+      return dequantize_load2<reg_t, cache_t>(cache_row_ + d, qparams);
+    } else {
+      return dequantize_load2<reg_t, emb_t>(row_ + d, qparams);
+    }
+  }
+
   //////////////////////////////////////////////////////////////////////////////
   // Store regster variable of 4 elements (Vec4T<reg_t>) back into the table
   // into the table row at element offset d
@@ -206,6 +235,19 @@ class WeightRow {
     }
   }
 
+  template <typename dst_t>
+  DEVICE_INLINE void quantize_store2(
+      dst_t* output,
+      const Vec2T<reg_t>& value,
+      const float2 qparams) {
+    if (stoc_rounding_state_ptr_) {
+      stochastic_rounding_vector2<dst_t, reg_t>(
+          output, value, *stoc_rounding_state_ptr_, qparams);
+    } else {
+      nearest_rounding_vector2<dst_t, reg_t>(output, value, qparams);
+    }
+  }
+
   DEVICE_INLINE void
   store(const Vec4T<reg_t>& v, const int32_t d, const float2 qparams) {
     // Write back weight (high precision) to cache if resident; else write to
@@ -217,6 +259,20 @@ class WeightRow {
       quantize_store(cache_row_ + d, v, qparams);
     } else {
       quantize_store(row_ + d, v, qparams);
+    }
+  }
+
+  DEVICE_INLINE void
+  store2(const Vec2T<reg_t>& v, const int32_t d, const float2 qparams) {
+    // Write back weight (high precision) to cache if resident; else write to
+    // embedding table.
+    //
+    // Note: This method assumes that reg_t is of higher precision than cache_t
+    // and emb_t
+    if (cache_row_) {
+      quantize_store2(cache_row_ + d, v, qparams);
+    } else {
+      quantize_store2(row_ + d, v, qparams);
     }
   }
 
