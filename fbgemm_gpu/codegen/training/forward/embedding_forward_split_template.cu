@@ -796,14 +796,15 @@ batch_index_select_dim0_codegen_forward_cuda(
         } else {
             // Allocate num warps per table based on max_D
             const int num_warps_per_table = B * div_round_up(max_D, kWarpSize * 4);
-            const uint32_t num_warps_per_threadblock = kForwardMaxThreads / kWarpSize;
+            const uint32_t num_warps_per_threadblock = kForwardMaxThreads / (kWarpSize*2);
 
             const auto kernel_func =
               (use_lxu_cache ? split_embedding_codegen_forward_{{ wdesc }}_v2_kernel<
                                   emb_t, cache_t, output_t, index_t, true>
                               : split_embedding_codegen_forward_{{ wdesc }}_v2_kernel<
                                   emb_t, cache_t, output_t, index_t, false>);
-
+            printf("grid size: %d \n", div_round_up(T * num_warps_per_table, num_warps_per_threadblock));
+            printf("num_warps_per_threadblock: %d \n", num_warps_per_threadblock);
             FBGEMM_LAUNCH_KERNEL(
               kernel_func,
               div_round_up(T * num_warps_per_table, num_warps_per_threadblock),
