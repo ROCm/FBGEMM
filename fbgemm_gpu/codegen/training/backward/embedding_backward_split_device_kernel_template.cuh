@@ -141,6 +141,88 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 ? sorted_indice_weights[segment_start + sl_j]
                 : 0.0;
             {%- endif %}
+            /// ===============================
+            {%- if is_rocm %}
+            constexpr int32_t kLoopUnrollFactor = 4;
+            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; j += kLoopUnrollFactor)
+            {
+                {%- if nobag %}
+                int32_t l_j[kLoopUnrollFactor];
+                
+                #pragma unroll kLoopUnrollFactor
+                for(int i = 0; i < kLoopUnrollFactor; ++i)
+                {
+                    l_j[i] = SHFL_SYNC(l, j + i);
+                }
+                {%- elif vbe %}
+                int64_t grad_offset_j[kLoopUnrollFactor];
+                
+                #pragma unroll kLoopUnrollFactor
+                for(int i = 0; i < kLoopUnrollFactor; ++i)
+                {
+                    grad_offset_j[i] = SHFL_SYNC(grad_offset, j + i);
+                }
+                {%- else %}
+                int32_t b_j[kLoopUnrollFactor];// = SHFL_SYNC(b, j);
+                int32_t D_start_j[kLoopUnrollFactor];// = SHFL_SYNC(D_start, j);
+                
+                #pragma unroll kLoopUnrollFactor
+                for(int i = 0; i < kLoopUnrollFactor; ++i)
+                {
+                    b_j[i] = SHFL_SYNC(b, j + i);
+                    D_start_j[i] = SHFL_SYNC(D_start, j + i);
+                }
+                {%- endif %}
+
+                {%- if weighted %}
+                at::acc_type<cache_t, true> idx_weight_j[kLoopUnrollFactor];// = SHFL_SYNC(idx_weight, j);
+
+                #pragma unroll kLoopUnrollFactor
+                for(int i = 0; i < kLoopUnrollFactor; ++i)
+                {
+                    idx_weight_j[i] = SHFL_SYNC(idx_weight, j + i);
+                }
+                {%- endif %}
+
+                {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+                
+                #pragma unroll kFixedMaxVecsPerThread
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) 
+                {
+                    const int32_t d = {{ d }};
+                    if (threadIdx.x * VEC_WIDTH < D) 
+                    {
+                        Vec4TAcc<grad_t> grad_out_vec[kLoopUnrollFactor];
+                        #pragma unroll kLoopUnrollFactor
+                        for(int i = 0; i < kLoopUnrollFactor; ++i)
+                        {
+                            grad_out_vec[i] = sl + j + i < sl_end ? Vec4TAcc<grad_t>(
+                                                                        {%- if nobag and is_index_select %}
+                                                                        // grad_output is 1d
+                                                                        &grad_output[grad_offset + l_j[i] * grad_stride + d]
+                                                                        {%- elif nobag %}
+                                                                        &grad_output[l_j[i]][d]
+                                                                        {%- elif vbe %}
+                                                                        &grad_output[0][grad_offset_j[i] + d]
+                                                                        {%- else %}
+                                                                        &grad_output[b_j[i]][0] + D_start_j[i] + d
+                                                                        {%- endif %} // if nobag
+                                                                    ) : Vec4TAcc<grad_t>();
+                        }
+
+                        #pragma unroll kLoopUnrollFactor
+                        for(int i = 0; i < kLoopUnrollFactor; ++i)
+                        {
+                            {%- if weighted %}
+                            grad_sum[vec].fma_(grad_out_vec[i], idx_weight_j[i]);
+                            {%- else %}
+                            grad_sum[vec].add_(grad_out_vec[i]);
+                            {%- endif %}
+                        }
+                    }
+                }
+            }
+            {%- else %}
             for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
                 {%- if nobag %}
                 int32_t l_j = SHFL_SYNC(l, j);
@@ -180,7 +262,9 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                     {%- endif %}
                 }
             }
+            {%- endif %}
         }
+        ///============================
         {%- set d_vec = "((vec + vec_start) * kThreadGroupSize + threadIdx.x)" %}
 
         if (smem_grad_sum) {
