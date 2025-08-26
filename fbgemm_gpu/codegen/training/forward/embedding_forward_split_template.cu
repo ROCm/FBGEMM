@@ -803,8 +803,6 @@ batch_index_select_dim0_codegen_forward_cuda(
                                   emb_t, cache_t, output_t, index_t, true>
                               : split_embedding_codegen_forward_{{ wdesc }}_v2_kernel<
                                   emb_t, cache_t, output_t, index_t, false>);
-            printf("grid size: %d \n", div_round_up(T * num_warps_per_table, num_warps_per_threadblock));
-            printf("num_warps_per_threadblock: %d \n", num_warps_per_threadblock);
             FBGEMM_LAUNCH_KERNEL(
               kernel_func,
               div_round_up(T * num_warps_per_table, num_warps_per_threadblock),
