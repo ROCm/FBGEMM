@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2016 - 2022 Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2016 - 2025 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -73,6 +73,13 @@ __device__ float llvm_amdgcn_raw_buffer_load_fp32(
     int32_t soffset,
     int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.f32");
 
+__device__ float2 llvm_amdgcn_raw_buffer_load_fp32x2(
+    int32x4_t srsrc,
+    int32_t voffset,
+    int32_t soffset,
+    int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v2f32");
+
+
 __device__ half2 llvm_amdgcn_raw_buffer_load_fp16x2(
     int32x4_t srsrc,
     int32_t voffset,
@@ -99,6 +106,236 @@ __device__ void llvm_amdgcn_raw_buffer_store_fp32x2(
     int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.store.v2f32");
 
 /******************************************************************************/
+// template <typename data_t, int32_t k_elements_per_thread, typename index_t, typename Enable = void>
+// struct load_row_per_warp_v2;
+//  {
+//   __device__ __forceinline__ static void
+//   run(data_t *dst, index_t row_index, const data_t *src, int lane_id, int dim) {
+//     // static_assert(std::is_same_v<data_t, c10::Half> ||
+//     //                   std::is_same_v<data_t, half> ||
+//     //                   std::is_same_v<data_t, float>,
+//                   // "Template parameters are not supported");
+//   }
+// };
+
+
+
+// template <typename data_t, int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2 {
+//   __device__ __forceinline__ static void
+//   run(data_t *dst, index_t row_index, const data_t *src, int lane_id, int dim) {
+//     // static_assert(std::is_same_v<data_t, c10::Half> ||
+//     //                   std::is_same_v<data_t, half> ||
+//     //                   std::is_same_v<data_t, float>,
+//                   // "Template parameters are not supported");
+//   }
+// };
+
+// template <typename data_t, int32_t k_elements_per_thread, typename index_t>
+// __device__ __forceinline__ void
+// load_row_per_warp(data_t *dst, index_t row_index, const data_t *src,
+//                   int lane_id, int dim) {}
+
+// template <typename emb_t, int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2<
+//     emb_t, k_elements_per_thread, index_t,
+//     typename std::enable_if_t<std::is_same_t<emb_t, half> ||
+//                                   std::is_same_v<emb_t, c10::Half>,
+//                               half>> {
+//   __device__ __forceinline__ static void run(emb_t *dst, index_t row_index,
+//                                              const emb_t *src, int lane_id,
+//                                              int emb_dim) {
+//     static_assert(k_elements_per_thread > 0);
+
+//     const auto row_offset = row_index * emb_dim;
+//     int32x4_t emb_res = amdgcn_make_buffer_resource(src + row_index * emb_dim);
+
+// #pragma unroll
+//     for (int idx = 0; idx < (k_elements_per_thread - 1) / 2; ++idx) {
+//       *reinterpret_cast<float2 *>(dst + idx * 2) =
+//           llvm_amdgcn_raw_buffer_load_fp32x2(
+//               emb_res, (lane_id + idx * warpSize) * sizeof(float2), 0, 0);
+//     }
+
+//     if constexpr (k_elements_per_thread % 2 == 0) {
+//       constexpr int k_tailing_even_idx = (k_elements_per_thread - 2);
+//       dst[k_tailing_even_idx] = llvm_amdgcn_raw_buffer_load_fp32(
+//           emb_res, (lane_id + k_tailing_even_idx * warpSize) * sizeof(float), 0,
+//           0);
+//     }
+
+//     constexpr int k_tailing_last_idx = k_elements_per_thread - 1;
+//     const auto tailing_idx = lane_id + k_tailing_last_idx * warpSize;
+//     dst[k_tailing_last_idx] =
+//         tailing_idx < emb_dim ? llvm_amdgcn_raw_buffer_load_fp32(
+//                                     emb_res, tailing_idx * sizeof(float), 0, 0)
+//                               : 0.f;
+//   }
+// };
+
+// template <int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2 {
+//   __device__ __forceinline__ static void
+//   run(float *dst, index_t row_index, const float *src, int lane_id, int emb_dim) {
+//     static_assert(k_elements_per_thread > 0);
+
+//     const auto row_offset = row_index * emb_dim;
+//     int32x4_t emb_res = amdgcn_make_buffer_resource(src + row_index * emb_dim);
+
+// #pragma unroll
+//     for (int idx = 0; idx < (k_elements_per_thread - 1) / 2; ++idx) {
+//       *reinterpret_cast<float2 *>(dst + idx * 2) =
+//           llvm_amdgcn_raw_buffer_load_fp32x2(
+//               emb_res, (lane_id + idx * warpSize) * sizeof(float2), 0, 0);
+//     }
+
+//     if constexpr (k_elements_per_thread % 2 == 0) {
+//       constexpr int k_tailing_even_idx = (k_elements_per_thread - 2);
+//       dst[k_tailing_even_idx] = llvm_amdgcn_raw_buffer_load_fp32(
+//           emb_res, (lane_id + k_tailing_even_idx * warpSize) * sizeof(float), 0,
+//           0);
+//     }
+
+//     constexpr int k_tailing_last_idx = k_elements_per_thread - 1;
+//     const auto tailing_idx = lane_id + k_tailing_last_idx * warpSize;
+//     dst[k_tailing_last_idx] =
+//         tailing_idx < emb_dim ? llvm_amdgcn_raw_buffer_load_fp32(
+//                                     emb_res, tailing_idx * sizeof(float), 0, 0)
+//                               : 0.f;
+//   }
+// };
+
+template <int32_t k_elements_per_thread, typename index_t>
+struct load_row_per_warp_v2 {
+  __device__ __forceinline__ static void
+  run(float *dst, index_t row_index, const float *src, int lane_id, int emb_dim) {
+    static_assert(k_elements_per_thread > 0);
+
+    const auto row_offset = row_index * emb_dim;
+    int32x4_t emb_res = amdgcn_make_buffer_resource(src + row_index * emb_dim);
+
+#pragma unroll
+    for (int idx = 0; idx < (k_elements_per_thread - 1) / 2; ++idx) {
+      *reinterpret_cast<float2 *>(dst + idx * 2) =
+          llvm_amdgcn_raw_buffer_load_fp32x2(
+              emb_res, (lane_id + idx * warpSize) * sizeof(float2), 0, 0);
+    }
+
+    if constexpr (k_elements_per_thread % 2 == 0) {
+      constexpr int k_tailing_even_idx = (k_elements_per_thread - 2);
+      dst[k_tailing_even_idx] = llvm_amdgcn_raw_buffer_load_fp32(
+          emb_res, (lane_id + k_tailing_even_idx * warpSize) * sizeof(float), 0,
+          0);
+    }
+
+    constexpr int k_tailing_last_idx = k_elements_per_thread - 1;
+    const auto tailing_idx = lane_id + k_tailing_last_idx * warpSize;
+    dst[k_tailing_last_idx] =
+        tailing_idx < emb_dim ? llvm_amdgcn_raw_buffer_load_fp32(
+                                    emb_res, tailing_idx * sizeof(float), 0, 0)
+                              : 0.f;
+  }
+
+  __device__ __forceinline__ static void
+  run(half *dst, index_t row_index, const half *src, int lane_id, int emb_dim) {
+    static_assert(k_elements_per_thread > 0);
+
+    const auto row_offset = row_index * emb_dim;
+    int32x4_t emb_res = amdgcn_make_buffer_resource(src + row_index * emb_dim);
+
+#pragma unroll
+    for (int idx = 0; idx < (k_elements_per_thread - 1) / 2; ++idx) {
+      *reinterpret_cast<half2 *>(dst + idx * 2) =
+          llvm_amdgcn_raw_buffer_load_fp16x2(
+              emb_res, (lane_id + idx * warpSize) * sizeof(half2), 0, 0);
+    }
+
+    if constexpr (k_elements_per_thread % 2 == 0) {
+      constexpr int k_tailing_even_idx = (k_elements_per_thread - 2);
+      dst[k_tailing_even_idx] = llvm_amdgcn_raw_buffer_load_fp16(
+          emb_res, (lane_id + k_tailing_even_idx * warpSize) * sizeof(half), 0,
+          0);
+    }
+
+    constexpr int k_tailing_last_idx = k_elements_per_thread - 1;
+    const auto tailing_idx = lane_id + k_tailing_last_idx * warpSize;
+    dst[k_tailing_last_idx] =
+        tailing_idx < emb_dim ? llvm_amdgcn_raw_buffer_load_fp16(
+                                    emb_res, tailing_idx * sizeof(half), 0, 0)
+                              : half(0.f);
+  }
+
+  __device__ __forceinline__ static void run(c10::Half *dst, index_t row_index,
+                                             const c10::Half *src, int lane_id,
+                                             int emb_dim) {
+    // load_row_per_warp_v2<k_elements_per_thread, index_t>::
+    run(
+        reinterpret_cast<half *>(dst), row_index,
+        reinterpret_cast<const half *>(src), lane_id, emb_dim);
+  }
+
+};
+
+// template <int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2<half, k_elements_per_thread, index_t> {
+//   __device__ __forceinline__ static void
+//   run(half *dst, index_t row_index, const half *src, int lane_id, int emb_dim) {
+//     static_assert(k_elements_per_thread > 0);
+
+//     const auto row_offset = row_index * emb_dim;
+//     int32x4_t emb_res = amdgcn_make_buffer_resource(src + row_index * emb_dim);
+
+// #pragma unroll
+//     for (int idx = 0; idx < (k_elements_per_thread - 1) / 2; ++idx) {
+//       *reinterpret_cast<half2 *>(dst + idx * 2) =
+//           llvm_amdgcn_raw_buffer_load_fp16x2(
+//               emb_res, (lane_id + idx * warpSize) * sizeof(half2), 0, 0);
+//     }
+
+//     if constexpr (k_elements_per_thread % 2 == 0) {
+//       constexpr int k_tailing_even_idx = (k_elements_per_thread - 2);
+//       dst[k_tailing_even_idx] = llvm_amdgcn_raw_buffer_load_fp16(
+//           emb_res, (lane_id + k_tailing_even_idx * warpSize) * sizeof(half), 0,
+//           0);
+//     }
+
+//     constexpr int k_tailing_last_idx = k_elements_per_thread - 1;
+//     const auto tailing_idx = lane_id + k_tailing_last_idx * warpSize;
+//     dst[k_tailing_last_idx] =
+//         tailing_idx < emb_dim ? llvm_amdgcn_raw_buffer_load_fp16(
+//                                     emb_res, tailing_idx * sizeof(half), 0, 0)
+//                               : half(0.f);
+//   }
+// };
+
+// template <int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2 {
+//   __device__ __forceinline__ static void run(c10::Half *dst, index_t row_index,
+//                                              const c10::Half *src, int lane_id,
+//                                              int emb_dim) {
+//     load_row_per_warp_v2<half, k_elements_per_thread, index_t>::run(
+//         reinterpret_cast<half *>(dst), row_index,
+//         reinterpret_cast<const half *>(src), lane_id, emb_dim);
+//   }
+// };
+
+// template <int32_t k_elements_per_thread, typename index_t>
+// struct load_row_per_warp_v2<c10::Half, k_elements_per_thread, index_t> {
+//   __device__ __forceinline__ static void run(c10::Half *dst, index_t row_index,
+//                                              const c10::Half *src, int lane_id,
+//                                              int emb_dim) {
+//     load_row_per_warp_v2<half, k_elements_per_thread, index_t>::run(
+//         reinterpret_cast<half *>(dst), row_index,
+//         reinterpret_cast<const half *>(src), lane_id, emb_dim);
+//   }
+// };
+// __device__ __forceinline__ void
+// load_row_per_warp<c10::Half, k_elements_per_thread, index_t>(
+//     c10::Half *dst, index_t row_index, const c10::Half *src, int lane_id,
+//     int emb_dim) {
+//   load_row_per_warp(reinterpret_cast<half *>(dst), row_index,
+//                     reinterpret_cast<const half *>(src), lane_id, emb_dim);
+// }
 
 template <typename emb_t, int32_t embedding_dim, typename index_t>
 struct load_row_per_warp {

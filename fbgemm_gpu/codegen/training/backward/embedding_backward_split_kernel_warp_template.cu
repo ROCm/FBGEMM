@@ -762,7 +762,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
 {%- endmacro %}
 
 {%- macro hip_bulk_template_instantiations(kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking) %}
-    {%- for grad_type in ['float', 'at::Half', 'at::BFloat16'] %}
+    {%- for grad_type in ['float', 'at::Half'] %}
     {%- for emb_type in ['float', 'at::Half'] %}
     {%- for cache_type in ['float', 'at::Half'] %}
     {%- for index_type in ['int32_t', 'int64_t'] %}

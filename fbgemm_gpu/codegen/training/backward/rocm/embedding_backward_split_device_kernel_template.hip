@@ -377,8 +377,10 @@ L_tail_grad_acc:
                 table_index = infos[0] >> info_B_num_bits;
                 bag_index = infos[0] & info_B_mask;
 
-                load_row_per_warp<grad_t, embedding_dim, index_t>::run(
-                    &grad_data[0], bag_index * num_tables, p_output_grad + table_index * embedding_dim, lane_id);
+                // load_row_per_warp<grad_t, embedding_dim, index_t>::run(
+                //     &grad_data[0], bag_index * num_tables, p_output_grad + table_index * embedding_dim, lane_id);
+                load_row_per_warp_v2<embedding_dim, index_t>::run(&grad_data[0], bag_index * num_tables,
+                                                                          p_output_grad + table_index, lane_id, embedding_dim);
                 accumulate_row_per_warp<grad_t, embedding_dim, cache_t, weighted>::run(
                     &grad_acc[0], &grad_data[0], lane_id);
 
@@ -395,8 +397,10 @@ L_tail_grad_acc:
                 table_index = infos[0] >> info_B_num_bits;
                 bag_index = infos[0] & info_B_mask;
 
-                load_row_per_warp<grad_t, embedding_dim, index_t>::run(
-                    &grad_data[0], bag_index * num_tables, p_output_grad + table_index * embedding_dim, lane_id);
+                // load_row_per_warp<grad_t, embedding_dim, index_t>::run(
+                //     &grad_data[0], bag_index * num_tables, p_output_grad + table_index * embedding_dim, lane_id);
+                load_row_per_warp_v2<embedding_dim, index_t>::run(&grad_data[0], bag_index * num_tables,
+                                                                          p_output_grad + table_index, lane_id, embedding_dim);
                 accumulate_row_per_warp<grad_t, embedding_dim, cache_t, weighted>::run(
                     &grad_acc[0], &grad_data[0], lane_id, indice_weights[0]);
 
@@ -406,8 +410,9 @@ L_tail_grad_acc:
     }
 
     // load the old emb weight data
-    load_row_per_warp<emb_t, embedding_dim, index_t>::run(
-        &emb_data[0], emb_idx, p_emb_table, lane_id);
+    // load_row_per_warp<emb_t, embedding_dim, index_t>::run(
+    //     &emb_data[0], emb_idx, p_emb_table, lane_id);
+    load_row_per_warp_v2<dword_per_row, index_t>::run(emb_data, emb_idx, p_emb_table, lane_id, embedding_dim);
     optimizer_t optimizer(opt_karg);
     optimizer.template update<dword_per_row, segment_split>(grad_acc, emb_data, emb_idx);
 
