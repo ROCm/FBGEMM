@@ -36,6 +36,7 @@ enum class PlacementType : uint8_t {
   MANAGED = 1,
   MANAGED_CACHING = 2,
   HOST = 3,
+  UNKNOWN = 4,
 };
 
 enum class BoundsCheckMode : uint8_t {

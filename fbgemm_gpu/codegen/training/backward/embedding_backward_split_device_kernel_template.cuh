@@ -100,7 +100,9 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
     const int32_t sl_start,
     const int32_t sl_end,
     const unsigned int shfl_sync_mask,
-    const int32_t num_vecs
+    const int32_t num_vecs,
+    const int32_t b_t_pre = 0,
+    const int32_t boff_pre = 0
 ) {
     // Copy value to vecs to make num_vecs known at compile time when
     // kUseVecBlocking == false
@@ -121,14 +123,20 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
         for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
             auto sl_j = sl + threadIdx.x;
             {%- if not nobag %}
-            const auto b_t = sl_j < sl_end
+            const auto b_t = (sl == sl_start && vec_start == 0) ? b_t_pre : (sl_j < sl_end
                 ? reinterpret_cast<const uint32_t*>(
                     &sorted_infos[0])[segment_start + sl_j]
-                : 0;
+                : 0);
             const auto b = b_t & info_B_mask;
             const auto t = b_t >> info_B_num_bits;
             {%- if vbe %}
+            {%- if not weighted %}
+            const auto boff = (sl == sl_start && vec_start == 0) ? boff_pre : B_offsets[t];
+            const auto grad_offset = row_output_offsets[boff + b];
+            {%- else %}
             const auto grad_offset = row_output_offsets[B_offsets[t] + b];
+            {%- endif %}       
+            const int32_t d = threadIdx.x * VEC_WIDTH;
             {%- else %} // if vbe
             int32_t D_start = sl_j < sl_end ? D_offsets[t] : 0;
             {%- endif %} // if vbe
@@ -141,6 +149,36 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 ? sorted_indice_weights[segment_start + sl_j]
                 : 0.0;
             {%- endif %}
+            {%- if not nobag and vbe and not weighted %}
+            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; j += 8) {
+                const auto grad_offset_j0 = SHFL_SYNC(grad_offset, j);
+                const auto grad_offset_j1 = SHFL_SYNC(grad_offset, j + 1);
+                const auto grad_offset_j2 = SHFL_SYNC(grad_offset, j + 2);
+                const auto grad_offset_j3 = SHFL_SYNC(grad_offset, j + 3);
+                const auto grad_offset_j4 = SHFL_SYNC(grad_offset, j + 4);
+                const auto grad_offset_j5 = SHFL_SYNC(grad_offset, j + 5);
+                const auto grad_offset_j6 = SHFL_SYNC(grad_offset, j + 6);
+                const auto grad_offset_j7 = SHFL_SYNC(grad_offset, j + 7);
+                if (threadIdx.x * VEC_WIDTH < D) {
+                    Vec4TAcc<grad_t> grad_out_vec0 = Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j0 + d]);
+                    Vec4TAcc<grad_t> grad_out_vec1 = sl + j + 1 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j1 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec2 = sl + j + 2 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j2 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec3 = sl + j + 3 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j3 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec4 = sl + j + 4 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j4 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec5 = sl + j + 5 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j5 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec6 = sl + j + 6 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j6 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec7 = sl + j + 7 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j7 + d]) : Vec4TAcc<grad_t>();
+                    grad_sum[0].add_(grad_out_vec0);
+                    grad_sum[0].add_(grad_out_vec1);
+                    grad_sum[0].add_(grad_out_vec2);
+                    grad_sum[0].add_(grad_out_vec3);
+                    grad_sum[0].add_(grad_out_vec4);
+                    grad_sum[0].add_(grad_out_vec5);
+                    grad_sum[0].add_(grad_out_vec6);
+                    grad_sum[0].add_(grad_out_vec7);
+                }
+            }
+            {%- else %}
             for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
                 {%- if nobag %}
                 int32_t l_j = SHFL_SYNC(l, j);
@@ -180,6 +218,7 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                     {%- endif %}
                 }
             }
+            {%- endif %}
         }
         {%- set d_vec = "((vec + vec_start) * kThreadGroupSize + threadIdx.x)" %}
 

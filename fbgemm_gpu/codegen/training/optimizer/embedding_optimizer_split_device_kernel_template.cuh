@@ -58,7 +58,8 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {%- if ssd %}
     const bool enable_optimizer_offloading,
     {%- endif %}
-    {{ args.split_ref_kernel_args | replace_pta_namespace() | join(",\n    ") }}
+    {{ args.split_ref_kernel_args | replace_pta_namespace() | join(",\n    ") }},
+    PlacementType weights_placement_input = PlacementType::UNKNOWN
 ) {
     constexpr auto kIsInt8 = std::is_same_v<emb_t, uint8_t>;
     // Copy value to max_vecs to make max_vecs_per_thread known at compile time
@@ -72,7 +73,9 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     if constexpr (kIsInt8) {
         D_emb += kINT8QparamsBytes;
     }
-    const auto weights_placement = static_cast<PlacementType>(weights_placements[t]);
+    const auto weights_placement = weights_placement_input == PlacementType::UNKNOWN
+        ? weights_placement_input
+        : static_cast<PlacementType>(weights_placements[t]);
     if (weights_placement == PlacementType::DEVICE) {
         weights = &dev_weights[weights_offset + idx * D_emb];
     } else {
