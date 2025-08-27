@@ -63,6 +63,111 @@ DEVICE_INLINE void store_grad_sum(
      */
 #}
 
+{%- if not nobag and not weighted and vbe %}
+template <
+    typename grad_t,
+    typename cache_t,
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize = kWarpSize,
+    int32_t VEC_WIDTH,
+    bool kUseVecBlocking
+>
+DEVICE_INLINE void compute_grad_sum_unweighted_vbe_rowwise_adagrad(
+    Vec4TAcc<cache_t>* grad_sum,
+    Vec4TAcc<cache_t>* smem_grad_sum,
+    const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits>& grad_output,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& D_offsets,
+    const int32_t D,
+    const int32_t T,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& sorted_infos,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& B_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>& row_output_offsets,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    const int32_t segment_start,
+    const int32_t sl_start,
+    const int32_t sl_end,
+    const unsigned int shfl_sync_mask,
+    const int32_t num_vecs,
+    const int32_t b_t_pre,
+    const int32_t boff_pre
+) {
+    // Copy value to vecs to make num_vecs known at compile time when
+    // kUseVecBlocking == false
+    const int32_t vecs = kUseVecBlocking ? num_vecs : kFixedMaxVecsPerThread;
+    for (int32_t vec_start = 0;
+         vec_start < vecs;
+         vec_start += kFixedMaxVecsPerThread) {
+
+        // Reset grad_sum vectors
+        #pragma unroll kFixedMaxVecsPerThread
+        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; vec++) {
+            grad_sum[vec].acc.x = 0;
+            grad_sum[vec].acc.y = 0;
+            grad_sum[vec].acc.z = 0;
+            grad_sum[vec].acc.w = 0;
+        }
+
+        for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
+            auto sl_j = sl + threadIdx.x;
+            const auto b_t = (sl==sl_start && vec_start==0) ? b_t_pre : (sl_j < sl_end
+                ? reinterpret_cast<const uint32_t*>(
+                    &sorted_infos[0])[segment_start + sl_j]
+                : 0);
+            const auto b = b_t & info_B_mask;
+            const auto t = b_t >> info_B_num_bits;
+            const auto boff = (sl == sl_start && vec_start == 0) ? boff_pre: B_offsets[t];
+            const auto grad_offset = row_output_offsets[B_offsets[t] + b];
+            const int32_t d =  threadIdx.x * VEC_WIDTH;
+            
+            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; j += 8) {
+                const auto grad_offset_j0 = SHFL_SYNC(grad_offset, j);
+                const auto grad_offset_j1 = SHFL_SYNC(grad_offset, j + 1);
+                const auto grad_offset_j2 = SHFL_SYNC(grad_offset, j + 2);
+                const auto grad_offset_j3 = SHFL_SYNC(grad_offset, j + 3);
+                const auto grad_offset_j4 = SHFL_SYNC(grad_offset, j + 4);
+                const auto grad_offset_j5 = SHFL_SYNC(grad_offset, j + 5);
+                const auto grad_offset_j6 = SHFL_SYNC(grad_offset, j + 6);
+                const auto grad_offset_j7 = SHFL_SYNC(grad_offset, j + 7);
+                if (threadIdx.x * VEC_WIDTH < D) {
+                    Vec4TAcc<grad_t> grad_out_vec0 = Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j0 + d]);
+                    Vec4TAcc<grad_t> grad_out_vec1 = sl + j + 1 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j1 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec2 = sl + j + 2 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j2 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec3 = sl + j + 3 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j3 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec4 = sl + j + 4 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j4 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec5 = sl + j + 5 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j5 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec6 = sl + j + 6 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j6 + d]) : Vec4TAcc<grad_t>();
+                    Vec4TAcc<grad_t> grad_out_vec7 = sl + j + 7 < sl_end ? Vec4TAcc<grad_t>(&grad_output[0][grad_offset_j7 + d]) : Vec4TAcc<grad_t>();
+                    grad_sum[0].add_(grad_out_vec0);
+                    grad_sum[0].add_(grad_out_vec1);
+                    grad_sum[0].add_(grad_out_vec2);
+                    grad_sum[0].add_(grad_out_vec3);
+                    grad_sum[0].add_(grad_out_vec4);
+                    grad_sum[0].add_(grad_out_vec5);
+                    grad_sum[0].add_(grad_out_vec6);
+                    grad_sum[0].add_(grad_out_vec7);
+
+                }
+            }
+        }
+
+        {%- set d_vec = "((vec + vec_start) * kThreadGroupSize + threadIdx.x)" %}
+
+        if (smem_grad_sum) {
+            // Store grad_sum in smem_grad_sum
+            #pragma unroll kFixedMaxVecsPerThread
+            for (int32_t vec = 0;
+                 (vec < kFixedMaxVecsPerThread) && {{ d_vec }} * VEC_WIDTH < D;
+                 ++vec) {
+                const int32_t d_vec = {{ d_vec }};
+                smem_grad_sum[d_vec] = grad_sum[vec];
+            }
+        }
+    }
+}
+
+{%- endif %}
+
 template <
     typename grad_t,
     typename cache_t,
