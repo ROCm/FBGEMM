@@ -1016,12 +1016,14 @@ static torch::autograd::variable_list backward(
            (not ssd) and 
            (not is_index_select) and 
            (not dense) %}
+    const static bool is_optimized_bwd_kernel_enabled = config::is_feature_enabled(
+                                                        config::FeatureGateName::TBE_ROCM_HIP_BACKWARD_KERNEL);
     constexpr int guarded_T = 153;
     constexpr int guarded_D = 256;
     constexpr int guarded_B = 65536;
     const auto T = weights_offsets.sym_numel();
     const auto B = (offsets.size(0) - 1) / T;
-    if(!mixed_D && (max_D == guarded_D) && (T == guarded_T) && (B == guarded_B)) 
+    if(!mixed_D && (max_D == guarded_D) && (T == guarded_T) && (B == guarded_B) && is_optimized_bwd_kernel_enabled) 
     {
       max_segment_length_per_warp = std::numeric_limits<int32_t>::max();
     }
