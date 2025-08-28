@@ -230,6 +230,8 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         {%- endif %}
         {%- endif %}
 
+        // now, each segment corresponds to exactly one table `t` and row in
+        // that table (`idx`). Thus, we can hoist out some of the book-keeping.
         int64_t hash_size = hash_size_cumsum[t_0];
         {%- if not nobag or is_index_select %}
         const auto D_start_t0 = D_offsets[t_0];
@@ -243,7 +245,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         const auto grad_stride = permute_output_dim_0_1 ? D_offsets[T] : D;
         {%- endif %}
         {%- endif %}
-        int64_t idx = linear_index - hash_size;
+        int64_t idx = linear_index - hash_size; // the id value or emb index
 
         {{ compute_global_weight_decay(is_gwd_kernel) }}
 
@@ -367,7 +369,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               max_vecs,
               weights_placement,
               {{ args.split_kernel_arg_names | join(", ") }}
-          );
+          ); // if not dense and optimizer != "none"
 
         t_0 = info_0 >> info_B_num_bits;
         auto weights_placement = static_cast<PlacementType>(weights_placements[t_0]);
@@ -441,7 +443,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               idx,
               max_vecs
         );
-        {%- endif %} // if not dense and optimizer != "none"
+        {%- endif %} 
     }
 }
 

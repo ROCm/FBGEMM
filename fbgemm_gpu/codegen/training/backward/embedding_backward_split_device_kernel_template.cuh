@@ -117,7 +117,7 @@ DEVICE_INLINE void compute_grad_sum_unweighted_vbe_rowwise_adagrad(
             const auto b = b_t & info_B_mask;
             const auto t = b_t >> info_B_num_bits;
             const auto boff = (sl == sl_start && vec_start == 0) ? boff_pre: B_offsets[t];
-            const auto grad_offset = row_output_offsets[B_offsets[t] + b];
+            const auto grad_offset = row_output_offsets[boff + b]; // if vbe // if not nobag
             const int32_t d =  threadIdx.x * VEC_WIDTH;
             
             for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; j += 8) {
