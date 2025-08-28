@@ -63,7 +63,7 @@ DEVICE_INLINE void store_grad_sum(
      */
 #}
 
-{%- if not nobag and not weighted and vbe %}
+{%- if not nobag and not weighted and vbe and not ssd %}
 template <
     typename grad_t,
     typename cache_t,

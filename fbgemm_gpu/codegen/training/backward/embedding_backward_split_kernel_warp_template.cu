@@ -153,7 +153,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     const float weight_decay_base = 1 - learning_rate * weight_decay;
     {%- endif %}
 
-    {%- if not nobag and vbe and not weighted and not ssd %}
+    {%- if not is_gwd_kernel and not nobag and vbe and not weighted and not ssd and optimizer == "rowwise_adagrad" and mdesc == "split" %}
     const auto run_sum = sorted_linear_indices_run.size(0) < sorted_linear_indices_num_runs[0]
         ? sorted_linear_indices_run.size(0)
         : sorted_linear_indices_num_runs[0];
@@ -178,7 +178,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
       ? smem.getPointer() + threadIdx.y * grad_sum_stride
       : nullptr;
 
-    {%- if vbe and not weighted and not ssd and not nobag and optimizer == "rowwise_adagrad" and not is_gwd_kernel %}
+    {%- if not is_gwd_kernel and not nobag and vbe and not weighted and not ssd and optimizer == "rowwise_adagrad" and mdesc == "split" %}
     int32_t segment_start = segment_start_pre;
     int32_t segment_end = segment_end_pre;
     int64_t linear_index = linear_index_pre;
@@ -196,6 +196,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 
     for (uint32_t run_id = start_run_id; run_id < run_sum; run_id += gridDim.x * blockDim.y) {
     {%- else %}
+
     for (uint32_t run_id = start_run_id;
          run_id < sorted_linear_indices_run.size(0) && run_id < sorted_linear_indices_num_runs[0];
              run_id += gridDim.x * blockDim.y) {
@@ -208,17 +209,19 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         const int32_t SL = segment_end - segment_start;
     {%- endif %}
 
+
         if (SL >= max_segment_length_per_warp) {
             continue;
         }
 
-        {%- if vbe and not weighted and not ssd and not nobag and optimizer == "rowwise_adagrad" and not is_gwd_kernel %}
+        {%- if not is_gwd_kernel and not nobag and vbe and not weighted and not ssd and optimizer == "rowwise_adagrad" and mdesc == "split" %}
         if (run_id + gridDim.x * blockDim.y < run_sum) {
             linear_index_pre = sorted_linear_indices_run[run_id + gridDim.x * blockDim.y];
             segment_start_pre = sorted_linear_indices_cumulative_run_lengths[run_id + gridDim.x * blockDim.y];
             segment_end_pre = sorted_linear_indices_cumulative_run_lengths[run_id + gridDim.x * blockDim.y + 1];
         }
         {%- else %}
+
         // now, each segment corresponds to exactly one table `t` and row in
         // that table (`idx`). Thus, we can hoist out some of the book-keeping.
         {%- if not nobag %}
@@ -230,8 +233,6 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         {%- endif %}
         {%- endif %}
 
-        // now, each segment corresponds to exactly one table `t` and row in
-        // that table (`idx`). Thus, we can hoist out some of the book-keeping.
         int64_t hash_size = hash_size_cumsum[t_0];
         {%- if not nobag or is_index_select %}
         const auto D_start_t0 = D_offsets[t_0];
@@ -245,7 +246,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         const auto grad_stride = permute_output_dim_0_1 ? D_offsets[T] : D;
         {%- endif %}
         {%- endif %}
-        int64_t idx = linear_index - hash_size; // the id value or emb index
+        int64_t idx = linear_index - hash_size;
 
         {{ compute_global_weight_decay(is_gwd_kernel) }}
 
@@ -256,7 +257,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
         const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
 
-        {%- if not nobag and not weighted and vbe and optimizer == "rowwise_adagrad" and not is_gwd_kernel and not ssd %}
+        {%- if not is_gwd_kernel and not nobag and vbe and not weighted and not ssd and optimizer == "rowwise_adagrad" and mdesc == "split" %}
         compute_grad_sum_unweighted_vbe_rowwise_adagrad<
             grad_t,
             cache_t,
@@ -295,6 +296,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
             ? reinterpret_cast<const uint32_t*>(&sorted_infos[0])[segment_start + threadIdx.x]
             : 0;
         {%- else %}
+
         compute_grad_sum_{{ kdesc }}<
           grad_t,
           cache_t,
@@ -331,7 +333,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
             sl_end,
             shfl_sync_mask,
             num_vecs
-          );
+        );
         {%- endif %}
 
         // Copy value to max_vecs to make max_vecs_per_thread known at compile time
@@ -340,7 +342,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
             kUseVecBlocking ? max_vecs_per_thread : kFixedMaxVecsPerThread;
 
         {%- if not dense and optimizer != "none" %}
-        {%- if not nobag and not weighted and vbe and optimizer == "rowwise_adagrad" and not is_gwd_kernel and not ssd %}
+        {%- if not is_gwd_kernel and not nobag and vbe and not weighted and not ssd and optimizer == "rowwise_adagrad" and mdesc == "split" %}
         vbe_unweighted_split_rowwise_adagrad_table_update_kernel<
             emb_t,
             cache_t,
@@ -360,7 +362,9 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               stochastic_rounding,
               stochastic_rounding_philox_args,
               run_id,
-              segment_start,
+              use_uniq_cache_locations
+                  ? (run_id - table_unique_indices_offsets[t_0])
+                  : segment_start,
               D,
               t_0,
               idx,
@@ -369,7 +373,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               max_vecs,
               weights_placement,
               {{ args.split_kernel_arg_names | join(", ") }}
-          ); // if not dense and optimizer != "none"
+        ); // if not dense and optimizer != "none"
 
         t_0 = info_0 >> info_B_num_bits;
         auto weights_placement = static_cast<PlacementType>(weights_placements[t_0]);
@@ -416,7 +420,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               enable_optimizer_offloading,
               {%- endif %}
               {{ args.split_kernel_arg_names | join(", ") }}
-          );
+        ); // if not dense and optimizer != "none"
         {%- endif %}
         {%- else %}
         // Write deduplicated gradient to grad_dev_weights gradient is sparse
@@ -442,8 +446,8 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
               weights_offset,
               idx,
               max_vecs
-        );
-        {%- endif %} 
+        ); // if not dense and optimizer != "none"
+        {%- endif %}
     }
 }
 
