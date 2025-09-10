@@ -280,7 +280,7 @@ struct KernelLauncher {
         // c10::cuda::get_cuda_error_help(cuda_error),
         c10::cuda::get_cuda_check_suffix(),
 #endif
-        "\n",
+        "\n"
         // c10::cuda::c10_retrieve_device_side_assertion_info());
         );
   }
