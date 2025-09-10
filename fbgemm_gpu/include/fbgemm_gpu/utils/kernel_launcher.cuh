@@ -281,7 +281,8 @@ struct KernelLauncher {
         c10::cuda::get_cuda_check_suffix(),
 #endif
         "\n",
-        c10::cuda::c10_retrieve_device_side_assertion_info());
+        // c10::cuda::c10_retrieve_device_side_assertion_info());
+        );
   }
 
   template <typename KernelFunc, typename... Args>
