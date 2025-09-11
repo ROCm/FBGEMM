@@ -222,15 +222,21 @@ void all_to_one(
            .output_idx = i,
            .transfer_cuda_event =
                std::make_unique<at::cuda::CUDAEvent>(cudaEventDisableTiming)});
-      AT_CUDA_CHECK(cudaMemcpy2DAsync(
-          dst.data_ptr(),
-          dst.stride(0) * dst.element_size(),
-          src.data_ptr(),
-          src.stride(0) * src.element_size(),
-          src.size(1) * src.element_size(),
-          src.size(0),
-          cudaMemcpyDeviceToDevice,
-          copy_stream));
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
+    AT_CUDA_CHECK(cudaMemcpy2DAsync(
+        dst.data_ptr(),
+        dstPitchBytes,//.stride(0) * dst.element_size(),
+        src.data_ptr(),
+        srcPitchBytes,//.stride(0) * src.element_size(),
+        src.size(1) * src.element_size(),
+        src.size(0),
+        cudaMemcpyDeviceToDevice,
+        at::cuda::getCurrentCUDAStream(src.get_device())));
       two_hop_transfers.back().transfer_cuda_event->record(copy_stream);
       is_two_hop_transfer.push_back(true);
     } else {
@@ -279,15 +285,21 @@ void all_to_one(
 
       auto& dst = output_tensors[i];
       // on source device, launch memcpy.
+      void* tmp1 = nullptr;
+      void* tmp2 = nullptr;
+      size_t srcPitchBytes;
+      size_t dstPitchBytes;
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
       AT_CUDA_CHECK(cudaMemcpy2DAsync(
           dst.data_ptr(),
-          dst.stride(0) * dst.element_size(),
+          dstPitchBytes,//.stride(0) * dst.element_size(),
           src.data_ptr(),
-          src.stride(0) * src.element_size(),
+          srcPitchBytes,//.stride(0) * src.element_size(),
           src.size(1) * src.element_size(),
           src.size(0),
           cudaMemcpyDeviceToDevice,
-          copy_stream));
+          at::cuda::getCurrentCUDAStream(src.get_device())));
     }
   }
 
@@ -313,11 +325,17 @@ void all_to_one(
     const auto output_index = two_hop_transfer.output_idx;
     auto& dst = output_tensors.at(output_index);
     // on source device, launch memcpy.
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//dst.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
@@ -333,11 +351,17 @@ void all_to_one(
         // single device memcpy, not that src_device == dst_device.
         at::cuda::CUDAStream copy_stream =
             at::cuda::getCurrentCUDAStream(target_device_index);
+        void* tmp1 = nullptr;
+        void* tmp2 = nullptr;
+        size_t srcPitchBytes;
+        size_t dstPitchBytes;
+        AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+        AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
         AT_CUDA_CHECK(cudaMemcpy2DAsync(
             dst.data_ptr(),
-            dst.stride(0) * dst.element_size(),
+            dstPitchBytes,//dst.stride(0) * dst.element_size(),
             src.data_ptr(),
-            src.stride(0) * src.element_size(),
+            srcPitchBytes,//src.stride(0) * src.element_size(),
             src.size(1) * src.element_size(),
             src.size(0),
             cudaMemcpyDeviceToDevice,
@@ -456,11 +480,17 @@ Tensor sum_reduce_to_one(
 
     // on source device, launch memcpy.
     auto& dst = copied_tensors[i];
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//dst.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
@@ -538,11 +568,17 @@ Tensor sum_reduce_to_one(
     dst_ready.block(copy_stream);
 
     auto& dst = copied_tensors[i];
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//dst.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
@@ -628,7 +664,7 @@ Tensor cat_dim_2d(
     int64_t uncat_dim_size,
     at::Device output_device,
     int64_t cat_dim = 1) {
-  if (tensors.size() == 0) {
+  if (tensors.empty()) {
     return at::empty({0}, at::TensorOptions().device(output_device));
   }
   // only support 2d tensor concatenation.
@@ -727,7 +763,7 @@ std::vector<Tensor> all_to_one_device(
 Tensor sum_reduce_to_one_device(
     std::vector<Tensor> input_tensors,
     at::Device target_device) {
-  TORCH_CHECK(input_tensors.size() > 0, "reducing no tensor is undefined");
+  TORCH_CHECK(!input_tensors.empty(), "reducing no tensor is undefined");
 
   init_p2p_access();
 
