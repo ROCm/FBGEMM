@@ -1,4 +1,5 @@
 export HIP_VISIBLE_DEVICES=7
+export FBGEMM_TBE_ROCM_HIP_BACKWARD_KERNEL=1
 # export ROCPROF_ATT_LIBRARY_PATH=/opt/rocm/lib/librocprof-trace-decoder.so
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:"/opt/rocm/lib:/usr/local/lib:"
 export ROCM_PATH="/opt/rocm"
