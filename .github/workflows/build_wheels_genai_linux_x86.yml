@@ -49,6 +49,9 @@ jobs:
       id: filter
       env:
         MAT: ${{ needs.generate-matrix.outputs.matrix }}
+      # Nova Coordinate Filters:
+      # cuda/11.8: No longer supported in FBGEMM
+      # rocm/3.13t: causes segfaults at runtime
       run: |
         set -ex
         pwd
@@ -75,4 +78,6 @@ jobs:
       test-infra-ref: main
       build-matrix: ${{ needs.filter-matrix.outputs.matrix }}
       trigger-event: ${{ github.event_name }}
+      # Based on current measurements for CUDA 12.9 workflows, builds take
+      # 2.5 hours while tests take 0.1 hours
       timeout: 210

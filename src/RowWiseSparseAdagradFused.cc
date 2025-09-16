@@ -10,7 +10,7 @@
 #include "fbgemm/FbgemmEmbedding.h"
 
 #include <cpuinfo.h>
-#include <iostream>
+#include <memory>
 #include <mutex>
 #include "./CodeCache.h" // @manual
 #include "./MaskAvx2.h" // @manual
@@ -66,37 +66,17 @@ class GenRowWiseSparseAdagradFused {
     return rt;
   }
 
-  static mutex rtMutex_; /// Controll access to runtime;
+  inline static mutex rtMutex_; /// Control access to runtime;
 
   // The hash depends on:
   // avx2 mask array, embedding dimension (block size), prefetch distance,
   // use_offsets and use_stochastic_rouding switch
-  static CodeCache<
+  inline static CodeCache<
       tuple<const int*, int, int, bool, bool, int>,
       typename ReturnFunctionSignature<indxType, offsetType, dataType>::
           jit_sparse_adagrad_kernel>
       codeCache_; ///< JIT Code Cache for reuse.
 }; // class GenRowWiseSparseAdagradFused
-
-template <
-    typename indxType,
-    typename offsetType,
-    typename dataType,
-    inst_set_t instSet>
-mutex GenRowWiseSparseAdagradFused<indxType, offsetType, dataType, instSet>::
-    rtMutex_;
-
-template <
-    typename indxType,
-    typename offsetType,
-    typename dataType,
-    inst_set_t instSet>
-CodeCache<
-    tuple<const int*, int, int, bool, bool, int>,
-    typename ReturnFunctionSignature<indxType, offsetType, dataType>::
-        jit_sparse_adagrad_kernel>
-    GenRowWiseSparseAdagradFused<indxType, offsetType, dataType, instSet>::
-        codeCache_;
 
 template <
     typename indxType,
@@ -145,8 +125,8 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
         }
         filename += ".txt";
         FILE* codeLogFile = fopen(filename.c_str(), "w");
-        asmjit::FileLogger* codeLogger = new asmjit::FileLogger(codeLogFile);
-        code.setLogger(codeLogger);
+        auto codeLogger = std::make_unique<asmjit::FileLogger>(codeLogFile);
+        code.setLogger(codeLogger.get());
 #endif
 
         x86::Gp rand_buffer = a->zax();
@@ -158,9 +138,9 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
         x86::Gp h = a->gpz(9);
         x86::Gp indices = a->gpz(10);
         x86::Gp lengths = a->gpz(11);
-        x86::Xmm epsilon(0);
-        x86::Xmm lr(1);
-        x86::Gpd lengths_R = a->gpz(12).r32();
+        Xmm epsilon(0);
+        Xmm lr(1);
+        auto lengths_R = a->gpz(12).r32();
         x86::Gp scratchReg1 = a->gpz(13);
         x86::Gp scratchReg2 = a->gpz(14); // for prefetching
 
@@ -230,13 +210,13 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
         int remainder = block_size % vlen;
 
         vec_reg_t src_vreg; // for holding embedding value temporarily
-        x86::Ymm mask_vreg;
+        Ymm mask_vreg;
 
         // Reserve registers with small ids first because some of them need to
         // be used with an instruction not supported in avx512 for which a big
         // register id won't work.
         int first_available_vec_reg_id = 0;
-        x86::Ymm partial_sum_vreg = x86::Ymm(first_available_vec_reg_id);
+        Ymm partial_sum_vreg = Ymm(first_available_vec_reg_id);
         ++first_available_vec_reg_id;
         vec_reg_t float_step_vreg = vec_reg_t(first_available_vec_reg_id);
         ++first_available_vec_reg_id;
@@ -301,7 +281,7 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
             src_vreg = vec_reg_t(first_available_vec_reg_id);
             ++first_available_vec_reg_id;
 
-            mask_vreg = x86::Ymm(first_available_vec_reg_id);
+            mask_vreg = Ymm(first_available_vec_reg_id);
             ++first_available_vec_reg_id;
             // Use scratchReg1 as temp
             a->mov(scratchReg1, asmjit::imm(mask_avx2));
@@ -362,7 +342,7 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
           int cur_unroll_factor =
               std::min(unroll_factor, num_vec_regs_per_block_avx2 - vec_idx);
           for (int v = 0; v < cur_unroll_factor; ++v) {
-            x86::Ymm out_vreg = x86::Ymm(v + first_available_vec_reg_id);
+            Ymm out_vreg = Ymm(v + first_available_vec_reg_id);
 
             auto g_ptr =
                 x86::dword_ptr(g, (vec_idx + v) * vlen_avx2 * sizeof(float));
@@ -385,8 +365,8 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
         // __m256 partial_sum_3 = _mm256_hadd_ps(partial_sum_2, partial_sum_2);
         // Use YMM/XMMs with smaller ids for AVX2 specific instructions like
         // vhaddps
-        x86::Xmm partial_sum_xmm(partial_sum_vreg.id());
-        x86::Xmm float_step_xmm(float_step_vreg.id());
+        Xmm partial_sum_xmm(partial_sum_vreg.id());
+        Xmm float_step_xmm(float_step_vreg.id());
         // a->vmovups(partial_sum_temp0_ymm, partial_sum_vreg);
         a->vhaddps(partial_sum_vreg, partial_sum_vreg, partial_sum_vreg);
         a->vhaddps(partial_sum_vreg, partial_sum_vreg, partial_sum_vreg);
@@ -764,7 +744,6 @@ typename ReturnFunctionSignature<indxType, offsetType, dataType>::
 
 #if defined(FBGEMM_LOG_CODE)
         fclose(codeLogFile);
-        delete codeLogger;
 #endif
         return fn;
       });

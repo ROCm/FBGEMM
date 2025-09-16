@@ -285,7 +285,8 @@ FBGEMM_API void FloatOrHalfToFusedNBitRowwiseQuantizedSBHalf(
     const InputType* input,
     size_t input_rows,
     int input_columns,
-    std::uint8_t* output);
+    std::uint8_t* output,
+    const InputType* rowwise_min_max = nullptr);
 
 /**
  * Convert fused rowwise quantized inputs to float (fp32 or fp16).
@@ -318,7 +319,8 @@ FBGEMM_API void FloatOrHalfToFused8BitRowwiseQuantizedSBFloat(
     const InputType* input,
     size_t input_rows,
     int input_columns,
-    std::uint8_t* output);
+    std::uint8_t* output,
+    const InputType* rowwise_min_max = nullptr);
 
 /**
  * Convert fused rowwise quantized (8-bit) inputs to float or half outputs.

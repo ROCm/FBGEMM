@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <memory_resource>
 #include <mutex>
 #include <numeric>
@@ -74,6 +75,22 @@ class FixedBlockPool : public std::pmr::memory_resource {
       reinterpret_cast<MetaHeader*>(block)->count++;
     }
   }
+
+  // Feature score operations
+  static void set_feature_score_rate(void* block, float ratio) {
+    uint32_t bits = 0;
+    memcpy(&bits, &ratio, sizeof(float));
+    uint32_t no_sign = bits & 0x7FFFFFFF; // Clear the sign bit, keep 31 bits
+    reinterpret_cast<MetaHeader*>(block)->count = no_sign;
+  }
+  static float get_feature_score_rate(const void* block) {
+    uint32_t no_sign = reinterpret_cast<const MetaHeader*>(block)->count;
+    uint32_t bits = no_sign & 0x7FFFFFFF; // Ensure sign bit is zero (positive)
+    float ratio = NAN;
+    memcpy(&ratio, &bits, sizeof(float));
+    return ratio;
+  }
+
   // timestamp operations
   static uint32_t get_timestamp(const void* block) {
     return reinterpret_cast<const MetaHeader*>(block)->timestamp;
@@ -86,6 +103,16 @@ class FixedBlockPool : public std::pmr::memory_resource {
   }
   static uint32_t current_timestamp() {
     return std::time(nullptr);
+  }
+
+  static uint64_t get_metaheader_raw(const void* block) {
+    const char* ptr = reinterpret_cast<const char*>(block);
+    // skip key
+    ptr += sizeof(int64_t);
+    uint64_t result = 0;
+    // Copy 8 bytes of timestamp and count+used to result
+    memcpy(&result, ptr, sizeof(uint64_t));
+    return result;
   }
 
   // Calculate storage size
@@ -259,6 +286,8 @@ class FixedBlockPool : public std::pmr::memory_resource {
     void* result = free_list_;
     free_list_ = *static_cast<void**>(free_list_);
     FixedBlockPool::set_used(result, true);
+    FixedBlockPool::set_count(result, 0);
+    FixedBlockPool::update_timestamp(result);
     return result;
   }
 

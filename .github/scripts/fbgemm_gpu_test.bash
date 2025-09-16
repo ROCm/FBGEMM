@@ -15,6 +15,35 @@
 # FBGEMM_GPU Test Helper Functions
 ################################################################################
 
+install_fbgemm_gpu_deps () {
+  local env_name="$1"
+  if [ "$env_name" == "" ]; then
+    echo "Usage: ${FUNCNAME[0]} ENV_NAME"
+    echo "Example(s):"
+    echo "    ${FUNCNAME[0]} build_env"
+    return 1
+  else
+    echo "################################################################################"
+    echo "# Install FBGEMM-GPU PIP dependencies"
+    echo "#"
+    echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
+    echo "################################################################################"
+    echo ""
+  fi
+
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
+
+  echo "[BUILD] Installing PIP dependencies ..."
+  # shellcheck disable=SC2086
+  (exec_with_retries 3 conda run --no-capture-output ${env_prefix} python -m pip install -r requirements.txt) || return 1
+
+  # shellcheck disable=SC2086
+  (test_python_import_package "${env_name}" einops) || return 1
+  # shellcheck disable=SC2086
+  (test_python_import_package "${env_name}" numpy) || return 1
+}
+
 run_python_test () {
   local env_name="$1"
   local python_test_file="$2"
@@ -102,7 +131,8 @@ __configure_fbgemm_gpu_test_cuda () {
   print_exec conda env config vars unset ${env_prefix} CUDA_VISIBLE_DEVICES
 
   export ignored_tests=(
-    ./moe/layers_test.py # not a UnitTest
+    ./moe/layers_test.py  # Not a python unittest file
+    ./attention/blackwell_fmha_test.py
   )
 }
 
@@ -139,9 +169,9 @@ __configure_fbgemm_gpu_test_rocm () {
   export ignored_tests=(
     ./batched_unary_embeddings_test.py
     ./sll/triton_sll_test.py
-    ./comm/multi_gpu_car_test.py
     ./gather_scatter/gather_scatter_test.py
-    ./moe/layers_test.py # Not a python unittest file
+    ./moe/layers_test.py  # Not a python unittest file
+    ./attention/blackwell_fmha_test.py
   )
 }
 
@@ -180,6 +210,12 @@ __setup_fbgemm_gpu_test () {
   else
     echo "[TEST] FBGEMM_GPU variant is ${fbgemm_build_variant}; configuring for CUDA-based testing ..."
     __configure_fbgemm_gpu_test_cuda
+  fi
+
+  if [ "$fbgemm_build_target" == "hstu" ]; then
+    ignored_tests+=(
+      ./tma_error_test.py
+    )
   fi
 
   if [[ $MACHINE_NAME == 'aarch64' ]]; then

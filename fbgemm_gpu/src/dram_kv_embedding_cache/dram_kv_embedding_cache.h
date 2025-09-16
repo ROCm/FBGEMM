@@ -109,7 +109,8 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       bool enable_async_update = false,
       std::optional<at::Tensor> table_dims = std::nullopt,
       std::optional<at::Tensor> hash_size_cumsum = std::nullopt,
-      bool is_training = true)
+      bool is_training = true,
+      bool disable_random_init = false)
       : kv_db::EmbeddingKVDB(
             num_shards,
             max_D,
@@ -138,7 +139,8 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
         max_D,
         uniform_init_lower,
         uniform_init_upper,
-        row_storage_bitwidth);
+        row_storage_bitwidth,
+        disable_random_init);
     if (table_dims.has_value()) {
       TORCH_CHECK_TENSOR_PROPERTIES(table_dims, at::ScalarType::Long);
       TORCH_NUM_CHECK_AND_ASSIGN_TENSOR_DATA(
@@ -167,13 +169,14 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       int64_t max_D,
       double uniform_init_lower,
       double uniform_init_upper,
-      int64_t row_storage_bitwidth) {
+      int64_t row_storage_bitwidth,
+      bool disable_random_init) {
     for (auto i = 0; i < num_shards; ++i) {
       auto* gen = at::check_generator<at::CPUGeneratorImpl>(
           at::detail::getDefaultCPUGenerator());
       {
         std::lock_guard<std::mutex> lock(gen->mutex_);
-        initializers_.push_back(std::make_unique<ssd ::Initializer>(
+        initializers_.push_back(std::make_unique<ssd::Initializer>(
             gen->random64(),
             max_D,
             uniform_init_lower,
@@ -181,6 +184,7 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
             row_storage_bitwidth));
       }
     }
+    disable_random_init_ = disable_random_init;
   }
 
   /// get all ids in the kvstore
@@ -230,6 +234,60 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                torch::kInt64 // data type
                )
         .view({-1, 1});
+  }
+
+  /// Get eviction metadata given indices
+  at::Tensor get_kv_zch_eviction_metadata_impl(
+      const at::Tensor& indices,
+      const at::Tensor& count) override {
+    std::vector<folly::Future<folly::Unit>> futures;
+    auto numel = indices.size(0);
+    auto metadata_tensor = at::zeros({numel}, at::kLong);
+
+    auto shardid_to_indexes = shard_input(indices, count);
+    for (auto iter = shardid_to_indexes.begin();
+         iter != shardid_to_indexes.end();
+         iter++) {
+      const auto shard_id = iter->first;
+      const auto indexes = iter->second;
+      auto f =
+          folly::via(executor_.get())
+              .thenValue([this, shard_id, indexes, &indices, &metadata_tensor](
+                             folly::Unit) {
+                FBGEMM_DISPATCH_INTEGRAL_TYPES(
+                    indices.scalar_type(),
+                    "dram_kv_zch_eviction_metadata",
+                    [this, shard_id, indexes, &indices, &metadata_tensor] {
+                      using index_t = scalar_t;
+                      CHECK(indices.is_contiguous());
+                      auto indices_data_ptr = indices.data_ptr<index_t>();
+                      auto* metadata = metadata_tensor.data_ptr<int64_t>();
+                      {
+                        auto rlmap = kv_store_.by(shard_id).rlock();
+                        for (auto index_iter = indexes.begin();
+                             index_iter != indexes.end();
+                             index_iter++) {
+                          const auto& id_index = *index_iter;
+                          auto id = int64_t(indices_data_ptr[id_index]);
+
+                          // use mempool
+                          weight_type* block = nullptr;
+
+                          auto it = rlmap->find(id);
+                          // All ids should be found in backend to get metadata
+                          CHECK(it != rlmap->end());
+                          block = it->second;
+
+                          metadata[id_index] =
+                              FixedBlockPool::get_metaheader_raw(block);
+                        }
+                      }
+                    });
+              });
+      futures.push_back(std::move(f));
+    }
+    folly::collectAll(futures).wait();
+    return metadata_tensor;
   }
 
   /// insert embeddings into kvstore.
@@ -330,6 +388,19 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                             local_write_allocate_total_duration +=
                                 facebook::WallClockUtil::NowInUsecFast() -
                                 before_alloc_ts;
+                            if (feature_evict_config_.has_value() &&
+                                feature_evict_config_.value()->trigger_mode_ !=
+                                    EvictTriggerMode::DISABLED &&
+                                feature_evict_) {
+                              auto* feature_score_evict = dynamic_cast<
+                                  FeatureScoreBasedEvict<weight_type>*>(
+                                  feature_evict_.get());
+                              if (feature_score_evict) {
+                                feature_score_evict
+                                    ->update_feature_score_statistics(
+                                        block, 0, shard_id, true);
+                              }
+                            }
                           }
                           if (feature_evict_config_.has_value() &&
                               feature_evict_config_.value()->trigger_mode_ !=
@@ -577,6 +648,116 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
               }
               return std::vector<folly::Unit>(tuples.size());
             });
+  }
+
+  /// Update feature scores metadata into kvstore.
+  folly::SemiFuture<std::vector<folly::Unit>>
+  set_kv_zch_eviction_metadata_async(
+      at::Tensor indices,
+      at::Tensor count,
+      at::Tensor engege_rates) override {
+    if (!feature_evict_ || !feature_evict_config_.has_value() ||
+        feature_evict_config_.value()->trigger_mode_ ==
+            EvictTriggerMode::DISABLED) {
+      // featre eviction is disabled
+      return folly::makeSemiFuture(std::vector<folly::Unit>());
+    }
+
+    CHECK_EQ(engege_rates.scalar_type(), at::ScalarType::Float);
+    auto* feature_score_evict =
+        dynamic_cast<FeatureScoreBasedEvict<weight_type>*>(
+            feature_evict_.get());
+
+    if (feature_score_evict == nullptr) {
+      // Not a feature score based eviction
+      return folly::makeSemiFuture(std::vector<folly::Unit>());
+    }
+    pause_ongoing_eviction();
+    std::vector<folly::Future<int64_t>> futures;
+    auto shardid_to_indexes = shard_input(indices, count);
+    for (auto iter = shardid_to_indexes.begin();
+         iter != shardid_to_indexes.end();
+         iter++) {
+      const auto shard_id = iter->first;
+      const auto indexes = iter->second;
+      auto f =
+          folly::via(executor_.get())
+              .thenValue([this,
+                          shard_id,
+                          indexes,
+                          indices,
+                          engege_rates,
+                          feature_score_evict](folly::Unit) {
+                int64_t updated_id_count = 0;
+                FBGEMM_DISPATCH_INTEGRAL_TYPES(
+                    indices.scalar_type(),
+                    "dram_set_kv_feature_score_metadata",
+                    [this,
+                     shard_id,
+                     indexes,
+                     indices,
+                     engege_rates,
+                     feature_score_evict,
+                     &updated_id_count] {
+                      using index_t = scalar_t;
+                      CHECK(indices.is_contiguous());
+                      CHECK(engege_rates.is_contiguous());
+                      CHECK_EQ(indices.size(0), engege_rates.size(0));
+                      auto indices_data_ptr = indices.data_ptr<index_t>();
+                      auto engage_rate_ptr = engege_rates.data_ptr<float>();
+                      int64_t stride = 2;
+                      {
+                        auto wlmap = kv_store_.by(shard_id).wlock();
+                        auto* pool = kv_store_.pool_by(shard_id);
+
+                        for (auto index_iter = indexes.begin();
+                             index_iter != indexes.end();
+                             index_iter++) {
+                          const auto& id_index = *index_iter;
+                          auto id = int64_t(indices_data_ptr[id_index]);
+                          float engege_rate =
+                              float(engage_rate_ptr[id_index * stride + 0]);
+                          // use mempool
+                          weight_type* block = nullptr;
+                          auto it = wlmap->find(id);
+                          if (it != wlmap->end()) {
+                            block = it->second;
+                            feature_score_evict
+                                ->update_feature_score_statistics(
+                                    block, engege_rate, shard_id, false);
+                          } else {
+                            // Key doesn't exist, allocate new block and
+                            // insert.
+                            block = pool->template allocate_t<weight_type>();
+                            FixedBlockPool::set_key(block, id);
+                            FixedBlockPool::set_feature_score_rate(
+                                block, engege_rate);
+                            wlmap->insert({id, block});
+                            feature_score_evict
+                                ->update_feature_score_statistics(
+                                    block, 0, shard_id, true);
+                          }
+                          updated_id_count++;
+                        }
+                      }
+                    });
+                return updated_id_count;
+              });
+      futures.push_back(std::move(f));
+    }
+    return folly::collect(std::move(futures))
+        .via(executor_.get())
+        .thenValue([this](const std::vector<int64_t>& results) {
+          resume_ongoing_eviction();
+          int total_updated_ids = 0;
+          for (const auto& result : results) {
+            total_updated_ids += result;
+          }
+          LOG(INFO)
+              << "[DRAM KV][Feature Score Eviction]Total updated IDs across all shards: "
+              << total_updated_ids;
+          return std::vector<folly::Unit>(results.size());
+        });
   }
 
   /// Get embeddings from kvstore.
@@ -940,6 +1121,10 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
     return kv_store_.getActualUsedChunkInBytes();
   }
 
+  size_t get_num_rows() const {
+    return kv_store_.getNumRows();
+  }
+
   void resume_ongoing_eviction(bool force_resume = false) override {
     if (!is_training_ && !force_resume) {
       return;
@@ -996,6 +1181,10 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
     return feature_evict_->get_feature_evict_metric();
   }
 
+  void set_backend_return_whole_row(bool backend_return_whole_row) override {
+    backend_return_whole_row_ = backend_return_whole_row;
+  }
+
  private:
   int64_t get_dim_from_index(int64_t weight_idx) const {
     if (sub_table_dims_.empty()) {
@@ -1038,8 +1227,16 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       int64_t copied_width) {
     CHECK_GE(row_width, copied_width);
     CHECK_GE(max_D_, row_width);
-    int64_t storage_row_bytes = elem_size_ * max_D_;
     int64_t row_bytes = row_width * elem_size_;
+
+    if (disable_random_init_) {
+      // Skip data copy and leave values empty (zero-initialized)
+      std::memset(
+          &(weights_data_ptr[weights_row_index * row_bytes]), 0, row_bytes);
+      return;
+    }
+
+    int64_t storage_row_bytes = elem_size_ * max_D_;
     auto copied_bytes = elem_size_ * copied_width;
     int64_t start_offset_bytes = elem_size_ * width_offset;
     int64_t row_index = 0;
@@ -1125,10 +1322,7 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
   std::vector<double> get_dram_kv_perf(
       const int64_t step,
       const int64_t interval) {
-    std::vector<double> ret(22, 0); // num metrics
-
-    allocated_memory_ = get_map_used_memsize_in_bytes();
-    actual_used_chunk_memory_ = get_map_actual_used_chunk_in_bytes();
+    std::vector<double> ret(23, 0); // num metrics
     if (step > 0 && step % interval == 0) {
       int reset_val = 0;
 
@@ -1175,10 +1369,6 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       auto dram_bwd_l1_cnflct_miss_write_missing_load_ =
           bwd_l1_cnflct_miss_write_missing_load_avg_.exchange(reset_val);
 
-      auto dram_allocated_memory = allocated_memory_.exchange(reset_val);
-      auto dram_actual_used_chunk_memory =
-          actual_used_chunk_memory_.exchange(reset_val);
-
       ret[0] = dram_read_total_duration / interval;
       ret[1] = dram_read_sharding_total_duration / interval;
       ret[2] = dram_read_cache_hit_copy_duration / interval;
@@ -1202,8 +1392,10 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       ret[18] = dram_bwd_l1_cnflct_miss_write_acquire_lock_duration_ / interval;
       ret[19] = dram_bwd_l1_cnflct_miss_write_missing_load_ / interval;
 
-      ret[20] = dram_allocated_memory / interval;
-      ret[21] = dram_actual_used_chunk_memory / interval;
+      ret[20] = get_map_used_memsize_in_bytes();
+      ret[21] = get_map_actual_used_chunk_in_bytes();
+
+      ret[22] = get_num_rows();
     }
     return ret;
   }
@@ -1333,62 +1525,80 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       const auto indexes = iter->second;
       auto f =
           folly::via(executor_.get())
-              .thenValue(
-                  [this, shard_id, indexes, &indices, &weights_with_metaheader](
-                      folly::Unit) {
-                    FBGEMM_DISPATCH_INTEGRAL_TYPES(
-                        indices.scalar_type(),
-                        "dram_kv_set_with_metaheader",
-                        [this,
-                         shard_id,
-                         indexes,
-                         &indices,
-                         &weights_with_metaheader] {
-                          using index_t = scalar_t;
-                          CHECK(indices.is_contiguous());
-                          CHECK(weights_with_metaheader.is_contiguous());
-                          CHECK_EQ(
-                              indices.size(0), weights_with_metaheader.size(0));
-                          {
-                            auto wlmap = kv_store_.by(shard_id).wlock();
-                            auto* pool = kv_store_.pool_by(shard_id);
-                            int64_t stride = weights_with_metaheader.size(1);
-                            auto indices_data_ptr = indices.data_ptr<index_t>();
-                            auto weights_data_ptr =
-                                weights_with_metaheader.data_ptr<weight_type>();
-                            for (auto index_iter = indexes.begin();
-                                 index_iter != indexes.end();
-                                 index_iter++) {
-                              const auto& id_index = *index_iter;
-                              auto id = int64_t(indices_data_ptr[id_index]);
-                              // Defensive programming
-                              // it shouldn't occur under normal circumstances
-                              auto used = FixedBlockPool::get_used(
-                                  weights_data_ptr + id_index * stride);
-                              if (!used) {
-                                continue;
+              .thenValue([this,
+                          shard_id,
+                          indexes,
+                          &indices,
+                          &weights_with_metaheader](folly::Unit) {
+                FBGEMM_DISPATCH_INTEGRAL_TYPES(
+                    indices.scalar_type(),
+                    "dram_kv_set_with_metaheader",
+                    [this,
+                     shard_id,
+                     indexes,
+                     &indices,
+                     &weights_with_metaheader] {
+                      using index_t = scalar_t;
+                      CHECK(indices.is_contiguous());
+                      CHECK(weights_with_metaheader.is_contiguous());
+                      CHECK_EQ(
+                          indices.size(0), weights_with_metaheader.size(0));
+                      {
+                        auto wlmap = kv_store_.by(shard_id).wlock();
+                        auto* pool = kv_store_.pool_by(shard_id);
+                        int64_t stride = weights_with_metaheader.size(1);
+                        auto indices_data_ptr = indices.data_ptr<index_t>();
+                        auto weights_data_ptr =
+                            weights_with_metaheader.data_ptr<weight_type>();
+                        for (auto index_iter = indexes.begin();
+                             index_iter != indexes.end();
+                             index_iter++) {
+                          const auto& id_index = *index_iter;
+                          auto id = int64_t(indices_data_ptr[id_index]);
+                          // Defensive programming
+                          // used is false shouldn't occur under normal
+                          // circumstances
+                          FixedBlockPool::set_used(
+                              weights_data_ptr + id_index * stride, true);
+
+                          // use mempool
+                          weight_type* block = nullptr;
+                          // First check if the key already exists
+                          auto it = wlmap->find(id);
+                          bool new_block = false;
+                          if (it != wlmap->end()) {
+                            block = it->second;
+                          } else {
+                            // Key doesn't exist, allocate new block and
+                            // insert.
+                            block = pool->template allocate_t<weight_type>();
+                            wlmap->insert({id, block});
+                            new_block = true;
+                          }
+                          std::copy(
+                              weights_data_ptr + id_index * stride,
+                              weights_data_ptr + (id_index + 1) * stride,
+                              block);
+
+                          if (new_block) {
+                            if (feature_evict_config_.has_value() &&
+                                feature_evict_config_.value()->trigger_mode_ !=
+                                    EvictTriggerMode::DISABLED &&
+                                feature_evict_) {
+                              auto* feature_score_evict = dynamic_cast<
+                                  FeatureScoreBasedEvict<weight_type>*>(
+                                  feature_evict_.get());
+                              if (feature_score_evict) {
+                                feature_score_evict
+                                    ->update_feature_score_statistics(
+                                        block, 0, shard_id, true);
                               }
-                              // use mempool
-                              weight_type* block = nullptr;
-                              // First check if the key already exists
-                              auto it = wlmap->find(id);
-                              if (it != wlmap->end()) {
-                                block = it->second;
-                              } else {
-                                // Key doesn't exist, allocate new block and
-                                // insert.
-                                block =
-                                    pool->template allocate_t<weight_type>();
-                                wlmap->insert({id, block});
-                              }
-                              std::copy(
-                                  weights_data_ptr + id_index * stride,
-                                  weights_data_ptr + (id_index + 1) * stride,
-                                  block);
                             }
                           }
-                        });
-                  });
+                        }
+                      }
+                    });
+              });
       futures.push_back(std::move(f));
     }
     return folly::collect(futures);
@@ -1438,11 +1648,10 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
   std::atomic<int64_t> fwd_l1_eviction_write_acquire_lock_avg_duration_{0};
   std::atomic<int64_t> fwd_l1_eviction_write_missing_load_avg_{0};
 
-  std::atomic<int64_t> allocated_memory_{0};
-  std::atomic<int64_t> actual_used_chunk_memory_{0};
-
   std::atomic<int64_t> inplace_update_hit_cnt_{0};
   std::atomic<int64_t> inplace_update_miss_cnt_{0};
+
+  bool disable_random_init_;
 }; // class DramKVEmbeddingCache
 
 } // namespace kv_mem

@@ -8,19 +8,27 @@
 
 #include "fbgemm_gpu/quantize/utils.h" // @manual
 
+#include <ATen/ATen.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime.h>
+
 namespace fbgemm_gpu {
 
-int nextPowerOf2(int n) {
-  if (n == 0) {
-    return 1;
-  }
-  n--;
-  n |= n >> 1;
-  n |= n >> 2;
-  n |= n >> 4;
-  n |= n >> 8;
-  n |= n >> 16;
-  return n + 1;
-}
+int getDeviceArch() {
+  static int arch = []() {
+    // Avoid expensive cudaGetDeviceProperties call.
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
 
+    if (prop.major >= 10) {
+      int runtimeVersion = 0;
+      C10_CUDA_CHECK(cudaRuntimeGetVersion(&runtimeVersion));
+      TORCH_CHECK(
+          runtimeVersion >= 12080, "SM100a+ kernels require cuda >= 12.8");
+    }
+
+    return prop.major;
+  }();
+  return arch;
+}
 } // namespace fbgemm_gpu

@@ -36,6 +36,23 @@ def pad4(value: int) -> int:
     return (int(value) + 3) & ~3
 
 
+def pad16(value: int) -> int:
+    """
+    Compute the smallest multiple of 16 that is greater than or equal to the given value.
+
+    Parameters:
+        value (int): The integer to align (must be non-negative).
+
+    Returns:
+        int: The aligned value.
+
+    Raises:
+        ValueError: If the input is negative.
+        TypeError: If the input is not an integer.
+    """
+    return (int(value) + 15) & ~15
+
+
 @enum.unique
 class EmbOptimType(enum.Enum):
     SGD = "sgd"  # uses non-deterministic updates (atomicAdd(..)) with duplicate ids
@@ -79,7 +96,7 @@ class EmbOptimType(enum.Enum):
         """
         if self == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
             return ["momentum1"]
-        elif self == EmbOptimType.PARTIAL_ROWWISE_ADAM:
+        elif self in [EmbOptimType.PARTIAL_ROWWISE_ADAM, EmbOptimType.ADAM]:
             return ["momentum1", "momentum2"]
         else:
             return []
@@ -93,24 +110,34 @@ class EmbOptimType(enum.Enum):
             return {"momentum1": 1}
         elif self == EmbOptimType.PARTIAL_ROWWISE_ADAM:
             return {"momentum1": D, "momentum2": 1}
+        elif self == EmbOptimType.ADAM:
+            return {"momentum1": D, "momentum2": D}
         else:
             return {}
 
     def state_size_nbytes(
-        self, D: int, optimizer_state_dtypes: Dict[str, "SparseType"] = {}  # noqa: B006
+        self,
+        D: int,
+        optimizer_state_dtypes: Dict[str, "SparseType"] = {},  # noqa: B006
     ) -> int:
         """
         Returns the size of the data (in bytes) required to hold the optimizer
-        state (per table row)
+        state (per table row).  This size includes byte-padding.
         """
-        return sum(
-            [
-                # For each state, multiply the number of elements by the byte
-                # size of each element
-                (self._extract_dtype(optimizer_state_dtypes, name).itemsize * elem)
-                for name, elem in self.state_size_table(D).items()
-            ]
-        )
+        momentum1_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum1")
+        momentum2_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum2")
+
+        if self == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
+            return momentum1_dtype.itemsize
+
+        elif self == EmbOptimType.PARTIAL_ROWWISE_ADAM:
+            return pad4(1 * momentum2_dtype.itemsize) + D * momentum1_dtype.itemsize
+
+        elif self == EmbOptimType.ADAM:
+            return (D * momentum1_dtype.itemsize) + (D * momentum2_dtype.itemsize)
+
+        else:
+            return 0
 
     def byte_offsets_along_row(
         self,
@@ -122,24 +149,34 @@ class EmbOptimType(enum.Enum):
         Returns the start and end byte offsets of each optimizer state along a
         cache row with optimizer state offloading enabled.
         """
+        # Extract the optimizer state dtypes
+        momentum1_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum1")
+        momentum2_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum2")
 
         # This is the pointer to where the optimizer state begins in the memory
         p0 = pad4(D) * weights_precision.as_dtype().itemsize
 
         if self == EmbOptimType.EXACT_ROWWISE_ADAGRAD:
-            momentum1_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum1")
-            # Store one value for momentum per row
             return {"momentum1": (p0, p0 + momentum1_dtype.itemsize)}
 
         elif self == EmbOptimType.PARTIAL_ROWWISE_ADAM:
-            momentum1_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum1")
-            momentum2_dtype = self._extract_dtype(optimizer_state_dtypes, "momentum2")
+            # momentum1 lies after momentum2
+            p1 = p0 + pad4(1 * momentum2_dtype.itemsize)
             return {
                 "momentum2": (p0, p0 + momentum2_dtype.itemsize),
                 "momentum1": (
-                    p0 + momentum2_dtype.itemsize,
-                    p0 + momentum2_dtype.itemsize + D * momentum1_dtype.itemsize,
+                    p1,
+                    p1 + D * momentum1_dtype.itemsize,
                 ),
+            }
+
+        elif self == EmbOptimType.ADAM:
+            # momentum2 lies after momentum1
+            p1 = p0 + (D * momentum1_dtype.itemsize)
+
+            return {
+                "momentum1": (p0, p1),
+                "momentum2": (p1, p1 + D * momentum2_dtype.itemsize),
             }
 
         else:
@@ -207,6 +244,12 @@ class EmbOptimType(enum.Enum):
             params = {"momentum1": row_count_cumsum}
         elif self == EmbOptimType.PARTIAL_ROWWISE_ADAM:
             params = {"momentum1": table_size_cumsum, "momentum2": row_count_cumsum}
+        elif self == EmbOptimType.ADAM:
+            params = {
+                "momentum1": table_size_cumsum,
+                "momentum2": table_size_cumsum,
+                "row_counter": row_count_cumsum,
+            }
         else:
             params = {}
 
@@ -266,6 +309,7 @@ def sparse_type_to_int(sparse_type: "SparseType") -> int:
         SparseType.BF16.value: 5,
         SparseType.FP8.value: 6,
         SparseType.MX4.value: 7,
+        SparseType.NFP8.value: 8,
     }[sparse_type.value]
 
 
@@ -274,6 +318,11 @@ class SparseType(enum.Enum):
     FP32 = "fp32"
     FP16 = "fp16"
     FP8 = "fp8"
+    # NFP8 refers to "native" FP8 in that it uses the GPU implementations
+    # of E4M3 whereas the other FP8 sparsetype uses a custom format. Use of
+    # NFP8 allows us to use hardware casting intrinsics which can be much faster.
+    # Eventually, we should merge these two types.
+    NFP8 = "nfp8"
     INT8 = "int8"
     INT4 = "int4"
     INT2 = "int2"
@@ -299,9 +348,11 @@ class SparseType(enum.Enum):
             return SparseType("bf16")
         elif ty == 6:
             return SparseType("fp8")
-        elif ty == 7:
+        elif ty == 8:
             return SparseType("mx4")
-        else:
+        elif ty == 9:
+            return SparseType("nfp8")
+        else:  # Invalid is 7 or non enumerated.
             raise ValueError(f"Unsupported sparse type: {ty}")
 
     def as_int(self) -> int:
@@ -323,6 +374,8 @@ class SparseType(enum.Enum):
             return SparseType("bf16")
         elif dtype == torch.uint8:
             return SparseType("mx4")
+        elif dtype == torch.float8_e4m3fnuz or dtype == torch.float8_e4m3fn:
+            return SparseType("nfp8")
         else:
             raise ValueError(f"Unsupported sparse dtype: {dtype}")
 
@@ -336,6 +389,11 @@ class SparseType(enum.Enum):
             SparseType.INT2.value: torch.quint2x4,
             SparseType.BF16.value: torch.bfloat16,
             SparseType.MX4.value: torch.uint8,
+            SparseType.NFP8.value: (
+                torch.float8_e4m3fnuz
+                if torch.version.hip is not None
+                else torch.float8_e4m3fn
+            ),
         }[self.value]
 
     def bit_rate(self) -> int:
@@ -348,6 +406,7 @@ class SparseType(enum.Enum):
             SparseType.INT2.value: 2,
             SparseType.BF16.value: 16,
             SparseType.MX4.value: 4,
+            SparseType.NFP8.value: 8,
         }[self.value]
 
     def align_size(self) -> int:
@@ -360,6 +419,7 @@ class SparseType(enum.Enum):
             SparseType.INT2.value: 16,
             SparseType.BF16.value: 2,
             SparseType.MX4.value: 8,
+            SparseType.NFP8.value: 4,
         }[self.value]
 
     def is_float(self) -> bool:
@@ -368,6 +428,7 @@ class SparseType(enum.Enum):
             or self.value == SparseType.FP16.value
             or self.value == SparseType.FP8.value
             or self.value == SparseType.BF16.value
+            or self.value == SparseType.NFP8.value
         ):
             return True
         else:
@@ -386,5 +447,6 @@ ELEMENT_SIZE: Dict[SparseType, int] = {
     SparseType.FP8: 1,
     SparseType.INT8: 1,
     SparseType.BF16: 2,
+    SparseType.NFP8: 1,
     # SparseType.INT4: 0.5,
 }

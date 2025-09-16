@@ -19,9 +19,9 @@ namespace pta = fbgemm_gpu::utils;
 namespace pta = at;
 #endif
 
-//////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 // Type Utilities
-//////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
 template <typename T>
 inline at::ScalarType scalar_type_for() {
@@ -108,7 +108,7 @@ struct TensorAccessorBuilder {
   // Constructor that takes in reference to tensor
   //////////////////////////////////////////////////////////////////////////////
 
-  constexpr inline TensorAccessorBuilder(
+  constexpr TensorAccessorBuilder(
       const std::string_view& name_,
       const at::Tensor& tensor_) noexcept
       : name(name_), tensor(tensor_) {}
@@ -117,7 +117,7 @@ struct TensorAccessorBuilder {
   // Validate Tensor Properties
   //////////////////////////////////////////////////////////////////////////////
 
-  inline void validate_tensor(const std::string_view& context) const {
+  void validate_tensor(const std::string_view& context) const {
     // Check numel is not out of bounds
     if constexpr (std::is_same_v<index_t, int32_t>) {
       TORCH_CHECK(
@@ -244,7 +244,7 @@ struct TensorAccessorBuilder {
 
 } // namespace fbgemm_gpu::utils
 
-//////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 // (Packed) Tensor Accessor Builder-Assembler Macros
 //
 // These macros are used to assemble the TensorAccessorBuilder.  The primary
@@ -264,11 +264,13 @@ struct TensorAccessorBuilder {
 //  // at::RestrictPtrTraits>
 //  const auto x = PTA_B(tensor, T, N, INB);
 //  ```
-//////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
 
-#define TA_B(TENSOR, T, N, INDEX_NBITS)                                      \
-  fbgemm_gpu::utils::                                                        \
-      TensorAccessorBuilder<T, N, INDEX_NBITS, false, at::DefaultPtrTraits>( \
+// Default to pta::DefaultPtrTraits here since the rest of the codebase declares
+// pta::TensorAccessor without specifying the PtrTraits template argument.
+#define TA_B(TENSOR, T, N, INDEX_NBITS)                                       \
+  fbgemm_gpu::utils::                                                         \
+      TensorAccessorBuilder<T, N, INDEX_NBITS, false, pta::DefaultPtrTraits>( \
           #TENSOR, TENSOR)
 
 #define PTA_B(TENSOR, T, N, INDEX_NBITS)                                     \

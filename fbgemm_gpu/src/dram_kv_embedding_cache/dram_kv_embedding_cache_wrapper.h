@@ -38,7 +38,8 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
       const std::optional<at::Tensor>& table_dims = std::nullopt,
       const std::optional<at::Tensor>& hash_size_cumsum = std::nullopt,
       bool backend_return_whole_row = false,
-      bool enable_async_update = false) {
+      bool enable_async_update = false,
+      bool disable_random_init = false) {
     if (row_storage_bitwidth == 16) {
       impl_ = std::make_shared<kv_mem::DramKVEmbeddingCache<at::Half>>(
           max_D,
@@ -51,7 +52,9 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
           backend_return_whole_row,
           enable_async_update,
           table_dims,
-          hash_size_cumsum);
+          hash_size_cumsum,
+          true, // is_training
+          disable_random_init);
     } else if (row_storage_bitwidth == 32) {
       impl_ = std::make_shared<kv_mem::DramKVEmbeddingCache<float>>(
           max_D,
@@ -64,7 +67,9 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
           backend_return_whole_row,
           enable_async_update,
           table_dims,
-          hash_size_cumsum);
+          hash_size_cumsum,
+          true, // is_training
+          disable_random_init);
     } else {
       throw std::runtime_error("Failed to create recording device");
     }
@@ -76,7 +81,7 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
       at::Tensor count,
       int64_t timestep,
       bool is_bwd) {
-    return impl_->set_cuda(indices, weights, count, timestep);
+    return impl_->set_cuda(indices, weights, count, timestep, is_bwd);
   }
 
   void get_cuda(at::Tensor indices, at::Tensor weights, at::Tensor count) {
@@ -108,6 +113,15 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
     return impl_->get_keys_in_range_impl(start_id, end_id, id_offset);
   }
 
+  at::Tensor get_kv_zch_eviction_metadata_by_snapshot(
+      const at::Tensor& indices,
+      const at::Tensor& count,
+      const std::optional<
+          c10::intrusive_ptr<ssd::EmbeddingSnapshotHandleWrapper>>&
+      /*snapshot_handle*/) {
+    return impl_->get_kv_zch_eviction_metadata_impl(indices, count);
+  }
+
   void get(
       at::Tensor indices,
       at::Tensor weights,
@@ -137,6 +151,7 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
   void get_feature_evict_metric(
       at::Tensor evicted_counts,
       at::Tensor processed_counts,
+      at::Tensor eviction_threshold_with_dry_run,
       at::Tensor full_duration_ms,
       at::Tensor exec_duration_ms) {
     auto metrics = impl_->get_feature_evict_metric();
@@ -145,6 +160,10 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
           metrics.value().evicted_counts); // evicted_counts (Long)
       processed_counts.copy_(
           metrics.value().processed_counts); // processed_counts (Long)
+      eviction_threshold_with_dry_run.copy_(
+          metrics.value()
+              .eviction_threshold_with_dry_run); // eviction threshold with dry
+                                                 // run (float)
       full_duration_ms.copy_(
           metrics.value().full_duration_ms); // full duration (Long)
       exec_duration_ms.copy_(
@@ -154,6 +173,17 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
 
   void wait_until_eviction_done() {
     impl_->wait_until_eviction_done();
+  }
+
+  void set_backend_return_whole_row(bool backend_return_whole_row) {
+    impl_->set_backend_return_whole_row(backend_return_whole_row);
+  }
+
+  void set_feature_score_metadata_cuda(
+      at::Tensor indices,
+      at::Tensor count,
+      at::Tensor engage_show_count) {
+    impl_->set_feature_score_metadata_cuda(indices, count, engage_show_count);
   }
 
  private:

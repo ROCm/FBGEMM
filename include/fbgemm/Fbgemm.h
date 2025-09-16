@@ -12,10 +12,7 @@
  * Top level include file for FBGEMM.
  */
 #include <cassert>
-#include <cmath>
-#include <limits>
 #include <memory>
-#include <type_traits>
 #include "./ConvUtils.h" // @manual
 #include "./FbgemmBuild.h" // @manual
 #include "./FbgemmEmbedding.h" // @manual
@@ -140,6 +137,7 @@ class PackMatrix {
       int cols = 0,
       const BlockingFactors* params = nullptr);
 
+  FBGEMM_PUSH_WARNING_AND_DISABLE("-Wpragmas")
   FBGEMM_PUSH_WARNING_AND_DISABLE("-Winfinite-recursion")
   /**
    * @return Pointer to a buffer containing row offset results. Some packing
@@ -148,9 +146,6 @@ class PackMatrix {
   std::int32_t* getRowOffsetBuffer() const {
     return static_cast<const PT*>(this)->getRowOffsetBuffer();
   }
-  FBGEMM_POP_WARNING
-
-  FBGEMM_PUSH_WARNING_AND_DISABLE("-Winfinite-recursion")
   /**
    * @brief When k loop is also tiled/blocked, this function is used to check if
    * have executed computations for the last k block so that we can perform
@@ -160,12 +155,17 @@ class PackMatrix {
     return static_cast<const PT*>(this)->isThisLastKBlock(block_id);
   }
   FBGEMM_POP_WARNING
+  FBGEMM_POP_WARNING
 
   /**
    * @brief Actual packing of a block of the source matrix in pmat buffer.
    */
   void pack(const block_type_t& block) {
+#if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
     static_cast<PT*>(this)->pack(block);
+#else
+    throw std::runtime_error("PackMatrix::pack() not implemented for aarch64");
+#endif // __aarch64__
   }
 
   std::int32_t numRows() const {
@@ -616,9 +616,11 @@ class FBGEMM_API PackWeightsForConv {
     return W_im2col_packed_;
   }
 
+#if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
   std::shared_ptr<PackedDepthWiseConvMatrix> getPackedWForDepthwise() {
     return W_dw_packed_;
   }
+#endif // __aarch64__
 
   std::shared_ptr<PackedDirectConvMatrix> getPackedWForDirectconv() {
     return W_dc_packed_;
@@ -670,8 +672,10 @@ class FBGEMM_API PackWeightsForConv {
   const conv_param_t<SPATIAL_DIM> conv_param_;
   // Packed weights if we use im2col based convolution implementation
   std::shared_ptr<PackBMatrix<T, accT>> W_im2col_packed_;
+#if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
   // Packed weights if we use depthwise convolution implementation
   std::shared_ptr<PackedDepthWiseConvMatrix> W_dw_packed_;
+#endif // __aarch64__
   // Packed weights if we use direct convolution implementation
   std::shared_ptr<PackedDirectConvMatrix> W_dc_packed_;
   // Packed weights if we use groupwise (small channels per group) convolution

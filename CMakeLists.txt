@@ -49,10 +49,26 @@ endfunction()
 # FBGEMM Build Kickstart
 ################################################################################
 
-project(fbgemm VERSION 0.1 LANGUAGES CXX C)
+# Declare CMake project
+project(
+  fbgemm
+  VERSION 1.3.0
+  LANGUAGES CXX)
+
+# Add C++ compiler flag detection
+include(CheckCXXCompilerFlag)
 
 # Install libraries into correct locations on all platforms
 include(GNUInstallDirs)
+
+# Check AVX
+set(CHECK_AVX_COMPILE ON)
+include(${MODULE_PATH}/FindAVX.cmake)
+# For some reason, AVX flag values end up being packed into a single quoted
+# string when FBGEMM is built as part of PyTorch build, so we need to separate
+# the flags here back into list-string format
+separate_arguments(CXX_AVX2_FLAGS)
+separate_arguments(CXX_AVX512_FLAGS)
 
 # Load Python
 find_package(Python)
@@ -61,30 +77,24 @@ set(FBGEMM_LIBRARY_TYPE "default"
   CACHE STRING
   "Type of library (shared, static, or default) to build")
 
-set_property(CACHE FBGEMM_LIBRARY_TYPE PROPERTY STRINGS DEFAULT STATIC SHARED)
 option(FBGEMM_BUILD_TESTS "Build fbgemm unit tests" ON)
 option(FBGEMM_BUILD_BENCHMARKS "Build fbgemm benchmarks" ON)
 option(FBGEMM_BUILD_DOCS "Build fbgemm documentation" OFF)
-# option(FBGEMM_BUILD_FBGEMM_GPU "Build fbgemm_gpu library" OFF)
 option(FBGEMM_USE_IPO "Build fbgemm with interprocedural optimization" OFF)
 option(DISABLE_FBGEMM_AUTOVEC "Disable FBGEMM Autovec" OFF)
 
+set_property(CACHE FBGEMM_LIBRARY_TYPE PROPERTY STRINGS DEFAULT STATIC SHARED)
+string(TOUPPER "${FBGEMM_LIBRARY_TYPE}" FBGEMM_LIBRARY_TYPE)
 if(FBGEMM_LIBRARY_TYPE STREQUAL "DEFAULT")
   if(BUILD_SHARED_LIB)
     set(FBGEMM_LIBRARY_TYPE "SHARED")
   else()
     set(FBGEMM_LIBRARY_TYPE "STATIC")
   endif()
-else()
-  string(TOUPPER "${FBGEMM_LIBRARY_TYPE}" FBGEMM_LIBRARY_TYPE)
-endif()
-
-if(FBGEMM_BUILD_TESTS)
-  enable_testing()
 endif()
 
 # Add address sanitizer
-set(USE_SANITIZER "" CACHE STRING "options include address, leak, ...")
+set(FBGEMM_USE_SANITIZER "" CACHE STRING "options include address, leak, ...")
 
 # We should default to a Release build
 if(NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
@@ -95,21 +105,14 @@ if(DISABLE_FBGEMM_AUTOVEC)
   add_compile_definitions("DISABLE_FBGEMM_AUTOVEC")
 endif()
 
-################################################################################
-# AVX512 Support
-################################################################################
-
-include(CheckCXXCompilerFlag)
 if(MSVC)
-  CHECK_CXX_COMPILER_FLAG(/arch:AVX512 COMPILER_SUPPORTS_AVX512)
   set(MSVC_BOOL True)
 else(MSVC)
-  CHECK_CXX_COMPILER_FLAG(-mavx512f COMPILER_SUPPORTS_AVX512)
   set(MSVC_BOOL False)
+  check_cxx_compiler_flag(-march=armv8-a+sve COMPILER_SUPPORTS_SVE)
+  check_cxx_compiler_flag(-march=armv8-a+sve2 COMPILER_SUPPORTS_SVE2)
+  check_cxx_compiler_flag(-march=armv8-a+fp16fml COMPILER_SUPPORTS_FP16FML)
 endif(MSVC)
-if(NOT COMPILER_SUPPORTS_AVX512)
-  message(FATAL_ERROR "A compiler with AVX512 support is required.")
-endif()
 
 ################################################################################
 # GNU F2H_IEEE Support
@@ -148,6 +151,9 @@ if(NOT MSVC)
     src/FbgemmFP16UKernelsAvx2.cc
     src/FbgemmFP16UKernelsAvx512.cc
     src/FbgemmFP16UKernelsAvx512_256.cc
+    src/fp32/FbgemmFP32UKernelsAvx2.cc
+    src/fp32/FbgemmFP32UKernelsAvx512.cc
+    src/fp32/FbgemmFP32UKernelsAvx512_256.cc
     PROPERTIES COMPILE_FLAGS "-masm=intel")
 
   # Workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80947
@@ -159,14 +165,32 @@ if(NOT MSVC)
   endif()
 endif()
 
+set(fbgemm_arm_defs)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+  set(fbgemm_arm_defs
+      FBGEMM_FP16_FALLBACK_TO_REF_KERNEL
+      FBGEMM_FP32_FALLBACK_TO_REF_KERNEL)
+  if(NOT APPLE)
+    list(APPEND fbgemm_arm_defs FBGEMM_ENABLE_KLEIDIAI)
+  endif()
+endif()
+
 ################################################################################
 # FBGEMM Generic Target
 ################################################################################
 
 get_filelist("get_fbgemm_generic_srcs(with_base=True)" FBGEMM_GENERIC_SRCS)
+if(MSVC)
+  list(FILTER FBGEMM_GENERIC_SRCS EXCLUDE REGEX "src/fp32/.*\\.cc$")
+endif()
 
+set(fbgemm_generic_defs "${fbgemm_arm_defs}")
 if(FBGEMM_LIBRARY_TYPE STREQUAL STATIC)
-  set(fbgemm_generic_defs FBGEMM_STATIC)
+  list(APPEND fbgemm_generic_defs FBGEMM_STATIC)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+  set(fbgemm_generic_defs ${fbgemm_generic_defs} FBGEMM_ENABLE_KLEIDIAI)
 endif()
 
 cpp_library(
@@ -180,8 +204,10 @@ cpp_library(
     $<BUILD_INTERFACE:${FBGEMM_SOURCE_DIR}>
     $<BUILD_INTERFACE:${FBGEMM_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${FBGEMM_SOURCE_DIR}/bench>
+  MSVC_FLAGS
+    /wd4717 /bigobj
   SANITIZER_OPTIONS
-    "${USE_SANITIZER}"
+    "${FBGEMM_USE_SANITIZER}"
   DEFINITIONS
     ${fbgemm_generic_defs}
   DEPS
@@ -189,63 +215,170 @@ cpp_library(
     $<BUILD_INTERFACE:asmjit>
 )
 
-set(fbgemm_targets fbgemm_avx2 fbgemm_avx512)
+set(fbgemm_targets)
 
 ################################################################################
 # FBGEMM AVX2 Target
 ################################################################################
 
-get_filelist("get_fbgemm_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_SRCS)
-get_filelist("get_fbgemm_inline_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_INLINE_SRCS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686")
 
-cpp_library(
-  PREFIX
-    fbgemm_avx2
-  TYPE
-    OBJECT
-  SRCS
-    ${FBGEMM_AVX2_SRCS}
-    ${FBGEMM_AVX2_INLINE_SRCS}
-  CC_FLAGS
-    -m64 -mavx2 -mf16c -mfma
-  MSVC_FLAGS
-    /arch:AVX2
-  DEPS
-    $<BUILD_INTERFACE:cpuinfo>
-    $<BUILD_INTERFACE:asmjit>
-    fbgemm_generic
-)
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build AVX2 target")
+
+  get_filelist("get_fbgemm_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_SRCS)
+  get_filelist("get_fbgemm_inline_avx2_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX2_INLINE_SRCS)
+
+  cpp_library(
+    PREFIX
+      fbgemm_avx2
+    TYPE
+      OBJECT
+    SRCS
+      ${FBGEMM_AVX2_SRCS}
+      ${FBGEMM_AVX2_INLINE_SRCS}
+    CC_FLAGS
+      -m64 -mf16c -mfma ${CXX_AVX2_FLAGS}
+    MSVC_FLAGS
+      ${CXX_AVX2_FLAGS}
+    DEPS
+      $<BUILD_INTERFACE:cpuinfo>
+      $<BUILD_INTERFACE:asmjit>
+      fbgemm_generic
+  )
+
+  list(APPEND fbgemm_targets fbgemm_avx2)
+
+else()
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will NOT build AVX2 target")
+endif()
 
 ################################################################################
 # FBGEMM AVX512 Target
 ################################################################################
 
-get_filelist("get_fbgemm_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_SRCS)
-get_filelist("get_fbgemm_inline_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_INLINE_SRCS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i386|i686" AND CXX_AVX512_FOUND)
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build AVX512 target")
 
-cpp_library(
-  PREFIX
-    fbgemm_avx512
-  TYPE
-    OBJECT
-  SRCS
-    ${FBGEMM_AVX512_SRCS}
-    ${FBGEMM_AVX512_INLINE_SRCS}
-  CC_FLAGS
-    -m64 -mavx2 -mfma -mavx512f -mavx512bw -mavx512dq -mavx512vl
-  MSVC_FLAGS
-    /arch:AVX512
-  DEPS
-    $<BUILD_INTERFACE:cpuinfo>
-    $<BUILD_INTERFACE:asmjit>
-    fbgemm_generic
-)
+  get_filelist("get_fbgemm_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_SRCS)
+  get_filelist("get_fbgemm_inline_avx512_srcs(msvc=${MSVC_BOOL})" FBGEMM_AVX512_INLINE_SRCS)
+
+  cpp_library(
+    PREFIX
+      fbgemm_avx512
+    TYPE
+      OBJECT
+    SRCS
+      ${FBGEMM_AVX512_SRCS}
+      ${FBGEMM_AVX512_INLINE_SRCS}
+    CC_FLAGS
+      -m64 -mfma ${CXX_AVX512_FLAGS} ${CXX_AVX2_FLAGS}
+    MSVC_FLAGS
+      ${CXX_AVX512_FLAGS} ${CXX_AVX2_FLAGS}
+    DEPS
+      $<BUILD_INTERFACE:cpuinfo>
+      $<BUILD_INTERFACE:asmjit>
+      fbgemm_generic
+  )
+
+  list(APPEND fbgemm_targets fbgemm_avx512)
+else()
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will NOT build AVX512 target")
+endif()
+
+################################################################################
+# FBGEMM Neon Target
+################################################################################
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+  if(NOT COMPILER_SUPPORTS_FP16FML)
+    message(FATAL_ERROR "The current compiler does not support building FP16FML code")
+  endif()
+
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build Neon target")
+
+  get_filelist("get_fbgemm_inline_neon_srcs(msvc=${MSVC_BOOL})" FBGEMM_NEON_SRCS)
+
+  cpp_library(
+    PREFIX
+      fbgemm_neon
+    TYPE
+      OBJECT
+    SRCS
+      ${FBGEMM_NEON_SRCS}
+    CC_FLAGS
+      -ftree-vectorize
+      -fno-trapping-math
+      -Wignored-qualifiers
+      -march=armv8-a+fp16fml
+    DEFINITIONS
+      ${fbgemm_arm_defs}
+    DEPS
+      $<BUILD_INTERFACE:cpuinfo>
+      $<BUILD_INTERFACE:asmjit>
+      fbgemm_generic
+  )
+
+  list(APPEND fbgemm_targets fbgemm_neon)
+
+else()
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will NOT build Neon target")
+endif()
+
+################################################################################
+# FBGEMM SVE Target
+################################################################################
+
+set(FBGEMM_BUILD_SVE False)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+  if(COMPILER_SUPPORTS_SVE2)
+    set(FBGEMM_BUILD_SVE True)
+    set(fbgemm_sve_flags "-march=armv8-a+sve2")
+  elseif(COMPILER_SUPPORTS_SVE)
+    set(FBGEMM_BUILD_SVE True)
+    set(fbgemm_sve_flags "-march=armv8-a+sve")
+  endif()
+endif()
+
+if(FBGEMM_BUILD_SVE)
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will build SVE target")
+
+  get_filelist("get_fbgemm_inline_sve_srcs(msvc=${MSVC_BOOL})" FBGEMM_SVE_SRCS)
+
+  cpp_library(
+    PREFIX
+      fbgemm_sve
+    TYPE
+      OBJECT
+    SRCS
+      ${FBGEMM_SVE_SRCS}
+    CC_FLAGS
+      -ftree-vectorize
+      -fno-trapping-math
+      -Wignored-qualifiers
+      -Wno-inline-asm
+      -Wno-asm-operand-widths
+      ${fbgemm_sve_flags}
+    DEFINITIONS
+      ${fbgemm_arm_defs}
+    DEPS
+      $<BUILD_INTERFACE:cpuinfo>
+      $<BUILD_INTERFACE:asmjit>
+      fbgemm_generic
+  )
+
+  list(APPEND fbgemm_targets fbgemm_sve)
+
+else()
+  message(STATUS "Processor is ${CMAKE_SYSTEM_PROCESSOR}; will NOT build SVE target")
+endif()
 
 ################################################################################
 # FBGEMM Autovec Target
 ################################################################################
 
 if(NOT DISABLE_FBGEMM_AUTOVEC)
+  message(STATUS "Will build autovec target")
+
   get_filelist("get_fbgemm_autovec_srcs()" FBGEMM_AUTOVEC_SRCS)
 
   cpp_library(
@@ -303,16 +436,14 @@ if(NOT TARGET asmjit)
   endif()
 
   # Build asmjit
-  # For MSVC shared build, asmjit needs to be shared also.
-  if(MSVC AND (FBGEMM_LIBRARY_TYPE STREQUAL "shared"))
-    set(ASMJIT_STATIC OFF)
-  else()
-    set(ASMJIT_STATIC ON)
-  endif()
+  set(ASMJIT_STATIC ON)
   set(ASMJIT_NO_INSTALL ON)
 
   add_subdirectory("${ASMJIT_SRC_DIR}" "${FBGEMM_BINARY_DIR}/asmjit")
   set_property(TARGET asmjit PROPERTY POSITION_INDEPENDENT_CODE ON)
+  if(MSVC)
+    target_compile_options(asmjit PRIVATE /wd5054)
+  endif()
 endif()
 
 ################################################################################
@@ -340,6 +471,7 @@ endif()
 ################################################################################
 
 if(FBGEMM_BUILD_TESTS)
+  enable_testing()
   add_subdirectory(test)
 endif()
 

@@ -121,6 +121,7 @@ static jit_conv_kernel_fp getOrCreateConvKernel(
       accum);
 
   if (cpuinfo_initialize()) {
+#if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
     if (fbgemmHasAvx512VnniSupport()) {
       return GenConvKernel<SPATIAL_DIM, inst_set_t::avx512_vnni>::codeCache_
           .getOrCreate(kernelSig, [&]() {
@@ -160,7 +161,9 @@ static jit_conv_kernel_fp getOrCreateConvKernel(
                 accum);
             return genObj.getOrCreate();
           });
-    } else {
+    } else
+#endif
+    {
       // TODO: Have default slower path
       assert(0 && "unsupported architecture");
     }
@@ -597,10 +600,10 @@ void GenConvKernel<SPATIAL_DIM, INST_SET>::initResultRegs(x86::Emitter* a) {
     // Take advantage of implicit zeroing out
     // i.e., zero out xmm and ymm and zmm will be zeroed out too
     for (int k = 0; k < kLoopIters_; ++k) {
-      a->vpxor(x86::Xmm(9 - k), x86::Xmm(9 - k), x86::Xmm(9 - k));
+      a->vpxor(Xmm(9 - k), Xmm(9 - k), Xmm(9 - k));
     }
   } else {
-    a->vpxor(x86::Xmm(9), x86::Xmm(9), x86::Xmm(9));
+    a->vpxor(Xmm(9), Xmm(9), Xmm(9));
   }
 }
 
@@ -879,33 +882,35 @@ template <typename processOutputType, typename outT, typename inT>
 static void dispatchOutputProcessing(
     const processOutputType& outProcess,
     int32_t* rowOffsetBuf,
-    outT* out,
-    const inT* inp,
-    const block_type_t& block,
-    int ld_out,
-    int ld_in,
+    outT* out [[maybe_unused]],
+    const inT* inp [[maybe_unused]],
+    const block_type_t& block [[maybe_unused]],
+    int ld_out [[maybe_unused]],
+    int ld_in [[maybe_unused]],
     int groups,
-    int C_per_G,
+    int C_per_G [[maybe_unused]],
     true_type /*unused*/) {
   constexpr QuantizationGranularity Q_GRAN = processOutputType::QGRANType;
-  constexpr int FUSE_RELU = processOutputType::RELU_FUSED;
-  bool b_symmetric = (Q_GRAN == QuantizationGranularity::TENSOR &&
-                      outProcess.getBZeroPoint()[0] == 0) ||
+  [[maybe_unused]] constexpr int FUSE_RELU = processOutputType::RELU_FUSED;
+  [[maybe_unused]] bool b_symmetric =
+      (Q_GRAN == QuantizationGranularity::TENSOR &&
+       outProcess.getBZeroPoint()[0] == 0) ||
       rowOffsetBuf == nullptr;
   int32_t a_zero_point = outProcess.getAZeroPoint();
 
   // Requantization
-  requantizationParams_t<typename processOutputType::BIAS_T> r = {
-      a_zero_point,
-      outProcess.getBZeroPoint(),
-      outProcess.getCZeroPoint(),
-      outProcess.getCMultiplier(),
-      rowOffsetBuf,
-      outProcess.getColOffsets(),
-      outProcess.getBias(),
-      outProcess.getNCols(),
-      groups,
-      outProcess.getActWScale()};
+  [[maybe_unused]] requantizationParams_t<typename processOutputType::BIAS_T>
+      r = {
+          a_zero_point,
+          outProcess.getBZeroPoint(),
+          outProcess.getCZeroPoint(),
+          outProcess.getCMultiplier(),
+          rowOffsetBuf,
+          outProcess.getColOffsets(),
+          outProcess.getBias(),
+          outProcess.getNCols(),
+          groups,
+          outProcess.getActWScale()};
 
 #define REQUANTIZE_BASE(ISA, C_PER_G, A_SYM, B_SYM, BIAS) \
   requantizeOutputProcessingGConv##ISA<                   \
@@ -949,11 +954,14 @@ static void dispatchOutputProcessing(
   }
 
   if (cpuinfo_initialize()) {
+#if defined(FBGEMM_FBCODE) || !defined(__aarch64__)
     if (fbgemmHasAvx512Support() || fbgemmHasAvx512VnniSupport()) {
       REQUANTIZE_C_PER_G(Avx512);
     } else if (fbgemmHasAvx2Support() || fbgemmHasArmNeonSupport()) {
       REQUANTIZE_C_PER_G(Avx2);
-    } else {
+    } else
+#endif
+    {
       assert(0 && "unsupported architecture");
     }
   } else {

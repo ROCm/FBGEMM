@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cmath>
 #include <cstring>
 #include "./OptimizedKernelsAvx2.h" // @manual
 
@@ -49,12 +48,12 @@ bool CompressedSparseColumn::IsHyperSparse() const {
 
 // TODO: fallback when AVX2 is not available
 void CompressedSparseColumn::SpMDM(
-    const block_type_t& block,
-    const uint8_t* A,
-    int lda,
-    bool accumulation,
-    int32_t* C,
-    int ldc) const {
+    const block_type_t& block [[maybe_unused]],
+    const uint8_t* A [[maybe_unused]],
+    int lda [[maybe_unused]],
+    bool accumulation [[maybe_unused]],
+    int32_t* C [[maybe_unused]],
+    int ldc [[maybe_unused]]) const {
   int K = NumOfRows();
   int N = block.col_size;
 
@@ -63,25 +62,10 @@ void CompressedSparseColumn::SpMDM(
   }
 
 #ifdef FBGEMM_MEASURE_TIME_BREAKDOWN
-  std::chrono::time_point<std::chrono::high_resolution_clock> t_very_start,
-      t_start, t_end;
-  double dt;
-  t_start = std::chrono::high_resolution_clock::now();
-  t_very_start = std::chrono::high_resolution_clock::now();
-#endif
-
-// Note: These (and others below) cause a ~2-3% overall performance drop in
-// resnet/resnext so we are keeping arrays with dynamic size for gcc/clang and
-// dynamically allocated memory for MSVC even though dynamically allocated
-// memory works for all compilers.
-#ifdef _MSC_VER
-  uint8_t* A_buffer =
-      static_cast<uint8_t*>(fbgemmAlignedAlloc(64, K * 32 * sizeof(uint8_t)));
-  int32_t* C_buffer =
-      static_cast<int32_t*>(fbgemmAlignedAlloc(64, N * 32 * sizeof(int32_t)));
-#else
-  alignas(64) uint8_t A_buffer[K * 32];
-  alignas(64) int32_t C_buffer[N * 32];
+  std::chrono::time_point<std::chrono::high_resolution_clock> t_end;
+  double dt = 0;
+  auto t_start = std::chrono::high_resolution_clock::now();
+  auto t_very_start = std::chrono::high_resolution_clock::now();
 #endif
 
   // If we compute C = C + A * B, where B is a sparse matrix in CSC format, for
@@ -158,12 +142,15 @@ void CompressedSparseColumn::SpMDM(
       } // for each column of B
     }
 #ifdef _MSC_VER
-    fbgemmAlignedFree(A_buffer);
-    fbgemmAlignedFree(C_buffer);
     fbgemmAlignedFree(C_temp);
 #endif
     return;
   }
+
+#ifdef __aarch64__
+  throw std::runtime_error(
+      "No fallback for fbgemm::SpMDM when AVX2 is not available");
+#else
 
 #ifdef FBGEMM_MEASURE_TIME_BREAKDOWN
   t_end = std::chrono::high_resolution_clock::now();
@@ -171,6 +158,20 @@ void CompressedSparseColumn::SpMDM(
            .count();
   spmdm_initial_time += (dt);
   t_start = std::chrono::high_resolution_clock::now();
+#endif
+
+// Note: These (and others below) cause a ~2-3% overall performance drop in
+// resnet/resnext so we are keeping arrays with dynamic size for gcc/clang and
+// dynamically allocated memory for MSVC even though dynamically allocated
+// memory works for all compilers.
+#ifdef _MSC_VER
+  uint8_t* A_buffer =
+      static_cast<uint8_t*>(fbgemmAlignedAlloc(64, K * 32 * sizeof(uint8_t)));
+  int32_t* C_buffer =
+      static_cast<int32_t*>(fbgemmAlignedAlloc(64, N * 32 * sizeof(int32_t)));
+#else
+  alignas(64) uint8_t A_buffer[K * 32];
+  alignas(64) int32_t C_buffer[N * 32];
 #endif
 
   // Take 32 rows at a time
@@ -283,6 +284,8 @@ void CompressedSparseColumn::SpMDM(
   fbgemmAlignedFree(A_buffer);
   fbgemmAlignedFree(C_buffer);
 #endif
+
+#endif // __aarch64__
 }
 
 void CompressedSparseColumn::SparseConv(

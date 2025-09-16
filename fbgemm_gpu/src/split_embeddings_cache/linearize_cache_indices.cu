@@ -105,22 +105,17 @@ DLL_PUBLIC Tensor linearize_cache_indices_cuda(
         using offset_t = index_t;
         AT_DISPATCH_INDEX_TYPES(
             indices.scalar_type(), "linearize_cache_indices_kernel_2", [&] {
-#ifdef FBGEMM_GPU_MEMCHECK
-              const char* func_name = "linearize_cache_indices_kernel";
-#endif
-              linearize_cache_indices_kernel<<<
+              FBGEMM_LAUNCH_KERNEL(
+                  (linearize_cache_indices_kernel<index_t, offset_t>),
                   div_round_up(num_indices, kMaxThreads),
                   kMaxThreads,
                   0,
-                  at::cuda::getCurrentCUDAStream()>>>(
-                  MAKE_PTA_WITH_NAME(
-                      func_name, cache_hash_size_cumsum, int64_t, 1, 32),
-                  MAKE_PTA_WITH_NAME(func_name, indices, index_t, 1, 32),
-                  MAKE_PTA_WITH_NAME(func_name, table_offsets, offset_t, 1, 32),
-                  MAKE_PTA_WITH_NAME(
-                      func_name, linear_cache_indices, int64_t, 1, 32),
+                  at::cuda::getCurrentCUDAStream(),
+                  PTA_B(cache_hash_size_cumsum, int64_t, 1, 32),
+                  PTA_B(indices, index_t, 1, 32),
+                  PTA_B(table_offsets, offset_t, 1, 32),
+                  PTA_B(linear_cache_indices, int64_t, 1, 32),
                   indices_base_offset);
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
       });
   return linear_cache_indices;
@@ -181,21 +176,16 @@ DLL_PUBLIC Tensor linearize_cache_indices_from_row_idx_cuda(
       update_row_indices.scalar_type(),
       "linearize_cache_indices_from_row_idx_kernel",
       [&] {
-#ifdef FBGEMM_GPU_MEMCHECK
-        const char* func_name = "linearize_cache_indices_from_row_idx_kernel";
-#endif
-        linearize_cache_indices_from_row_idx_kernel<<<
+        FBGEMM_LAUNCH_KERNEL(
+            (linearize_cache_indices_from_row_idx_kernel<index_t>),
             div_round_up(num_indices, kMaxThreads),
             kMaxThreads,
             0,
-            at::cuda::getCurrentCUDAStream()>>>(
-            MAKE_PTA_WITH_NAME(
-                func_name, cache_hash_size_cumsum, int64_t, 1, 32),
-            MAKE_PTA_WITH_NAME(func_name, update_table_indices, index_t, 1, 32),
-            MAKE_PTA_WITH_NAME(func_name, update_row_indices, index_t, 1, 32),
-            MAKE_PTA_WITH_NAME(
-                func_name, linear_cache_indices, index_t, 1, 32));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+            at::cuda::getCurrentCUDAStream(),
+            PTA_B(cache_hash_size_cumsum, int64_t, 1, 32),
+            PTA_B(update_table_indices, index_t, 1, 32),
+            PTA_B(update_row_indices, index_t, 1, 32),
+            PTA_B(linear_cache_indices, index_t, 1, 32));
       });
   return linear_cache_indices;
 }
@@ -242,8 +232,7 @@ get_unique_indices_cuda_impl(
       N,                                                                  \
       0,                                                                  \
       int(log2(float(max_indices + 1)) + 1),                              \
-      at::cuda::getCurrentCUDAStream(),                                   \
-      false))
+      at::cuda::getCurrentCUDAStream()))
 
 #define INVOKE_CUB_SORT_KEYS(TEMP_STORAGE_PTR)                           \
   AT_CUDA_CHECK(FBGEMM_GPU_CUB_NS_PREFIX cub::DeviceRadixSort::SortKeys( \
@@ -254,8 +243,7 @@ get_unique_indices_cuda_impl(
       N,                                                                 \
       0,                                                                 \
       int(log2(float(max_indices + 1)) + 1),                             \
-      at::cuda::getCurrentCUDAStream(),                                  \
-      false))
+      at::cuda::getCurrentCUDAStream()))
 
 #define INVOKE_CUB_ENCODE(TEMP_STORAGE_PTR)                                  \
   AT_CUDA_CHECK(FBGEMM_GPU_CUB_NS_PREFIX cub::DeviceRunLengthEncode::Encode( \
@@ -266,8 +254,7 @@ get_unique_indices_cuda_impl(
       unique_indices_count->data_ptr<int32_t>(),                             \
       unique_indices_length.data_ptr<int32_t>(),                             \
       N,                                                                     \
-      at::cuda::getCurrentCUDAStream(),                                      \
-      false))
+      at::cuda::getCurrentCUDAStream()))
 
 #define INVOKE_CUB_UNIQUE(TEMP_STORAGE_PTR)                         \
   AT_CUDA_CHECK(FBGEMM_GPU_CUB_NS_PREFIX cub::DeviceSelect::Unique( \
@@ -277,8 +264,7 @@ get_unique_indices_cuda_impl(
       unique_indices.data_ptr<index_t>(),                           \
       unique_indices_length.data_ptr<int32_t>(),                    \
       N,                                                            \
-      at::cuda::getCurrentCUDAStream(),                             \
-      false))
+      at::cuda::getCurrentCUDAStream()))
 
   AT_DISPATCH_INDEX_TYPES(
       linear_indices.scalar_type(), "get_unique_indices_cuda", [&] {

@@ -27,52 +27,58 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
 ################################################################################
 
 glob_files_nohip(experimental_gen_ai_cpp_source_files_cpu
-  src/attention/*.cpp
+  src/attention/cuda/*.cpp
   src/coalesce/*.cpp
+  src/comm/*.cpp
+  src/kv_cache/*.cpp
   src/moe/*.cpp
   src/quantize/*.cpp
   src/quantize/common/*.cpp)
 
 glob_files_nohip(experimental_gen_ai_cpp_source_files_gpu
-  src/attention/*.cu
+  src/attention/cuda/*.cu
+  src/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cu
   src/coalesce/*.cu
+  src/comm/*.cu
+  src/kv_cache/*.cu
   src/moe/*.cu
   src/quantize/*.cu)
 
 if(FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
   glob_files_nohip(tmp_list_cpu
-    src/comm/*.cpp
     src/gather_scatter/*.cpp)
 
   glob_files_nohip(tmp_list_gpu
-    src/comm/*.cu
     src/gather_scatter/*.cu)
 
-  # TODO: kv_cache sources need to be updated with proper CUDA_VERSION ifdef
-  # wrapping before this if-clause can be removed
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
-    glob_files_nohip(tmp_list_cpu2
-      src/kv_cache/*.cpp)
-
-    glob_files_nohip(tmp_list_gpu2
-      src/kv_cache/*.cu)
-  endif()
-
-  list(APPEND experimental_gen_ai_cpp_source_files_cpu ${tmp_list_cpu} ${tmp_list_cpu2})
-  list(APPEND experimental_gen_ai_cpp_source_files_gpu ${tmp_list_gpu} ${tmp_list_gpu2})
+  list(APPEND experimental_gen_ai_cpp_source_files_cpu
+    ${tmp_list_cpu} ${tmp_list_cpu2})
+  list(APPEND experimental_gen_ai_cpp_source_files_gpu
+    ${tmp_list_gpu} ${tmp_list_gpu2})
 endif()
 
 # Include FB-internal code into the build
 if(USE_FB_ONLY
   AND (FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CUDA)
   AND (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0))
+  BLOCK_PRINT(
+    "[FBPKG] USE_FB_ONLY is set, "
+    "will be INCLUDING FB-internal sources.")
+
   glob_files_nohip(fb_only_sources_cpu
       fb/src/*/*.cpp)
 
   glob_files_nohip(fb_only_sources_gpu
       fb/src/*/*.cu)
 
-  if(NOT FBGEMM_FBPKG_BUILD)
+  if(FBGEMM_FBPKG_BUILD)
+    BLOCK_PRINT("[FBPKG] FBGEMM_FBPKG_BUILD is set.")
+
+  else()
+    BLOCK_PRINT(
+      "[FBPKG] FBGEMM_FBPKG_BUILD is NOT set,"
+      "certain FB-internal sources will be excluded from the build.")
+
     # NOTE: Some FB-internal code explicitly require an FB-internal
     # environment to build, such as code that depends on NCCLX
     list(FILTER fb_only_sources_cpu
@@ -84,6 +90,11 @@ if(USE_FB_ONLY
 
   list(APPEND experimental_gen_ai_cpp_source_files_cpu ${fb_only_sources_cpu})
   list(APPEND experimental_gen_ai_cpp_source_files_gpu ${fb_only_sources_gpu})
+
+else()
+  BLOCK_PRINT(
+    "[FBPKG] USE_FB_ONLY is NOT set, "
+    "will be EXCLUDING FB-internal sources.")
 endif()
 
 # CUDA-specific sources
@@ -134,7 +145,9 @@ gpu_cpp_library(
     ${KEEP_PREFIX}
   INCLUDE_DIRS
     ${fbgemm_sources_include_directories}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/attention/cuda/cutlass_blackwell_fmha
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quantize
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quantize/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quantize/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kv_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include

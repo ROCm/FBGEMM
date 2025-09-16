@@ -19,7 +19,7 @@ def combine_shuffling(
     token_counts: torch.Tensor,
     expert_start: Optional[int] = None,
     expert_end: Optional[int] = None,
-    is_balanced: bool = False,
+    is_padded: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # pyre-ignore
     return _combine_or_split_shuffling(
@@ -27,7 +27,7 @@ def combine_shuffling(
         token_counts=token_counts,
         expert_start=expert_start,
         expert_end=expert_end,
-        is_balanced=is_balanced,
+        is_padded=is_padded,
         is_combine=True,
     )
 
@@ -37,7 +37,8 @@ def split_shuffling(
     token_counts: torch.Tensor,
     expert_start: Optional[int] = None,
     expert_end: Optional[int] = None,
-    is_balanced: bool = False,
+    is_padded: bool = False,
+    init_with_zeros: bool = False,
 ) -> torch.Tensor:
     # pyre-ignore
     return _combine_or_split_shuffling(
@@ -45,8 +46,9 @@ def split_shuffling(
         token_counts=token_counts,
         expert_start=expert_start,
         expert_end=expert_end,
-        is_balanced=is_balanced,
+        is_padded=is_padded,
         is_combine=False,
+        init_with_zeros=init_with_zeros,
     )
 
 
@@ -55,8 +57,9 @@ def _combine_or_split_shuffling(
     token_counts: torch.Tensor,
     expert_start: Optional[int],
     expert_end: Optional[int],
-    is_balanced: bool,
+    is_padded: bool,
     is_combine: bool,
+    init_with_zeros: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # T is intentionally ignored in kernel interface to avoid recompilation
     assert tokens.is_contiguous()
@@ -64,6 +67,10 @@ def _combine_or_split_shuffling(
 
     T, D = tokens.shape
     EP, E = token_counts.shape
+    B_T = -1
+    if is_padded:
+        assert T % EP == 0
+        B_T = T // EP
 
     if expert_start is None:
         expert_start = 0
@@ -83,15 +90,19 @@ def _combine_or_split_shuffling(
     else:
         grid = (EP * EG * SPLIT_D,)
 
-    output_tokens = torch.empty_like(tokens)
+    output_tokens = (
+        torch.zeros_like(tokens) if init_with_zeros else torch.empty_like(tokens)
+    )
     if is_combine:
         output_token_counts = torch.empty(
             EG + 1, dtype=token_counts.dtype, device=token_counts.device
         )
     else:
         output_token_counts = None
-    T_BUCKET_CAP = 16384
-    T_BUCKET = min(triton.next_power_of_2(T), T_BUCKET_CAP)
+
+    BLOCK_E = max(triton.next_power_of_2(E), 8)
+    BLOCK_EG = max(triton.next_power_of_2(EG), 8)
+    BLOCK_EP = max(triton.next_power_of_2(EP), 8)
 
     _fbgemm_combine_or_split_shuffling[grid](
         tokens,
@@ -99,13 +110,16 @@ def _combine_or_split_shuffling(
         output_tokens,
         output_token_counts,
         is_combine,
-        is_balanced,
-        T_BUCKET,
+        expert_start,
+        is_padded,
+        B_T,
         EG,
         EP,
         E,
         D,
-        expert_start,
+        BLOCK_E,
+        BLOCK_EG,
+        BLOCK_EP,
         SPLIT_D,
     )
 
@@ -121,7 +135,7 @@ _COMBINE_SHUFFLING_OP_NAME = "fbgemm::combine_shuffling"
 
 torch.library.define(
     "fbgemm::combine_shuffling",
-    "(Tensor tokens, Tensor token_counts, int? expert_start = None, int? expert_end = None, bool? is_balanced = False) -> (Tensor, Tensor)",
+    "(Tensor tokens, Tensor token_counts, int? expert_start = None, int? expert_end = None, bool? is_padded = False) -> (Tensor, Tensor)",
 )
 
 
@@ -131,7 +145,7 @@ def combine_shuffling_meta(
     token_counts,
     expert_start,
     expert_end,
-    is_balanced,
+    is_padded,
 ):
     _, E = token_counts.shape
     if expert_start is None:
@@ -153,14 +167,14 @@ def combine_shuffling_cuda(
     token_counts,
     expert_start=None,
     expert_end=None,
-    is_balanced=False,
+    is_padded=False,
 ):
     return combine_shuffling(
         tokens,
         token_counts,
         expert_start,
         expert_end,
-        is_balanced,
+        is_padded,
     )
 
 
@@ -168,7 +182,7 @@ _SPLIT_SHUFFLING_OP_NAME = "fbgemm::split_shuffling"
 
 torch.library.define(
     "fbgemm::split_shuffling",
-    "(Tensor tokens, Tensor token_counts, int? expert_start = None, int? expert_end = None, bool? is_balanced = False) -> Tensor",
+    "(Tensor tokens, Tensor token_counts, int? expert_start = None, int? expert_end = None, bool? is_padded = False, bool? init_with_zeros = False) -> Tensor",
 )
 
 
@@ -178,7 +192,7 @@ def split_shuffling_meta(
     token_counts,
     expert_start,
     expert_end,
-    is_balanced,
+    is_padded,
 ):
     output_tokens = torch.empty_like(tokens)
     return output_tokens
@@ -190,14 +204,14 @@ def split_shuffling_cuda(
     token_counts,
     expert_start=None,
     expert_end=None,
-    is_balanced=False,
+    is_padded=False,
 ):
     return split_shuffling(
         tokens,
         token_counts,
         expert_start,
         expert_end,
-        is_balanced,
+        is_padded,
     )
 
 
@@ -240,8 +254,6 @@ _AMD_CONFIGS = [
     configs=_AMD_CONFIGS if torch.version.hip else _NV_CONFIGS,
     key=[
         "COMBINE",
-        "BALANCED",
-        "T_BUCKET",
         "EG",
         "EP",
         "E",
@@ -255,13 +267,16 @@ def _fbgemm_combine_or_split_shuffling(
     output_tokens_ptr,
     output_token_counts_ptr,
     COMBINE: tl.constexpr,
-    BALANCED,
-    T_BUCKET,
+    EG_START,
+    PADDED,
+    B_T: tl.constexpr,
     EG: tl.constexpr,
     EP: tl.constexpr,
     E: tl.constexpr,
     D: tl.constexpr,
-    EG_START,
+    BLOCK_E: tl.constexpr,
+    BLOCK_EG: tl.constexpr,
+    BLOCK_EP: tl.constexpr,
     SPLIT_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -279,66 +294,71 @@ def _fbgemm_combine_or_split_shuffling(
     rank = tidx // (EG * SPLIT_D)
     local_expert = (tidx % (EG * SPLIT_D)) // SPLIT_D
     didx = tidx % SPLIT_D
+    # All experts in communication group
+    offs_e = tl.arange(0, BLOCK_E)
+    # Local experts
+    offs_eg = tl.arange(0, BLOCK_EG)
+    # Ranks
+    offs_ep = tl.arange(0, BLOCK_EP)
 
     global_expert = local_expert + EG_START
 
     input_token_counts = tl.load(
-        input_token_counts_ptr
-        + tl.arange(0, EP)[:, None] * E
-        + tl.arange(0, E)[None, :],
+        input_token_counts_ptr + offs_ep[:, None] * E + offs_e[None, :],
         eviction_policy="evict_last",
+        mask=((offs_ep[:, None] < EP) & (offs_e[None, :] < E)),
+        other=0,
     )  # [EP, E]
 
-    input_token_counts_eg = tl.load(
-        input_token_counts_ptr
-        + tl.arange(0, EP)[:, None] * E
-        + EG_START
-        + tl.arange(0, EG)[None, :],
-        eviction_policy="evict_last",
-    )  # [EP, EG]
+    if E == EG:
+        input_token_counts_eg = input_token_counts
+    else:
+        input_token_counts_eg = tl.load(
+            input_token_counts_ptr + offs_ep[:, None] * E + EG_START + offs_eg[None, :],
+            eviction_policy="evict_last",
+            mask=((offs_ep[:, None] < EP) & (offs_eg[None, :] < EG)),
+            other=0,
+        )  # [EP, EG]
 
     if COMBINE:
         LAST_TILE: tl.constexpr = EP * EG * SPLIT_D
 
         if tidx == LAST_TILE:
-            if EG == E:
-                output_token_counts = tl.sum(input_token_counts, axis=0)
-                tl.store(
-                    output_token_counts_ptr + tl.arange(0, E)[:], output_token_counts
-                )
-                output_token_counts = tl.sum(output_token_counts)
-                tl.store(output_token_counts_ptr + E, output_token_counts)
-            else:
-                output_token_counts_eg = tl.sum(input_token_counts_eg, axis=0)
-                tl.store(
-                    output_token_counts_ptr + tl.arange(0, EG)[:],
-                    output_token_counts_eg,
-                )
-                output_token_counts_eg = tl.sum(output_token_counts_eg)
-                tl.store(output_token_counts_ptr + EG, output_token_counts_eg)
+            output_token_counts_eg = tl.sum(input_token_counts_eg, axis=0)
+            tl.store(
+                output_token_counts_ptr + offs_eg,
+                output_token_counts_eg,
+                mask=(offs_eg < EG),
+            )
+            output_token_counts_eg = tl.sum(output_token_counts_eg)
+            tl.store(output_token_counts_ptr + EG, output_token_counts_eg)
             return
 
-    cond0 = tl.arange(0, EP)[:, None] < rank
-    cond1 = tl.arange(0, EP)[:, None] == rank
+    cond0 = offs_ep[:, None] < rank
+    cond1 = offs_ep[:, None] == rank
 
-    cond2 = tl.arange(0, E)[None, :] < global_expert
-    cond3 = tl.arange(0, E)[None, :] == global_expert
+    cond2 = offs_e[None, :] < global_expert
 
-    # r < rank || (r == rank && e < expert)
-    ep_first_order = tl.sum(tl.where(cond0 or (cond1 and cond2), input_token_counts, 0))
-    if EG == E:
-        # e < expert || (e == expert && r < rank)
-        expert_first_order = tl.sum(
-            tl.where(cond2 or (cond3 and cond0), input_token_counts, 0)
+    if PADDED:
+        tl.device_assert(B_T >= 0)
+        # Only need information from previous experts in the same rank.
+        ep_first_order = (
+            tl.sum(tl.where(cond1 and cond2, input_token_counts, 0)) + B_T * rank
         )
     else:
-        # e < expert || (e == expert && r < rank)
-        cond4 = tl.arange(0, EG)[None, :] < local_expert
-        cond5 = tl.arange(0, EG)[None, :] == local_expert
-
-        expert_first_order = tl.sum(
-            tl.where(cond4 or (cond5 and cond0), input_token_counts_eg, 0)
+        # r < rank || (r == rank && e < expert)
+        ep_first_order = tl.sum(
+            tl.where(cond0 or (cond1 and cond2), input_token_counts, 0)
         )
+
+    cond4 = offs_eg[None, :] < local_expert
+    cond5 = offs_eg[None, :] == local_expert
+
+    # Expert first only need information from local experts across ranks.
+    # e < expert || (e == expert && r < rank)
+    expert_first_order = tl.sum(
+        tl.where(cond4 or (cond5 and cond0), input_token_counts_eg, 0)
+    )
 
     if COMBINE:
         input_offset = ep_first_order

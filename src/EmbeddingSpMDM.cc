@@ -18,6 +18,7 @@
 #include <tuple>
 #include "./CodeCache.h" // @manual
 #include "./EmbeddingSpMDMAutovec.h" // @manual
+#include "./EmbeddingSpMDMSve.h"
 #include "./MaskAvx2.h" // @manual
 #include "./RefImplementations.h" // @manual
 #include "fbgemm/FbgemmEmbedding.h"
@@ -117,12 +118,12 @@ class GenEmbeddingSpMDMLookup {
     return rt;
   }
 
-  static std::mutex rtMutex_; ///< Controll access to runtime;
+  inline static std::mutex rtMutex_; ///< Control access to runtime;
 
   // The hash depends on embedding dimension (block size), weighted sls,
-  // positional weights, normalize by lenths, prefetch distance, use_offsets,
+  // positional weights, normalize by lengths, prefetch distance, use_offsets,
   // output_stride, input_stride, and scale_bias_last
-  static CodeCache<
+  inline static CodeCache<
       std::tuple<int, bool, bool, bool, int, bool, int, int, bool, bool, bool>,
       typename ReturnFunctionSignature<
           inType,
@@ -133,49 +134,6 @@ class GenEmbeddingSpMDMLookup {
       THREAD_LOCAL>
       codeCache_; ///< JIT Code Cache for reuse.
 }; // GenEmbeddingSpmDMLookup
-
-template <
-    typename inType,
-    typename indxType,
-    typename offsetType,
-    typename outType,
-    inst_set_t instSet,
-    bool ROWWISE_SPARSE,
-    bool THREAD_LOCAL>
-std::mutex GenEmbeddingSpMDMLookup<
-    inType,
-    indxType,
-    offsetType,
-    outType,
-    instSet,
-    ROWWISE_SPARSE,
-    THREAD_LOCAL>::rtMutex_;
-
-template <
-    typename inType,
-    typename indxType,
-    typename offsetType,
-    typename outType,
-    inst_set_t instSet,
-    bool ROWWISE_SPARSE,
-    bool THREAD_LOCAL>
-CodeCache<
-    std::tuple<int, bool, bool, bool, int, bool, int, int, bool, bool, bool>,
-    typename ReturnFunctionSignature<
-        inType,
-        indxType,
-        offsetType,
-        outType,
-        ROWWISE_SPARSE>::jit_embedding_kernel,
-    THREAD_LOCAL>
-    GenEmbeddingSpMDMLookup<
-        inType,
-        indxType,
-        offsetType,
-        outType,
-        instSet,
-        ROWWISE_SPARSE,
-        THREAD_LOCAL>::codeCache_;
 
 template <
     typename inType,
@@ -418,8 +376,8 @@ GenEmbeddingSpMDMLookup<
         vec_reg_t
             vlen_inv_vreg; // used for normalize by lengths -- 1/ lengths[i]
         vec_reg_t src_vreg; // for holding embedding value temporarily
-        x86::Ymm mask_vreg; // mask for avx2
-        x86::Xmm mask_fp16_vreg; // mask for loading fp16 in avx2
+        Ymm mask_vreg; // mask for avx2
+        Xmm mask_fp16_vreg; // mask for loading fp16 in avx2
         vec_reg_t ones_vreg; // 2^15 for bf16_2_fp32_rn
 
         if constexpr (is_8bit_in) {
@@ -1028,13 +986,13 @@ typename EmbeddingSpMDMKernelSignature<inType, indxType, offsetType, outType>::
         bool no_bag /*=false*/,
         bool is_bf16_out /*=false*/,
         bool is_bf16_in /*=false*/) {
-#if defined(__APPLE__) || defined(_WIN32)
-  if (std::is_same<inType, uint16_t>::value && is_bf16_in &&
-      std::is_same<outType, float>::value) {
-    throw std::runtime_error(
-        "Bfloat16 input with float32 output is not yet supported on Apple or Windows");
+  bool use_avx [[maybe_unused]] = true;
+  if constexpr (
+      std::is_same_v<inType, uint16_t> && std::is_same_v<outType, float>) {
+    if (is_bf16_in) {
+      use_avx = false;
+    }
   }
-#endif
   if (output_stride == -1) {
     output_stride = block_size;
   }
@@ -1049,7 +1007,7 @@ typename EmbeddingSpMDMKernelSignature<inType, indxType, offsetType, outType>::
   }
 
 #if CPUINFO_ARCH_X86 || CPUINFO_ARCH_X86_64
-  if (!no_bag) {
+  if (!no_bag && use_avx) {
     if (!cpuinfo_initialize()) {
       throw std::runtime_error("Failed to initialize cpuinfo!");
     }
@@ -1168,6 +1126,76 @@ typename EmbeddingSpMDMKernelSignature<inType, indxType, offsetType, outType>::
     }
   }
 #endif // CPUINFO_ARCH_X86 || CPUINFO_ARCH_X86_64
+
+#if HAVE_SVE
+  if constexpr (std::is_same<inType, uint8_t>::value) {
+    if (!is_asmjit_disabled()) {
+      if (no_bag) {
+        return [=](int64_t output_size,
+                   int64_t index_size,
+                   int64_t data_size,
+                   const uint8_t* input_u8,
+                   const indxType* indices,
+                   const offsetType* offsets_or_lengths,
+                   const float*
+                       weights, // optional, can be null for non-weighted sum
+                   outType* out) {
+          return internal::
+              EmbeddingSpMDM8Bit_Sve<indxType, offsetType, outType, true, true>(
+                  block_size,
+                  output_size,
+                  index_size,
+                  data_size,
+                  input_u8,
+                  indices,
+                  offsets_or_lengths,
+                  weights,
+                  normalize_by_lengths,
+                  out,
+                  is_weight_positional,
+                  use_offsets,
+                  output_stride,
+                  input_stride,
+                  scale_bias_last,
+                  is_bf16_out);
+        };
+      } else {
+        return [=](int64_t output_size,
+                   int64_t index_size,
+                   int64_t data_size,
+                   const uint8_t* input_u8,
+                   const indxType* indices,
+                   const offsetType* offsets_or_lengths,
+                   const float* weights, // optional, can be null for
+                                         // non-weighted sum
+                   outType* out) {
+          return internal::EmbeddingSpMDM8Bit_Sve<
+              indxType,
+              offsetType,
+              outType,
+              false,
+              true>(
+              block_size,
+              output_size,
+              index_size,
+              data_size,
+              input_u8,
+              indices,
+              offsets_or_lengths,
+              weights,
+              normalize_by_lengths,
+              out,
+              is_weight_positional,
+              use_offsets,
+              output_stride,
+              input_stride,
+              scale_bias_last,
+              is_bf16_out);
+        };
+      };
+    }
+  }
+#endif
 
 #ifdef FBGEMM_AUTOVEC_AVAILABLE
   if (!cpuinfo_initialize()) {
@@ -1341,9 +1369,9 @@ typename EmbeddingSpMDMRowWiseSparseKernelSignature<
     offsetType>::Type
 GenerateEmbeddingSpMDMRowWiseSparse(
     const int64_t block_size,
-    bool has_weight,
+    bool has_weight [[maybe_unused]],
     bool normalize_by_lengths,
-    int prefetch,
+    int prefetch [[maybe_unused]],
     bool is_weight_positional,
     bool use_offsets) {
 #if CPUINFO_ARCH_X86 || CPUINFO_ARCH_X86_64

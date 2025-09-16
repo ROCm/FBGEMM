@@ -35,10 +35,15 @@ void DramKVEmbeddingInferenceWrapper::init(
       static_cast<fbgemm_gpu::SparseType>(std::get<2>(specs[0])),
       static_cast<int32_t>(row_alignment),
       static_cast<int32_t>(scale_bias_size_in_bytes));
+  LOG(INFO) << "Initialize dram_kv with max_D: " << max_D
+            << ", sparse_type: " << std::get<2>(specs[0])
+            << ", row_alignment: " << row_alignment
+            << ", scale_bias_size_in_bytes: " << scale_bias_size_in_bytes
+            << ", max_row_bytes_: " << max_row_bytes_;
   if (dram_kv_ != nullptr) {
     return;
   }
-  dram_kv_ = std::make_shared<kv_mem::DramKVEmbeddingCache<uint8_t>>(
+  dram_kv_ = std::make_shared<kv_mem::DramKVInferenceEmbedding<uint8_t>>(
       max_row_bytes_,
       uniform_init_lower_,
       uniform_init_upper_,
@@ -50,28 +55,32 @@ void DramKVEmbeddingInferenceWrapper::init(
           std::nullopt /* ttls_in_mins */,
           std::nullopt /* counter_thresholds */,
           std::nullopt /* counter_decay_rates */,
+          std::nullopt /* feature_score_counter_decay_rates */,
+          std::nullopt /* max_training_id_num_per_table */,
+          std::nullopt /* target_eviction_percent_per_table */,
           std::nullopt /* l2_weight_thresholds */,
           std::nullopt /* embedding_dims */,
+          std::nullopt /* threshold_calculation_bucket_stride */,
+          std::nullopt /* threshold_calculation_bucket_num */,
           0 /* interval for insufficient eviction s*/,
-          0 /* interval for sufficient eviction s*/),
+          0 /* interval for sufficient eviction s*/,
+          0 /* interval_for_feature_statistics_decay_s_*/),
       num_shards_ /* num_shards */,
       num_shards_ /* num_threads */,
       8 /* row_storage_bitwidth */,
-      false, /* backend_return_whole_row */
       false /* enable_async_update */,
       std::nullopt /* table_dims */,
-      hash_size_cumsum,
-      false /* is_training */);
+      hash_size_cumsum);
   return;
 }
 
-std::shared_ptr<kv_mem::DramKVEmbeddingCache<uint8_t>>
+std::shared_ptr<kv_mem::DramKVInferenceEmbedding<uint8_t>>
 DramKVEmbeddingInferenceWrapper::get_dram_kv() {
   return dram_kv_;
 }
 
 void DramKVEmbeddingInferenceWrapper::set_dram_kv(
-    std::shared_ptr<kv_mem::DramKVEmbeddingCache<uint8_t>> dram_kv) {
+    std::shared_ptr<kv_mem::DramKVInferenceEmbedding<uint8_t>> dram_kv) {
   dram_kv_ = std::move(dram_kv);
 }
 

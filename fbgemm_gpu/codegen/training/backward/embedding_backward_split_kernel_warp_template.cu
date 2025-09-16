@@ -137,7 +137,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
@@ -436,7 +436,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
     const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args_no_defaults |
@@ -451,7 +451,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
 
 {%- macro bulk_template_instantiations(kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking) %}
     {%- for grad_type in ['float', 'at::Half', 'at::BFloat16'] %}
-    {%- for emb_type in ['float', 'at::Half'] %}
+    {%- for emb_type in (['float', 'at::Half'] + (['at::Float8_e4m3fnuz'] if is_rocm else ['at::Float8_e4m3fn'])) %}
     {%- for cache_type in ['float', 'at::Half'] %}
     {%- for index_type in ['int32_t', 'int64_t'] %}
     {%- for ph_type_combo in args.placeholder_type_combos %}
@@ -606,7 +606,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     const int32_t max_D,
     const int32_t max_vecs_per_thread,
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
@@ -771,7 +771,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     const int32_t max_D,
     const int32_t max_vecs_per_thread,
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args_no_defaults | replace_pta_namespace() | join(",\n    ") | replace("cache_t", cache_type) }}
@@ -781,7 +781,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
 
 {%- macro hip_bulk_template_instantiations(kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking) %}
     {%- for grad_type in ['float', 'at::Half', 'at::BFloat16'] %}
-    {%- for emb_type in ['float', 'at::Half'] %}
+    {%- for emb_type in (['float', 'at::Half'] + (['at::Float8_e4m3fnuz'] if is_rocm else ['at::Float8_e4m3fn'])) %}
     {%- for cache_type in ['float', 'at::Half'] %}
     {%- for index_type in ['int32_t', 'int64_t'] %}
     {%- for kEmbeddingDim in [64, 128, 160, 192, 256] %}
