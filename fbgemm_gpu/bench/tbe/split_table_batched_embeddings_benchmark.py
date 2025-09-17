@@ -1158,28 +1158,28 @@ def device_with_spec(  # noqa C901
         f"Accessed weights per batch: {B * sum_DLs * param_size_multiplier / 1.0e9: .2f} GB"
     )
 
-    # forward
-    time_per_iter = benchmark_requests(
-        requests,
-        lambda indices, offsets, per_sample_weights: emb.forward(
-            indices,
-            offsets,
-            per_sample_weights,
-            feature_requires_grad=feature_requires_grad,
-        ),
-        flush_gpu_cache_size_mb=flush_gpu_cache_size_mb,
-        num_warmups=warmup_runs,
-    )
-    logging.info(
-        f"Forward, B: {B}, "
-        f"Es: {Es}, T: {T}, Ds: {Ds}, Ls: {Ls_str}, W: {weighted}, "
-        f"BW: {read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "  # noqa: B950
-        f"T: {time_per_iter * 1.0e6:.0f}us"
-    )
+    # # forward
+    # time_per_iter = benchmark_requests(
+    #     requests,
+    #     lambda indices, offsets, per_sample_weights: emb.forward(
+    #         indices,
+    #         offsets,
+    #         per_sample_weights,
+    #         feature_requires_grad=feature_requires_grad,
+    #     ),
+    #     flush_gpu_cache_size_mb=flush_gpu_cache_size_mb,
+    #     num_warmups=warmup_runs,
+    # )
+    # logging.info(
+    #     f"Forward, B: {B}, "
+    #     f"Es: {Es}, T: {T}, Ds: {Ds}, Ls: {Ls_str}, W: {weighted}, "
+    #     f"BW: {read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "  # noqa: B950
+    #     f"T: {time_per_iter * 1.0e6:.0f}us"
+    # )
 
-    if output_dtype == SparseType.INT8:
-        # backward bench not representative
-        return
+    # if output_dtype == SparseType.INT8:
+    #     # backward bench not representative
+    #     return
 
     if do_pooling:
         grad_output = torch.randn(B, sum(Ds)).to(get_device())

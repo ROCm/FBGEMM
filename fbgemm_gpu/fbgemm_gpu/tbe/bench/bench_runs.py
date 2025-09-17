@@ -12,6 +12,9 @@ import threading
 import time
 from subprocess import Popen
 from typing import Callable, List, Optional, Tuple
+import roctx
+# from roctx.context_decorators import RoctxRange
+# from roctx.context_decorators import RoctxProfiler
 
 import torch
 
@@ -224,6 +227,8 @@ def benchmark_requests(  # noqa: C901
     if warmup_ms is None:
         num_warmups = num_warmups + 1 if num_warmups >= 0 else 1
 
+    tid = roctx.getThreadId()
+    roctx.profilerPause(tid)
     # warm-up the GPU before profiling
     bench_warmup(
         requests[0],
@@ -241,6 +246,7 @@ def benchmark_requests(  # noqa: C901
 
     if callback_after_warmup is not None:
         callback_after_warmup()
+    roctx.profilerResume(tid)
 
     num_reqs = len(requests)
     iters = num_reqs if iters == -1 else iters
@@ -259,7 +265,11 @@ def benchmark_requests(  # noqa: C901
         indices, offsets, weights = req.unpack_3()
         if bwd_only:
             # Run forward before profiling if does backward only
+            tid = roctx.getThreadId()
+            roctx.profilerPause(tid)
+            # fwd kernel should be hidden by profiling tool
             out = func(indices, offsets, weights)
+            roctx.profilerResume(tid)
         start_time = time.time()
         if torch.cuda.is_available():
             if flush_gpu_cache_size_mb:
