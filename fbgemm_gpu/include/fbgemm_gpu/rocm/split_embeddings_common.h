@@ -275,15 +275,27 @@ struct accumulate_row_per_warp {
         acc[i] += static_cast<output_t>(emb_data[i]);
       }
     } else {
-#pragma unroll
-      for (int i = 0; i < dword_per_row; i++) {
-        if constexpr (std::is_same_v<emb_t, c10::Half>)
-        {
-          acc[i] += static_cast<output_t>(__half2float(emb_data[i]) * row_weight);
+      if constexpr ((dword_per_row % 2) == 0 && std::is_same_v<emb_t, c10::Half>) { // unroll 2 times
+        for (int i = 0; i < dword_per_row; i += 2) {
+          __half2 h2 = *(reinterpret_cast<__half2*>(emb_data + i));
+          asm volatile(
+             "v_fma_mix_f32 %[acc0], %[h2], %[row_weight], %[acc0] op_sel:[0,0,0] op_sel_hi:[1,0,0];\n\t"
+             "v_fma_mix_f32 %[acc1], %[h2], %[row_weight], %[acc1] op_sel:[1,0,0] op_sel_hi:[1,0,0];\n\t"
+             :[acc0]"=v"(acc[i]), [acc1]"=v"(acc[i + 1])
+             :[h2]"v"(h2), [row_weight]"v"(row_weight)
+             : "memory");
         }
-        else
-        {
-          acc[i] += static_cast<output_t>(static_cast<float>(emb_data[i]) * row_weight);
+      } else {
+#pragma unroll
+        for (int i = 0; i < dword_per_row; i++) {
+          if constexpr (std::is_same_v<emb_t, c10::Half>)
+          {
+            acc[i] += static_cast<output_t>(__half2float(emb_data[i]) * row_weight);
+          }
+          else
+          {
+            acc[i] += static_cast<output_t>(static_cast<float>(emb_data[i]) * row_weight);
+          }
         }
       }
     }
