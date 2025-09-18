@@ -24,7 +24,6 @@
 #include <c10/util/Half.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <iostream>
 /******************************************************************************/
 typedef int32_t int32x4_t __attribute__((ext_vector_type(4)));
 typedef float floatx2_t __attribute__((ext_vector_type(2)));
