@@ -24,7 +24,7 @@
 #include <c10/util/Half.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-
+#include <iostream>
 /******************************************************************************/
 typedef int32_t int32x4_t __attribute__((ext_vector_type(4)));
 typedef float floatx2_t __attribute__((ext_vector_type(2)));
@@ -303,6 +303,14 @@ struct store_row_per_warp<c10::Half, 256, c10::Half> {
   }
 };
 
+template <>
+struct store_row_per_warp<c10::Half, 192, c10::Half> {
+  static __device__ void run(c10::Half* acc, c10::Half* p_output, int lane_id) {
+    auto out = reinterpret_cast<half2*>(p_output);
+    out[lane_id] = *reinterpret_cast<half2*>(acc);
+    *(reinterpret_cast<half*>(&out[64]) + lane_id) = *reinterpret_cast<half*>(acc + 2);
+  }
+};
 
 template <>
 struct store_row_per_warp<half, 128, float> {
@@ -348,6 +356,7 @@ struct store_row_per_warp<half, 192, float> {
         acc[2], out_res, (lane_id + 128) * sizeof(float), 0, 0);
   }
 };
+
 
 template <>
 struct store_row_per_warp<half, 256, float> {
