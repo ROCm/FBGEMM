@@ -320,6 +320,15 @@ struct store_row_per_warp<c10::Half, 256, c10::Half> {
 };
 
 template <>
+struct store_row_per_warp<c10::Half, 192, c10::Half> {
+  static __device__ void run(c10::Half* acc, c10::Half* p_output, int lane_id) {
+    auto out = reinterpret_cast<half2*>(p_output);
+    out[lane_id] = *reinterpret_cast<half2*>(acc);
+    *(reinterpret_cast<half*>(&out[64]) + lane_id) = *reinterpret_cast<half*>(acc + 2);
+  }
+};
+
+template <>
 struct store_row_per_warp<c10::Half, 320, c10::Half> {
   static __device__ void run(c10::Half* acc, c10::Half* p_output, int lane_id) {
     auto out = reinterpret_cast<half2*>(p_output);
