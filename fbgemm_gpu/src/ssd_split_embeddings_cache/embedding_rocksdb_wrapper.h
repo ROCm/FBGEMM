@@ -44,7 +44,8 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
       const std::vector<int64_t>& table_sizes = {},
       std::optional<at::Tensor> table_dims = std::nullopt,
       std::optional<at::Tensor> hash_size_cumsum = std::nullopt,
-      int64_t flushing_block_size = 2000000000 /*2GB*/)
+      int64_t flushing_block_size = 2000000000 /*2GB*/,
+      bool disable_random_init = false)
       : impl_(std::make_shared<ssd::EmbeddingRocksDB>(
             path,
             num_shards,
@@ -74,7 +75,8 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
             table_sizes,
             table_dims,
             hash_size_cumsum,
-            flushing_block_size)) {}
+            flushing_block_size,
+            disable_random_init)) {}
 
   void set_cuda(
       at::Tensor indices,
@@ -91,6 +93,14 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
       const at::Tensor& count,
       bool blocking_tensor_copy = true) {
     return impl_->stream_cuda(indices, weights, count, blocking_tensor_copy);
+  }
+
+  void set_feature_score_metadata_cuda(
+      const at::Tensor& indices,
+      const at::Tensor& count,
+      const at::Tensor& engage_show_count) {
+    LOG(INFO) << "set_feature_score_metadata_cuda";
+    impl_->set_feature_score_metadata_cuda(indices, count, engage_show_count);
   }
 
   void stream_sync_cuda() {
@@ -210,14 +220,14 @@ class EmbeddingRocksDBWrapper : public torch::jit::CustomClassHolder {
     impl_->create_checkpoint(global_step);
   }
 
-  c10::intrusive_ptr<RocksdbCheckpointHandleWrapper> get_active_checkpoint_uuid(
-      int64_t global_step) {
+  std::optional<c10::intrusive_ptr<RocksdbCheckpointHandleWrapper>>
+  get_active_checkpoint_uuid(int64_t global_step) {
     auto uuid_opt = impl_->get_active_checkpoint_uuid(global_step);
     if (uuid_opt.has_value()) {
       return c10::make_intrusive<RocksdbCheckpointHandleWrapper>(
           uuid_opt.value(), impl_);
     } else {
-      return nullptr;
+      return std::nullopt;
     }
   }
 

@@ -26,16 +26,35 @@ ALL_TARGETS = [TARGET_DEFAULT, TARGET_GENAI, TARGET_HSTU]
 VARIANT_CPU = "cpu"
 VARIANT_CUDA = "cuda"
 VARIANT_ROCM = "rocm"
+ALL_VARIANTS = [VARIANT_CPU, VARIANT_CUDA, VARIANT_ROCM]
 
 JOBTYPE_BUILD = "build"
 JOBTYPE_TEST = "test"
+JOBTYPE_INSTALL = "install"
+ALL_JOB_TYPES = [JOBTYPE_BUILD, JOBTYPE_TEST, JOBTYPE_INSTALL]
 
 REPO_OWNER_PYTORCH = "pytorch"
 REPO_OWNER_FACEBOOKRESEARCH = "facebookresearch"
 ALL_REPO_OWNERS = [REPO_OWNER_PYTORCH, REPO_OWNER_FACEBOOKRESEARCH]
 
+REFS_MAIN = "refs/heads/main"
+
+EVENT_NAME_PUSH = "push"
+
 
 class GitRepo:
+    @classmethod
+    def ref(cls) -> str:
+        ref_ = os.getenv("GITHUB_REF") or ""
+        logging.debug(f"Fetched git ref: {ref_}")
+        return ref_
+
+    @classmethod
+    def event_name(cls) -> str:
+        event_name = os.getenv("GITHUB_EVENT_NAME") or ""
+        logging.debug(f"Fetched git event name: {event_name}")
+        return event_name
+
     @classmethod
     def is_pr_merge_ref(cls) -> bool:
         """
@@ -43,9 +62,7 @@ class GitRepo:
         """
 
         try:
-            ref = os.getenv("GITHUB_REF") or ""
-            logging.debug(f"Fetched git ref: {ref}")
-            return re.match(r"^refs/pull/\d+/merge$", ref) is not None
+            return re.match(r"^refs/pull/\d+/merge$", cls.ref()) is not None
 
         except Exception as e:
             logging.error(f"Error fetching git ref: {e}")
@@ -156,13 +173,13 @@ class BuildConfigScheme:
         parser.add_argument(
             "--variant",
             required=True,
-            choices=[VARIANT_CPU, VARIANT_CUDA, VARIANT_ROCM],
+            choices=ALL_VARIANTS,
             help="Build variant: cpu, cuda, or rocm",
         )
         parser.add_argument(
             "--jobtype",
             required=True,
-            choices=[JOBTYPE_BUILD, JOBTYPE_TEST],
+            choices=ALL_JOB_TYPES,
             help="Job type",
         )
         parser.add_argument(
@@ -241,9 +258,9 @@ class BuildConfigScheme:
         """
         if self.target not in ALL_TARGETS:
             raise ValueError(f"Invalid target: {self.target}")
-        if self.variant not in [VARIANT_CPU, VARIANT_CUDA, VARIANT_ROCM]:
+        if self.variant not in ALL_VARIANTS:
             raise ValueError(f"Invalid variant: {self.variant}")
-        if self.jobtype not in [JOBTYPE_BUILD, JOBTYPE_TEST]:
+        if self.jobtype not in ALL_JOB_TYPES:
             raise ValueError(f"Invalid job type: {self.jobtype}")
 
         if self.target == TARGET_GENAI and self.variant not in [
@@ -257,6 +274,8 @@ class BuildConfigScheme:
         return self
 
     def python_versions(self) -> List[str]:
+        if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
+            return ["3.13"]
         if self.repo_owner != REPO_OWNER_PYTORCH:
             return ["3.13"]
         if self.target == TARGET_HSTU:
@@ -267,6 +286,8 @@ class BuildConfigScheme:
         return ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     def compilers(self) -> List[str]:
+        if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
+            return ["gcc"]
         if self.repo_owner != REPO_OWNER_PYTORCH:
             return ["gcc"]
         if self.target == TARGET_HSTU:
@@ -275,17 +296,24 @@ class BuildConfigScheme:
             return ["gcc", "clang"]
 
     def cuda_versions(self) -> List[str]:
+        if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
+            return ["12.9.1"]
         if self.repo_owner != REPO_OWNER_PYTORCH:
             return ["12.9.1"]
         if self.target == TARGET_HSTU:
             # FBGEMM HSTU is expensive, so conserve CI resources
             return ["12.9.1"]
+        elif self.target == TARGET_GENAI:
+            return ["12.6.3", "12.8.1", "12.9.1", "13.0.0"]
         else:
             # GenAI is unable to support 11.8.0 anymore as of https://github.com/pytorch/FBGEMM/pull/4138
             return ["12.6.3", "12.8.1", "12.9.1"]
 
     def rocm_versions(self) -> List[str]:
-        return ["6.3", "6.4"]
+        if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
+            return ["6.4"]
+        else:
+            return ["6.3", "6.4"]
 
     def host_machines(self) -> List[Dict[str, str]]:
         # For the list of available instance types:
@@ -329,11 +357,14 @@ class BuildConfigScheme:
     def generate(self) -> List[Dict[str, Any]]:
         # Build a table of dimensions to values for each dimension
         table: Dict[str, List[Any]] = {
-            "compiler": self.compilers(),
             "python-version": self.python_versions(),
             "host-machine": self.host_machines(),
             "build-target": [self.target],
         }
+
+        if self.jobtype != JOBTYPE_INSTALL:
+            # The choice of compiler irrelevant for package installation tetss
+            table |= {"compiler": self.compilers()}
 
         if self.variant == VARIANT_CUDA:
             table |= {"cuda-version": self.cuda_versions()}

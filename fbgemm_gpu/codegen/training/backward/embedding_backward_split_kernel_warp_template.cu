@@ -145,7 +145,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
@@ -444,7 +444,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
     const bool enable_optimizer_offloading,
     {%- endif %}
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args_no_defaults |
@@ -614,7 +614,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     const int32_t max_D,
     const int32_t max_vecs_per_thread,
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
@@ -753,7 +753,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     const int32_t max_D,
     const int32_t max_vecs_per_thread,
     {%- if is_index_select %}
-    const at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
     const bool permute_output_dim_0_1
     {%- else %}
     {{ args.split_kernel_args_no_defaults | replace_pta_namespace() | join(",\n    ") | replace("cache_t", cache_type) }}

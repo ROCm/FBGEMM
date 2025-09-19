@@ -208,6 +208,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self.backend_type = backend_type
         self.enable_optimizer_offloading: bool = False
         self.backend_return_whole_row: bool = False
+        self._embedding_cache_mode: bool = False
         if self.kv_zch_params:
             self.kv_zch_params.validate()
             self.enable_optimizer_offloading = (
@@ -228,6 +229,13 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 logging.info(
                     "Backend will return whole row including metaheader, weight and optimizer for checkpoint"
                 )
+            # pyre-ignore [16]
+            self._embedding_cache_mode = self.kv_zch_params.embedding_cache_mode
+            if self._embedding_cache_mode:
+                logging.info("KVZCH is in embedding_cache_mode")
+                assert self.optimizer in [
+                    OptimType.EXACT_ROWWISE_ADAGRAD
+                ], f"only EXACT_ROWWISE_ADAGRAD supports embedding cache mode, but got {self.optimizer}"
 
         self.pooling_mode = pooling_mode
         self.bounds_check_mode_int: int = bounds_check_mode.value
@@ -554,6 +562,8 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self._cached_kvzch_data: Optional[KVZCHCachedData] = None
         # initial embedding rows on this rank per table, this is used for loading checkpoint
         self.local_weight_counts: List[int] = [0] * T_
+        # groundtruth global id on this rank per table, this is used for loading checkpoint
+        self.global_id_per_rank: List[torch.Tensor] = [torch.zeros(0)] * T_
         # loading checkpoint flag, set by checkpoint loader, and cleared after weight is applied to backend
         self.load_state_dict: bool = False
 
@@ -629,6 +639,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     else None
                 ),
                 flushing_block_size,
+                self._embedding_cache_mode,  # disable_random_init
             )
             if self.bulk_init_chunk_size > 0:
                 self.ssd_uniform_init_lower: float = ssd_uniform_init_lower
@@ -677,18 +688,25 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     if self.kv_zch_params.eviction_policy.eviction_mem_threshold_gb
                     else self.l2_cache_size
                 )
+                # Please refer to https://fburl.com/gdoc/nuupjwqq for the following eviction parameters.
                 eviction_config = torch.classes.fbgemm.FeatureEvictConfig(
                     self.kv_zch_params.eviction_policy.eviction_trigger_mode,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual
-                    self.kv_zch_params.eviction_policy.eviction_strategy,  # evict_trigger_strategy: 0: timestamp, 1: counter (feature score), 2: counter (feature score) + timestamp, 3: feature l2 norm
+                    self.kv_zch_params.eviction_policy.eviction_strategy,  # evict_trigger_strategy: 0: timestamp, 1: counter, 2: counter + timestamp, 3: feature l2 norm, 4: timestamp threshold 5: feature score
                     self.kv_zch_params.eviction_policy.eviction_step_intervals,  # trigger_step_interval if trigger mode is iteration
                     eviction_mem_threshold_gb,  # mem_util_threshold_in_GB if trigger mode is mem_util
                     self.kv_zch_params.eviction_policy.ttls_in_mins,  # ttls_in_mins for each table if eviction strategy is timestamp
-                    self.kv_zch_params.eviction_policy.counter_thresholds,  # counter_thresholds for each table if eviction strategy is feature score
-                    self.kv_zch_params.eviction_policy.counter_decay_rates,  # counter_decay_rates for each table if eviction strategy is feature score
+                    self.kv_zch_params.eviction_policy.counter_thresholds,  # counter_thresholds for each table if eviction strategy is counter
+                    self.kv_zch_params.eviction_policy.counter_decay_rates,  # counter_decay_rates for each table if eviction strategy is counter
+                    self.kv_zch_params.eviction_policy.feature_score_counter_decay_rates,  # feature_score_counter_decay_rates for each table if eviction strategy is feature score
+                    self.kv_zch_params.eviction_policy.max_training_id_num_per_table,  # max_training_id_num for each table
+                    self.kv_zch_params.eviction_policy.target_eviction_percent_per_table,  # target_eviction_percent for each table
                     self.kv_zch_params.eviction_policy.l2_weight_thresholds,  # l2_weight_thresholds for each table if eviction strategy is feature l2 norm
                     table_dims.tolist() if table_dims is not None else None,
+                    self.kv_zch_params.eviction_policy.threshold_calculation_bucket_stride,  # threshold_calculation_bucket_stride if eviction strategy is feature score
+                    self.kv_zch_params.eviction_policy.threshold_calculation_bucket_num,  # threshold_calculation_bucket_num if eviction strategy is feature score
                     self.kv_zch_params.eviction_policy.interval_for_insufficient_eviction_s,
                     self.kv_zch_params.eviction_policy.interval_for_sufficient_eviction_s,
+                    self.kv_zch_params.eviction_policy.interval_for_feature_statistics_decay_s,
                 )
             self._ssd_db = torch.classes.fbgemm.DramKVEmbeddingCacheWrapper(
                 self.cache_row_dim,
@@ -705,6 +723,8 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     else None
                 ),  # hash_size_cumsum
                 self.backend_return_whole_row,  # backend_return_whole_row
+                False,  # enable_async_update
+                self._embedding_cache_mode,  # disable_random_init
             )
         else:
             raise AssertionError(f"Invalid backend type {self.backend_type}")
@@ -726,6 +746,17 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self.ssd_event_backward = torch.cuda.Event()
         # SSD get's input copy completion event
         self.ssd_event_get_inputs_cpy = torch.cuda.Event()
+        if self._embedding_cache_mode:
+            # Direct write embedding completion event
+            self.direct_write_l1_complete_event: torch.cuda.streams.Event = (
+                torch.cuda.Event()
+            )
+            self.direct_write_sp_complete_event: torch.cuda.streams.Event = (
+                torch.cuda.Event()
+            )
+        # Prefetch operation completion event
+        self.prefetch_complete_event = torch.cuda.Event()
+
         if self.prefetch_pipeline:
             # SSD scratch pad index queue insert completion event
             self.ssd_event_sp_idxq_insert: torch.cuda.streams.Event = torch.cuda.Event()
@@ -960,6 +991,10 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self.dram_kv_allocated_bytes_stats_name: str = (
             f"dram_kv.mem.tbe_id{tbe_unique_id}.allocated_bytes"
         )
+        self.dram_kv_mem_num_rows_stats_name: str = (
+            f"dram_kv.mem.tbe_id{tbe_unique_id}.num_rows"
+        )
+
         self.eviction_sum_evicted_counts_stats_name: str = (
             f"eviction.tbe_id.{tbe_unique_id}.sum_evicted_counts"
         )
@@ -997,6 +1032,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             self.stats_reporter.register_stats(
                 self.dram_kv_actual_used_chunk_bytes_stats_name
             )
+            self.stats_reporter.register_stats(self.dram_kv_mem_num_rows_stats_name)
             self.stats_reporter.register_stats(
                 self.eviction_sum_evicted_counts_stats_name
             )
@@ -1012,6 +1048,9 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     f"eviction.feature_table.{t}.processed_counts"
                 )
                 self.stats_reporter.register_stats(
+                    f"eviction.feature_table.{t}.eviction_threshold_with_dry_run"
+                )
+                self.stats_reporter.register_stats(
                     f"eviction.feature_table.{t}.evict_rate"
                 )
             self.stats_reporter.register_stats(
@@ -1019,6 +1058,9 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             )
             self.stats_reporter.register_stats(
                 "eviction.feature_table.exec_duration_ms"
+            )
+            self.stats_reporter.register_stats(
+                "eviction.feature_table.dry_run_exec_duration_ms"
             )
             self.stats_reporter.register_stats(
                 "eviction.feature_table.exec_div_full_duration_rate"
@@ -1325,6 +1367,8 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         Returns:
             None
         """
+        if not self.training:  # if not training, freeze the embedding
+            return
         with record_function(f"## ssd_evict_{name} ##"):
             with torch.cuda.stream(stream):
                 if pre_event is not None:
@@ -1337,7 +1381,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 self.record_function_via_dummy_profile(
                     f"## ssd_set_{name} ##",
                     self.ssd_db.set_cuda,
-                    indices_cpu.cpu(),
+                    indices_cpu,
                     rows_cpu,
                     actions_count_cpu,
                     self.timestep,
@@ -1607,6 +1651,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self,
         indices: Tensor,
         offsets: Tensor,
+        weights: Optional[Tensor] = None,  # todo: need to update caller
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
     ) -> None:
@@ -1632,6 +1677,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self._prefetch(
             indices,
             offsets,
+            weights,
             vbe_metadata,
             forward_stream,
         )
@@ -1640,11 +1686,17 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self,
         indices: Tensor,
         offsets: Tensor,
+        weights: Optional[Tensor] = None,
         vbe_metadata: Optional[invokers.lookup_args.VBEMetadata] = None,
         forward_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        # TODO: Refactor prefetch
+        # Wait for any ongoing direct_write_embedding operations to complete
+        # Moving this from forward() to _prefetch() is more logical as direct_write
+        # operations affect the same cache structures that prefetch interacts with
         current_stream = torch.cuda.current_stream()
+        if self._embedding_cache_mode:
+            current_stream.wait_event(self.direct_write_l1_complete_event)
+            current_stream.wait_event(self.direct_write_sp_complete_event)
 
         B_offsets = None
         max_B = -1
@@ -1667,6 +1719,12 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
 
             self.timestep += 1
             self.timesteps_prefetched.append(self.timestep)
+            if self.backend_type == BackendType.DRAM and weights is not None:
+                # DRAM backend supports feature score eviction, if there is weights available
+                # in the prefetch call, we will set metadata for feature score eviction asynchronously
+                cloned_linear_cache_indices = linear_cache_indices.clone()
+            else:
+                cloned_linear_cache_indices = None
 
             # Lookup and virtually insert indices into L1. After this operator,
             # we know:
@@ -2008,21 +2066,33 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 use_pipeline=self.prefetch_pipeline,
             )
 
-            if linear_cache_indices.numel() > 0:
-                # Evict rows from cache to SSD
-                self.evict(
-                    rows=self.lxu_cache_evicted_weights,
-                    indices_cpu=self.lxu_cache_evicted_indices,
-                    actions_count_cpu=self.lxu_cache_evicted_count,
-                    stream=self.ssd_eviction_stream,
-                    pre_event=self.ssd_event_get,
-                    # Record completion event after scratch pad eviction
-                    # instead since that happens after L1 eviction
-                    post_event=self.ssd_event_cache_evict,
-                    is_rows_uvm=True,
-                    name="cache",
-                    is_bwd=False,
-                )
+            if self.training:
+                if linear_cache_indices.numel() > 0:
+                    # Evict rows from cache to SSD
+                    self.evict(
+                        rows=self.lxu_cache_evicted_weights,
+                        indices_cpu=self.lxu_cache_evicted_indices,
+                        actions_count_cpu=self.lxu_cache_evicted_count,
+                        stream=self.ssd_eviction_stream,
+                        pre_event=self.ssd_event_get,
+                        # Record completion event after scratch pad eviction
+                        # instead since that happens after L1 eviction
+                        post_event=self.ssd_event_cache_evict,
+                        is_rows_uvm=True,
+                        name="cache",
+                        is_bwd=False,
+                    )
+                if self.backend_type == BackendType.DRAM and weights is not None:
+                    # Write feature score metadata to DRAM
+                    self.record_function_via_dummy_profile(
+                        "## ssd_write_feature_score_metadata ##",
+                        self.ssd_db.set_feature_score_metadata_cuda,
+                        cloned_linear_cache_indices.cpu(),
+                        torch.tensor(
+                            [weights.shape[0]], device="cpu", dtype=torch.long
+                        ),
+                        weights.cpu().view(torch.float32).view(-1, 2),
+                    )
 
             # Generate row addresses (pointing to either L1 or the current
             # iteration's scratch pad)
@@ -2104,18 +2174,24 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     )
                 )
 
-            # Store scratch pad info for post backward eviction
-            self.ssd_scratch_pad_eviction_data.append(
-                (
-                    inserted_rows,
-                    post_bwd_evicted_indices_cpu,
-                    actions_count_cpu,
-                    linear_cache_indices.numel() > 0,
+            # Store scratch pad info for post backward eviction only for training
+            # for eval job, no backward pass, so no need to store this info
+            if self.training and not self._embedding_cache_mode:
+                self.ssd_scratch_pad_eviction_data.append(
+                    (
+                        inserted_rows,
+                        post_bwd_evicted_indices_cpu,
+                        actions_count_cpu,
+                        linear_cache_indices.numel() > 0,
+                    )
                 )
-            )
 
             # Store data for forward
             self.ssd_prefetch_data.append(prefetch_data)
+
+            # Record an event to mark the completion of prefetch operations
+            # This will be used by direct_write_embedding to ensure it doesn't run concurrently with prefetch
+            current_stream.record_event(self.prefetch_complete_event)
 
     @torch.jit.ignore
     def _generate_vbe_metadata(
@@ -2166,6 +2242,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self,
         indices: Tensor,
         offsets: Tensor,
+        weights: Optional[Tensor] = None,
         per_sample_weights: Optional[Tensor] = None,
         feature_requires_grad: Optional[Tensor] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
@@ -2187,7 +2264,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 context=self.step,
                 stream=self.ssd_eviction_stream,
             ):
-                self._prefetch(indices, offsets, vbe_metadata)
+                self._prefetch(indices, offsets, weights, vbe_metadata)
 
         assert len(self.ssd_prefetch_data) > 0
 
@@ -3041,16 +3118,26 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     logging.info(
                         f"before weight PMT loading, resetting id tensor with {self.local_weight_counts[i]}"
                     )
-                    bucket_ascending_id_tensor = torch.zeros(
-                        (self.local_weight_counts[i], 1),
-                        device=torch.device("cpu"),
-                        dtype=torch.int64,
-                    )
+                    if self.global_id_per_rank[i].numel() != 0:
+                        assert (
+                            self.local_weight_counts[i]
+                            == self.global_id_per_rank[i].numel()
+                        ), f"local weight count and global id per rank size mismatch, with {self.local_weight_counts[i]} and {self.global_id_per_rank[i].numel()}"
+                        bucket_ascending_id_tensor = self.global_id_per_rank[i].to(
+                            device=torch.device("cpu"), dtype=torch.int64
+                        )
+                    else:
+                        bucket_ascending_id_tensor = torch.zeros(
+                            (self.local_weight_counts[i], 1),
+                            device=torch.device("cpu"),
+                            dtype=torch.int64,
+                        )
                     metadata_tensor = torch.zeros(
                         (self.local_weight_counts[i], 1),
                         device=torch.device("cpu"),
                         dtype=torch.int64,
                     )
+
                     # self.local_weight_counts[i] = 0  # Reset the count
 
                 # pyre-ignore [16] bucket_sorted_id_splits is not None
@@ -3411,6 +3498,10 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
     def flush(self, force: bool = False) -> None:
         # allow force flush from split_embedding_weights to cover edge cases, e.g. checkpointing
         # after trained 0 batches
+        if not self.training:
+            # for eval mode, we should not write anything to embedding
+            return
+
         if self.step == self.last_flush_step and not force:
             logging.info(
                 f"SSD TBE has been flushed at {self.last_flush_step=} already for tbe:{self.tbe_unique_id}"
@@ -3790,21 +3881,28 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         T = len(set(self.feature_table_map))
         evicted_counts = torch.zeros(T, dtype=torch.int64)
         processed_counts = torch.zeros(T, dtype=torch.int64)
+        eviction_threshold_with_dry_run = torch.zeros(T, dtype=torch.float)
         full_duration_ms = torch.tensor(0, dtype=torch.int64)
         exec_duration_ms = torch.tensor(0, dtype=torch.int64)
         self.ssd_db.get_feature_evict_metric(
-            evicted_counts, processed_counts, full_duration_ms, exec_duration_ms
+            evicted_counts,
+            processed_counts,
+            eviction_threshold_with_dry_run,
+            full_duration_ms,
+            exec_duration_ms,
         )
 
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name=self.eviction_sum_evicted_counts_stats_name,
             data_bytes=int(evicted_counts.sum().item()),
+            enable_tb_metrics=True,
         )
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name=self.eviction_sum_processed_counts_stats_name,
             data_bytes=int(processed_counts.sum().item()),
+            enable_tb_metrics=True,
         )
         if processed_counts.sum().item() != 0:
             stats_reporter.report_data_amount(
@@ -3813,17 +3911,25 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 data_bytes=int(
                     evicted_counts.sum().item() * 100 / processed_counts.sum().item()
                 ),
+                enable_tb_metrics=True,
             )
         for t in self.feature_table_map:
             stats_reporter.report_data_amount(
                 iteration_step=self.step,
                 event_name=f"eviction.feature_table.{t}.evicted_counts",
                 data_bytes=int(evicted_counts[t].item()),
+                enable_tb_metrics=True,
             )
             stats_reporter.report_data_amount(
                 iteration_step=self.step,
                 event_name=f"eviction.feature_table.{t}.processed_counts",
                 data_bytes=int(processed_counts[t].item()),
+                enable_tb_metrics=True,
+            )
+            stats_reporter.report_data_amount(
+                iteration_step=self.step,
+                event_name=f"eviction.feature_table.{t}.eviction_threshold_with_dry_run",
+                data_bytes=float(eviction_threshold_with_dry_run[t].item()),
             )
             if processed_counts[t].item() != 0:
                 stats_reporter.report_data_amount(
@@ -3832,24 +3938,28 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     data_bytes=int(
                         evicted_counts[t].item() * 100 / processed_counts[t].item()
                     ),
+                    enable_tb_metrics=True,
                 )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="eviction.feature_table.full_duration_ms",
             duration_ms=full_duration_ms.item(),
             time_unit="ms",
+            enable_tb_metrics=True,
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="eviction.feature_table.exec_duration_ms",
             duration_ms=exec_duration_ms.item(),
             time_unit="ms",
+            enable_tb_metrics=True,
         )
         if full_duration_ms.item() != 0:
             stats_reporter.report_data_amount(
                 iteration_step=self.step,
                 event_name="eviction.feature_table.exec_div_full_duration_rate",
                 data_bytes=int(exec_duration_ms.item() * 100 / full_duration_ms.item()),
+                enable_tb_metrics=True,
             )
 
     @torch.jit.ignore
@@ -3869,8 +3979,8 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             self.step, stats_reporter.report_interval  # pyre-ignore
         )
 
-        if len(dram_kv_perf_stats) != 22:
-            logging.error("dram cache perf stats should have 22 elements")
+        if len(dram_kv_perf_stats) != 23:
+            logging.error("dram cache perf stats should have 23 elements")
             return
 
         dram_read_duration = dram_kv_perf_stats[0]
@@ -3898,52 +4008,61 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
 
         dram_kv_allocated_bytes = dram_kv_perf_stats[20]
         dram_kv_actual_used_chunk_bytes = dram_kv_perf_stats[21]
+        dram_kv_num_rows = dram_kv_perf_stats[22]
 
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_duration_us",
             duration_ms=dram_read_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_sharding_duration_us",
             duration_ms=dram_read_sharding_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_cache_hit_copy_duration_us",
             duration_ms=dram_read_cache_hit_copy_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_fill_row_storage_duration_us",
             duration_ms=dram_read_fill_row_storage_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_lookup_cache_duration_us",
             duration_ms=dram_read_lookup_cache_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_acquire_lock_duration_us",
             duration_ms=dram_read_acquire_lock_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name="dram_kv.perf.get.dram_read_missing_load",
+            enable_tb_metrics=True,
             data_bytes=dram_read_missing_load,
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_write_sharing_duration_us",
             duration_ms=dram_write_sharing_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
 
@@ -3951,83 +4070,103 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_duration_us",
             duration_ms=dram_fwd_l1_eviction_write_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_allocate_duration_us",
             duration_ms=dram_fwd_l1_eviction_write_allocate_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_cache_copy_duration_us",
             duration_ms=dram_fwd_l1_eviction_write_cache_copy_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_lookup_cache_duration_us",
             duration_ms=dram_fwd_l1_eviction_write_lookup_cache_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_acquire_lock_duration_us",
             duration_ms=dram_fwd_l1_eviction_write_acquire_lock_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_fwd_l1_eviction_write_missing_load",
             data_bytes=dram_fwd_l1_eviction_write_missing_load,
+            enable_tb_metrics=True,
         )
 
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_duration_us",
             duration_ms=dram_bwd_l1_cnflct_miss_write_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_allocate_duration_us",
             duration_ms=dram_bwd_l1_cnflct_miss_write_allocate_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_cache_copy_duration_us",
             duration_ms=dram_bwd_l1_cnflct_miss_write_cache_copy_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_lookup_cache_duration_us",
             duration_ms=dram_bwd_l1_cnflct_miss_write_lookup_cache_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_duration(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_acquire_lock_duration_us",
             duration_ms=dram_bwd_l1_cnflct_miss_write_acquire_lock_duration,
+            enable_tb_metrics=True,
             time_unit="us",
         )
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name="dram_kv.perf.set.dram_bwd_l1_cnflct_miss_write_missing_load",
             data_bytes=dram_bwd_l1_cnflct_miss_write_missing_load,
+            enable_tb_metrics=True,
         )
 
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name=self.dram_kv_allocated_bytes_stats_name,
             data_bytes=dram_kv_allocated_bytes,
+            enable_tb_metrics=True,
         )
         stats_reporter.report_data_amount(
             iteration_step=self.step,
             event_name=self.dram_kv_actual_used_chunk_bytes_stats_name,
             data_bytes=dram_kv_actual_used_chunk_bytes,
+            enable_tb_metrics=True,
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name=self.dram_kv_mem_num_rows_stats_name,
+            data_bytes=dram_kv_num_rows,
+            enable_tb_metrics=True,
         )
 
     def _recording_to_timer(
@@ -4217,3 +4356,195 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         self.placeholder_autograd_tensor.register_hook(backward_hook)
         for hook in hooks:
             self.placeholder_autograd_tensor.register_hook(hook)
+
+    def set_local_weight_counts_for_table(
+        self, table_idx: int, weight_count: int
+    ) -> None:
+        self.local_weight_counts[table_idx] = weight_count
+
+    def set_global_id_per_rank_for_table(
+        self, table_idx: int, global_id: torch.Tensor
+    ) -> None:
+        self.global_id_per_rank[table_idx] = global_id
+
+    def direct_write_embedding(
+        self,
+        indices: torch.Tensor,
+        offsets: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        """
+        Directly write the weights to L1, SP and backend without relying on auto-gradient for embedding cache.
+        Please refer to design doc for more details: https://docs.google.com/document/d/1TJHKvO1m3-5tYAKZGhacXnGk7iCNAzz7wQlrFbX_LDI/edit?tab=t.0
+        """
+        assert (
+            self._embedding_cache_mode
+        ), "Must be in embedding_cache_mode to support direct_write_embedding method."
+
+        B_offsets = None
+        max_B = -1
+
+        with torch.no_grad():
+            # Wait for any ongoing prefetch operations to complete before starting direct_write
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_event(self.prefetch_complete_event)
+
+            # Create local step events for internal sequential execution
+            weights_dtype = self.weights_precision.as_dtype()
+            assert (
+                weights_dtype == weights.dtype
+            ), f"Expected embedding table dtype {weights_dtype} is same with input weight dtype, but got {weights.dtype}"
+
+            # Pad the weights to match self.max_D width if necessary
+            if weights.size(1) < self.cache_row_dim:
+                weights = torch.nn.functional.pad(
+                    weights, (0, self.cache_row_dim - weights.size(1))
+                )
+
+            step = self.step
+
+            # step 0: run backward hook for prefetch if prefetch pipeline is enabled before writing to L1 and SP
+            if self.prefetch_pipeline:
+                self._update_cache_counter_and_pointers(nn.Module(), torch.empty(0))
+
+            # step 1: lookup and write to l1 cache
+            with record_function(
+                f"## direct_write_to_l1_{step}_{self.tbe_unique_id} ##"
+            ):
+                if self.gather_ssd_cache_stats:
+                    self.local_ssd_cache_stats.zero_()
+
+                # Linearize indices
+                linear_cache_indices = torch.ops.fbgemm.linearize_cache_indices(
+                    self.hash_size_cumsum,
+                    indices,
+                    offsets,
+                    B_offsets,
+                    max_B,
+                )
+
+                lxu_cache_locations: torch.Tensor = torch.ops.fbgemm.lxu_cache_lookup(
+                    linear_cache_indices,
+                    self.lxu_cache_state,
+                    self.total_hash_size,
+                )
+                cache_location_mask = lxu_cache_locations >= 0
+
+                # Get the cache locations for the row_ids that are already in the cache
+                cache_locations = lxu_cache_locations[cache_location_mask]
+
+                # Get the corresponding input weights for these row_ids
+                cache_weights = weights[cache_location_mask]
+
+                # Update the cache with these input weights
+                if cache_locations.numel() > 0:
+                    self.lxu_cache_weights.index_put_(
+                        (cache_locations,), cache_weights, accumulate=False
+                    )
+
+                # Record completion of step 1
+                current_stream.record_event(self.direct_write_l1_complete_event)
+
+            # step 2: pop the current scratch pad and write to next batch scratch pad if exists
+            # Wait for step 1 to complete
+            with record_function(
+                f"## direct_write_to_sp_{step}_{self.tbe_unique_id} ##"
+            ):
+                if len(self.ssd_scratch_pad_eviction_data) > 0:
+                    self.ssd_scratch_pad_eviction_data.pop(0)
+                    if len(self.ssd_scratch_pad_eviction_data) > 0:
+                        # if scratch pad exists, write to next batch scratch pad
+                        sp = self.ssd_scratch_pad_eviction_data[0][0]
+                        sp_idx = self.ssd_scratch_pad_eviction_data[0][1].to(
+                            self.current_device
+                        )
+                        actions_count_gpu = self.ssd_scratch_pad_eviction_data[0][2][0]
+                        if actions_count_gpu.item() != 0:
+                            # when no actional_count_gpu, no need to write to SP
+                            sp_idx = sp_idx[:actions_count_gpu]
+
+                            # -1 in lxu_cache_locations means the row is not in L1 cache and in SP
+                            # fill the row_ids in L1 with -2, >0 values means in SP or backend
+                            # @eg. updated_indices_in_sp= [1, 100, 1, 2, -2, 3, 4, 5, 10]
+                            updated_indices_in_sp = linear_cache_indices.masked_fill(
+                                lxu_cache_locations != -1, -2
+                            )
+                            # sort the sp_idx for binary search
+                            # should already be sorted
+                            # sp_idx_inverse_indices is the indices before sorting which is same to the location in SP.
+                            # @eg. sp_idx = [4, 2, 1, 3, 10]
+                            # @eg sorted_sp_idx = [ 1,  2,  3,  4, 10] and sp_idx_inverse_indices = [2, 1, 3, 0, 4]
+                            sorted_sp_idx, sp_idx_inverse_indices = torch.sort(sp_idx)
+                            # search rows id in sp against the SP indexes to find location of the rows in SP
+                            # @eg: updated_indices_in_sp = [0, 5, 0, 1, 0, 2, 3, 4, 4]
+                            # @eg: 5 is OOB
+                            updated_indices_in_sp_idx = torch.searchsorted(
+                                sorted_sp_idx, updated_indices_in_sp
+                            )
+                            # does not found in SP will Out of Bound
+                            oob_sp_idx = updated_indices_in_sp_idx >= sp_idx.numel()
+                            # make the oob items in bound
+                            # @eg updated_indices_in_sp=[0, 0, 0, 1, 0, 2, 3, 4, 4]
+                            updated_indices_in_sp_idx[oob_sp_idx] = 0
+
+                            # torch.searchsorted is not exact match,
+                            # we only take exact matched rows, where the id is found in SP.
+                            # @eg 5 in updated_indices_in_sp is not in sp_idx, but has 4 in updated_indices_in_sp
+                            # @eg sorted_sp_idx[updated_indices_in_sp]=[ 1,  1,  1,  2,  1,  3,  4, 10, 10]
+                            # @eg exact_match_mask=[ True, False,  True,  True, False,  True,  True, False,  True]
+                            exact_match_mask = (
+                                sorted_sp_idx[updated_indices_in_sp_idx]
+                                == updated_indices_in_sp
+                            )
+                            # Get the location of the row ids found in SP.
+                            # @eg: sp_locations_found=[2, 2, 1, 3, 0, 4]
+                            sp_locations_found = sp_idx_inverse_indices[
+                                updated_indices_in_sp[exact_match_mask]
+                            ]
+                            # Get the corresponding weights for the matched indices
+                            matched_weights = weights[exact_match_mask]
+
+                            # Write the weights to the sparse tensor at the found locations
+                            if sp_locations_found.numel() > 0:
+                                sp.index_put_(
+                                    (sp_locations_found,),
+                                    matched_weights,
+                                    accumulate=False,
+                                )
+                current_stream.record_event(self.direct_write_sp_complete_event)
+
+            # step 3: write l1 cache missing rows to backend
+            # Wait for step 2 to complete
+            with record_function(
+                f"## direct_write_to_backend_{step}_{self.tbe_unique_id} ##"
+            ):
+                # Use the existing ssd_eviction_stream for all backend write operations
+                # This stream is already created with low priority during initialization
+                with torch.cuda.stream(self.ssd_eviction_stream):
+                    # Create a mask for indices not in L1 cache
+                    non_cache_mask = ~cache_location_mask
+
+                    # Calculate the count of valid indices (those not in L1 cache)
+                    valid_count = non_cache_mask.sum().to(torch.int64).cpu()
+
+                    if valid_count.item() > 0:
+                        # Extract only the indices and weights that are not in L1 cache
+                        non_cache_indices = linear_cache_indices[non_cache_mask]
+                        non_cache_weights = weights[non_cache_mask]
+
+                        # Move tensors to CPU for set_cuda
+                        cpu_indices = non_cache_indices.cpu()
+                        cpu_weights = non_cache_weights.cpu()
+
+                        # Write to backend - only sending the non-cache indices and weights
+                        self.record_function_via_dummy_profile(
+                            f"## ssd_write_{step}_set_cuda_{self.tbe_unique_id} ##",
+                            self.ssd_db.set_cuda,
+                            cpu_indices,
+                            cpu_weights,
+                            valid_count,
+                            self.timestep,
+                            is_bwd=False,
+                        )
+
+                # Return control to the main stream without waiting for the backend operation to complete

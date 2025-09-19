@@ -27,6 +27,8 @@
 #include <folly/futures/Future.h>
 #include <folly/hash/Hash.h>
 
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/filter_policy.h>
@@ -34,14 +36,11 @@
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/table.h>
 #include <rocksdb/table_properties.h>
-#ifdef FBGEMM_USE_GPU
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#endif
 
 #include <folly/coro/Task.h>
 #include "../dram_kv_embedding_cache/feature_evict.h"
 #include "fbgemm_gpu/split_embeddings_cache/cachelib_cache.h"
+#include "fbgemm_gpu/split_embeddings_cache/raw_embedding_streamer.h"
 #include "fbgemm_gpu/utils/dispatch_macros.h"
 
 namespace ssd {
@@ -202,33 +201,6 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
       const at::Tensor& count,
       int64_t sleep_ms = 0);
 
-  /// Stream out non-negative elements in <indices> and its paired embeddings
-  /// from <weights> for the first <count> elements in the tensor.
-  /// It spins up a thread that will copy all 3 tensors to CPU and inject them
-  /// into the background queue which will be picked up by another set of thread
-  /// pools for streaming out to the thrift server (co-located on same host
-  /// now).
-  ///
-  /// This is used in cuda stream callback, which doesn't require to be
-  /// serialized with other callbacks, thus a separate thread is used to
-  /// maximize the overlapping with other callbacks.
-  ///
-  /// @param indices The 1D embedding index tensor, should skip on negative
-  /// value
-  /// @param weights The 2D tensor that each row(embeddings) is paired up with
-  /// relative element in <indices>
-  /// @param count A single element tensor that contains the number of indices
-  /// to be processed
-  /// @param blocking_tensor_copy whether to copy the tensors to be streamed in
-  /// a blocking manner
-  ///
-  /// @return None
-  void stream(
-      const at::Tensor& indices,
-      const at::Tensor& weights,
-      const at::Tensor& count,
-      bool blocking_tensor_copy = true);
-
   /// storage tier counterpart of function get()
   virtual folly::SemiFuture<std::vector<folly::Unit>> get_kv_db_async(
       const at::Tensor& indices,
@@ -241,6 +213,12 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
       const at::Tensor& weights,
       const at::Tensor& count,
       const RocksdbWriteMode w_mode = RocksdbWriteMode::FWD_ROCKSDB_READ) = 0;
+
+  virtual folly::SemiFuture<std::vector<folly::Unit>>
+  set_kv_zch_eviction_metadata_async(
+      at::Tensor indices,
+      at::Tensor count,
+      at::Tensor engage_show_count) = 0;
 
   virtual void compact() = 0;
 
@@ -266,6 +244,11 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
       const at::Tensor& count,
       const int64_t timestep,
       const bool is_bwd = false);
+
+  void set_feature_score_metadata_cuda(
+      const at::Tensor& indices,
+      const at::Tensor& count,
+      const at::Tensor& engage_show_count);
 
   void stream_cuda(
       const at::Tensor& indices,
@@ -430,34 +413,6 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
     return 0;
   }
 
-#ifdef FBGEMM_FBCODE
-  folly::coro::Task<void> tensor_stream(
-      const at::Tensor& indices,
-      const at::Tensor& weights);
-  /*
-   * Copy the indices, weights and count tensors and enqueue them for
-   * asynchronous stream.
-   */
-  void copy_and_enqueue_stream_tensors(
-      const at::Tensor& indices,
-      const at::Tensor& weights,
-      const at::Tensor& count);
-
-  /*
-   * Join the stream tensor copy thread, make sure the thread is properly
-   * finished before creating new.
-   */
-  void join_stream_tensor_copy_thread();
-
-  /*
-   * FOR TESTING: Join the weight stream thread, make sure the thread is
-   * properly finished for destruction and testing.
-   */
-  void join_weights_stream_thread();
-  // FOR TESTING: get queue size.
-  uint64_t get_weights_to_stream_queue_size();
-#endif
-
  private:
   /// Find non-negative embedding indices in <indices> and shard them into
   /// #cachelib_pools pieces to be lookedup in parallel
@@ -588,17 +543,7 @@ class EmbeddingKVDB : public std::enable_shared_from_this<EmbeddingKVDB> {
 
   // -- commone path
   std::atomic<int64_t> total_cache_update_duration_{0};
-
-  // -- raw embedding streaming
-  bool enable_raw_embedding_streaming_;
-  int64_t res_store_shards_;
-  int64_t res_server_port_;
-  std::vector<std::string> table_names_;
-  std::vector<int64_t> table_offsets_;
-  at::Tensor table_sizes_;
-  std::unique_ptr<std::thread> weights_stream_thread_;
-  folly::UMPSCQueue<QueueItem, true> weights_to_stream_queue_;
-  std::unique_ptr<std::thread> stream_tensor_copy_thread_;
+  std::unique_ptr<fbgemm_gpu::RawEmbeddingStreamer> raw_embedding_streamer_;
 }; // class EmbeddingKVDB
 
 } // namespace kv_db
