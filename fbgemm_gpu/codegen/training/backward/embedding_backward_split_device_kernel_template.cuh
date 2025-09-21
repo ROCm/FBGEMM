@@ -141,45 +141,129 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 ? sorted_indice_weights[segment_start + sl_j]
                 : 0.0;
             {%- endif %}
-            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
-                {%- if nobag %}
-                int32_t l_j = SHFL_SYNC(l, j);
-                {%- elif vbe %}
-                const auto grad_offset_j = SHFL_SYNC(grad_offset, j);
-                {%- else %}
-                int32_t b_j = SHFL_SYNC(b, j);
-                int32_t D_start_j = SHFL_SYNC(D_start, j);
-                {%- endif %}
+            if (kFixedMaxVecsPerThread == 1) {
+                {%- set d = "((vec_start * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+                if ({{ d }} < D) {
+                    const int32_t d = {{d}};
+                    constexpr auto num_unroll = (kThreadGroupSize >= 16)? 16 : kThreadGroupSize;
+                    auto unroll_limit = min(kThreadGroupSize, (sl_end - sl)) / num_unroll * num_unroll;
+                    for (int32_t j = 0; j < unroll_limit; j += num_unroll) {
+                        #pragma unroll
+                        for (auto i = 0; i < num_unroll; ++i) {
+                            {%- if nobag %}
+                            int32_t l_j = SHFL_SYNC(l, j + i);
+                            {%- elif vbe %}
+                            const auto grad_offset_j = SHFL_SYNC(grad_offset, j + i);
+                            {%- else %}
+                            int32_t b_j = SHFL_SYNC(b, j + i);
+                            int32_t D_start_j = SHFL_SYNC(D_start, j + i);
+                            {%- endif %}
 
-                {%- if weighted %}
-                at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j);
-                {%- endif %}
+                            {%- if weighted %}
+                            at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j + i);
+                            {%- endif %}
 
-                {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+                            Vec4TAcc<grad_t> grad_out_vec(
+                                {%- if nobag and is_index_select %}
+                                // grad_output is 1d
+                                &grad_output[grad_offset + l_j * grad_stride + d]
+                                {%- elif nobag %}
+                                &grad_output[l_j][d]
+                                {%- elif vbe %}
+                                &grad_output[0][grad_offset_j + d]
+                                {%- else %}
+                                &grad_output[b_j][0] + D_start_j + d
+                                {%- endif %} // if nobag
+                            );
 
-                #pragma unroll kFixedMaxVecsPerThread
-                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
-                    const int32_t d = {{ d }};
-                    Vec4TAcc<grad_t> grad_out_vec(
-                        {%- if nobag and is_index_select %}
-                        // grad_output is 1d
-                        &grad_output[grad_offset + l_j * grad_stride + d]
-                        {%- elif nobag %}
-                        &grad_output[l_j][d]
+                            {%- if weighted %}
+                            grad_sum[vec_start].fma_(grad_out_vec, idx_weight_j);
+                            {%- else %}
+                            grad_sum[vec_start].add_(grad_out_vec);
+                            {%- endif %}
+                        }
+                    }
+                    for (int32_t j = unroll_limit; j < kThreadGroupSize && sl + j < sl_end; ++j) {
+                        {%- if nobag %}
+                        int32_t l_j = SHFL_SYNC(l, j);
                         {%- elif vbe %}
-                        &grad_output[0][grad_offset_j + d]
+                        const auto grad_offset_j = SHFL_SYNC(grad_offset, j);
                         {%- else %}
-                        &grad_output[b_j][0] + D_start_j + d
-                        {%- endif %} // if nobag
-                    );
+                        int32_t b_j = SHFL_SYNC(b, j);
+                        int32_t D_start_j = SHFL_SYNC(D_start, j);
+                        {%- endif %}
+
+                        {%- if weighted %}
+                        at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j);
+                        {%- endif %}
+
+                        {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+
+                        #pragma unroll kFixedMaxVecsPerThread
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
+                            const int32_t d = {{ d }};
+                            Vec4TAcc<grad_t> grad_out_vec(
+                                {%- if nobag and is_index_select %}
+                                // grad_output is 1d
+                                &grad_output[grad_offset + l_j * grad_stride + d]
+                                {%- elif nobag %}
+                                &grad_output[l_j][d]
+                                {%- elif vbe %}
+                                &grad_output[0][grad_offset_j + d]
+                                {%- else %}
+                                &grad_output[b_j][0] + D_start_j + d
+                                {%- endif %} // if nobag
+                            );
+
+                            {%- if weighted %}
+                            grad_sum[vec].fma_(grad_out_vec, idx_weight_j);
+                            {%- else %}
+                            grad_sum[vec].add_(grad_out_vec);
+                            {%- endif %}
+                        }
+                    }
+                }
+            } else {
+                for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
+                    {%- if nobag %}
+                    int32_t l_j = SHFL_SYNC(l, j);
+                    {%- elif vbe %}
+                    const auto grad_offset_j = SHFL_SYNC(grad_offset, j);
+                    {%- else %}
+                    int32_t b_j = SHFL_SYNC(b, j);
+                    int32_t D_start_j = SHFL_SYNC(D_start, j);
+                    {%- endif %}
 
                     {%- if weighted %}
-                    grad_sum[vec].fma_(grad_out_vec, idx_weight_j);
-                    {%- else %}
-                    grad_sum[vec].add_(grad_out_vec);
+                    at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j);
                     {%- endif %}
+
+                    {%- set d = "(((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH)" %}
+
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && {{ d }} < D; ++vec) {
+                        const int32_t d = {{ d }};
+                        Vec4TAcc<grad_t> grad_out_vec(
+                            {%- if nobag and is_index_select %}
+                            // grad_output is 1d
+                            &grad_output[grad_offset + l_j * grad_stride + d]
+                            {%- elif nobag %}
+                            &grad_output[l_j][d]
+                            {%- elif vbe %}
+                            &grad_output[0][grad_offset_j + d]
+                            {%- else %}
+                            &grad_output[b_j][0] + D_start_j + d
+                            {%- endif %} // if nobag
+                        );
+
+                        {%- if weighted %}
+                        grad_sum[vec].fma_(grad_out_vec, idx_weight_j);
+                        {%- else %}
+                        grad_sum[vec].add_(grad_out_vec);
+                        {%- endif %}
+                    }
                 }
-            }
+            } 
         }
         {%- set d_vec = "((vec + vec_start) * kThreadGroupSize + threadIdx.x)" %}
 
