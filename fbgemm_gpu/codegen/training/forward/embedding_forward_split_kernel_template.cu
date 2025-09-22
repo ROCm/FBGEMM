@@ -258,11 +258,8 @@ using namespace fbgemm_gpu;
     {%- if not nobag %}
     // Iterate over the row in the weights table, in 4-element strides
     #pragma unroll kMaxVecsPerThread
-    // for (int32_t i = 0;
-    //     i < kMaxVecsPerThread && (i * kThreadGroupSize + threadIdx.x) * VEC_WIDTH < D;
-    //     ++i) {
     for (int32_t i = 0;
-        i < kMaxVecsPerThread;
+        i < kMaxVecsPerThread && (i * kThreadGroupSize + threadIdx.x) * VEC_WIDTH < D;
         ++i) {
         {%- if is_gwd_kernel %}
         // Scale weights with global weight decay
@@ -286,7 +283,7 @@ using namespace fbgemm_gpu;
     benchmarks, it was found that the extra function-calling resulted in a
     20-100 GB/s bandwidth reduction.
 */#}
-{%- macro embedding_pool_or_store_imp(lxu_miss_rate) %}
+{%- macro embedding_pool_or_store(lxu_miss_rate) %}
     // Iterate over each kThreadGroupSize-sized subset of L indices in the bag
     for (int32_t l_start = 0; l_start < L; l_start += kThreadGroupSize) {
         // Determine the L index that this thread will load data from in cooperative load
@@ -345,7 +342,7 @@ using namespace fbgemm_gpu;
             }
             {%- endif %}
 
-          {%- if weighted %}
+	        {%- if weighted %}
             // Load positional weight index from thread j in the group
             at::acc_type<cache_t, true> idx_weight_j_[kManualUnrollLength];
             for (auto inner_j = 0; inner_j < kManualUnrollLength; ++inner_j)
@@ -468,7 +465,7 @@ using namespace fbgemm_gpu;
                 {#/**************************************************************/#}
             }
             {%- endif %}
-      }
+	    }
         {%- endif %}
 
         {%- if is_rocm %}
@@ -539,17 +536,7 @@ using namespace fbgemm_gpu;
     }
 {%- endmacro %}
 
-{%- macro embedding_pool_or_store(lxu_miss_rate) %}
-    {%- if not nobag %}
-        if (((kMaxVecsPerThread - 1) * kThreadGroupSize + blockDim.x) * VEC_WIDTH < D) {
-          {{ embedding_pool_or_store_imp(lxu_miss_rate) }}
-        } else {
-          {{ embedding_pool_or_store_imp(lxu_miss_rate) }}
-        }
-    {%- else %}
-        {{ embedding_pool_or_store_imp(lxu_miss_rate) }}
-    {%- endif %}
-{%- endmacro %}
+
 {#-
   /* Generate different kernels for global_weight_decay support using Jinja
      because adding new variables increase number of registers and
