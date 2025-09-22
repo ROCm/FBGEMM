@@ -628,7 +628,7 @@ batch_index_select_dim0_codegen_forward_kernel(
     constexpr int VEC_WIDTH = 4;
     {%- if is_rocm %}
     // Unroll factor for ROCm devices
-    constexpr int kManualUnrollLength = 4;
+    constexpr int kManualUnrollLength = 8;
     {%- endif %}
 
     // Determine the linearized warp ID, and exit early if needed
