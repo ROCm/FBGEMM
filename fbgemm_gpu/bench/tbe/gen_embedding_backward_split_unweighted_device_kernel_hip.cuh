@@ -50,7 +50,7 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
     // Copy value to vecs to make num_vecs known at compile time when
     // kUseVecBlocking == false
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        printf("%s %d %d %d %d %d\n", __FILE__, kFixedMaxVecsPerThread, kThreadGroupSize, VEC_WIDTH, D);
+        printf("%s %d %d %d %d %d %d\n", __FILE__, blockDim.x, kFixedMaxVecsPerThread, kThreadGroupSize, VEC_WIDTH, D);
     }
     const int32_t vecs = kUseVecBlocking ? num_vecs : kFixedMaxVecsPerThread;
 
@@ -77,7 +77,24 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
                 const auto b = b_t & info_B_mask;
                 const auto t = b_t >> info_B_num_bits; // if vbe
                 int32_t D_start = sl_j < sl_end ? D_offsets[t] : 0; // if vbe // if not nobag
-                for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
+
+                constexpr auto num_unroll = 4;
+                auto unroll_limit = min(kThreadGroupSize, (sl_end - sl)) / num_unroll * num_unroll;
+                for (int32_t j = 0; j < unroll_limit; j += num_unroll) {
+                    #pragma unroll num_unroll
+                    for (int32_t i = 0; j < num_unroll; ++i) {
+                        int32_t b_j = SHFL_SYNC(b, j + i);
+                        int32_t D_start_j = SHFL_SYNC(D_start, j + i);
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; ++vec) {
+                            const int32_t d = (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                            Vec4TAcc<grad_t> grad_out_vec(
+                                &grad_output[b_j][0] + D_start_j + d // if nobag
+                            );
+                            grad_sum[vec].add_(grad_out_vec);
+                        }
+                    }
+                }
+                for (int32_t j = unroll_limit; j < kThreadGroupSize && sl + j < sl_end; ++j) {
                     int32_t b_j = SHFL_SYNC(b, j);
                     int32_t D_start_j = SHFL_SYNC(D_start, j);
                     for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; ++vec) {
@@ -102,7 +119,6 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
                 for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
                     int32_t b_j = SHFL_SYNC(b, j);
                     int32_t D_start_j = SHFL_SYNC(D_start, j);
-
                     #pragma unroll kFixedMaxVecsPerThread
                     for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
                         const int32_t d = (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
