@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 #include <ATen/ATen.h>
+#include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPStream.h>
 
 #include "kernels/fp8_rowwise_preshuffle_kernel_manifest.h"
@@ -24,7 +25,42 @@ namespace fbgemm_gpu {
 using RowwiseKernel = std::function<
     at::Tensor(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor)>;
 
+// Define a custom hash function for std::tuple<int, int, int>
+struct IntTupleHash {
+  size_t operator()(const std::tuple<int, int>& t) const {
+    auto hash1 = std::hash<int>{}(std::get<0>(t));
+    auto hash2 = std::hash<int>{}(std::get<1>(t));
+    return hash1 ^ hash2;
+  }
+  size_t operator()(const std::tuple<int, int, int>& t) const {
+    auto hash1 = std::hash<int>{}(std::get<0>(t));
+    auto hash2 = std::hash<int>{}(std::get<1>(t));
+    auto hash3 = std::hash<int>{}(std::get<2>(t));
+    return hash1 ^ hash2 ^ hash3;
+  }
+};
+
+// For certain high priority shapes, we directly map to the best kernel rather
+// than use heuristics.
+static const std::unordered_map<std::tuple<int, int, int>, RowwiseKernel, IntTupleHash> llama70b_lookup_dispatch = {
+    // LLama 70B shapes
+    // Support for decode batch size 1
+    {{1, 1280, 8192},
+     fp8_rowwise_preshuffle_256x16x64x256_16x16_1x1_16x16x1_16x16x1_1x16x1x16_4x4x1_1x1_intrawave_v1_8},
+    {{1, 7168, 8192},
+     fp8_rowwise_preshuffle_256x16x128x256_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8x8x1_1x2_intrawave_v1_8},
+    {{1, 8192, 3584},
+     fp8_rowwise_preshuffle_128x16x32x128_16x16_1x1_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1_4},
+    {{1, 8192, 1024},
+     fp8_rowwise_preshuffle_256x16x64x256_16x16_1x1_16x16x1_16x16x1_1x16x1x16_4x4x1_1x1_intrawave_v2},
+};
+
 RowwiseKernel rowwise_preshuffle_heuristic_dispatch(int M, int N, int K) {
+  // Llama 70B specific shape lookup.
+  auto nk_lookup_it = llama70b_lookup_dispatch.find({M, N, K});
+  if (nk_lookup_it != llama70b_lookup_dispatch.end()){
+    return nk_lookup_it->second;
+  }
   // Apply shape heuristics to find a suitable kernel implementation.
   if (M <= 16) {
     if (K <= 1024) {
@@ -91,6 +127,17 @@ RowwiseKernel rowwise_preshuffle_heuristic_dispatch(int M, int N, int K) {
   }
 }
 
+static std::pair<at::ScalarType, std::string> get_float8_e4m3_dtype() {
+  if (at::detail::getCUDAHooks().isGPUArch({"gfx942"})) {
+    return std::make_pair(at::kFloat8_e4m3fnuz, "float8_e4m3fnuz");
+  } else if (at::detail::getCUDAHooks().isGPUArch({"gfx950"})) {
+    return std::make_pair(at::kFloat8_e4m3fn, "float8_e4m3fn");
+  } else {
+    std::string gcn_arch_name = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+    TORCH_CHECK(false, "Unsupported GPU architecture for FP8: ", gcn_arch_name);
+  }
+}
+
 template <at::ScalarType OUTPUT_DTYPE>
 at::Tensor f8f8_rowwise_preshuffle_wrapper(
     at::Tensor XQ,
@@ -100,11 +147,12 @@ at::Tensor f8f8_rowwise_preshuffle_wrapper(
     std::optional<at::Tensor> bias,
     bool use_fast_accum,
     std::optional<at::Tensor> output = std::nullopt) {
+  static auto float8_dtype = get_float8_e4m3_dtype();
   // Check that input datatypes are valid.
   TORCH_CHECK(
-      (XQ.dtype() == at::kFloat8_e4m3fnuz) &&
-          (WQ.dtype() == at::kFloat8_e4m3fnuz),
-      "Inputs must be type float8_e4m3fnuz.");
+      (XQ.dtype() == float8_dtype.first) &&
+          (WQ.dtype() == float8_dtype.first),
+      "Inputs must be type ", float8_dtype.second);
   TORCH_CHECK(
       (x_scale.dtype() == at::kFloat) && (w_scale.dtype() == at::kFloat),
       "Scales must be float32.");
