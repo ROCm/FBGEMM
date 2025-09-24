@@ -71,7 +71,8 @@ template <
   typename grad_t,
   typename cache_t,
   typename index_t,
-  int32_t kFixedMaxVecsPerThread
+  int32_t kFixedMaxVecsPerThread,
+  bool embDimMatch
 >
 __global__ __launch_bounds__(kForwardMaxThreads) void
 {{ mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_{{ vbdesc }}kernel(
@@ -276,10 +277,10 @@ __global__ __launch_bounds__(kForwardMaxThreads) void
                         weight3.acc.z * grad_out[vec].acc.z + weight3.acc.w * grad_out[vec].acc.w;
                 }
                 
-                grad_indice_weight0 = warpReduceAllSum<at::acc_type<cache_t, true>>(grad_indice_weight0);
-                grad_indice_weight1 = warpReduceAllSum<at::acc_type<cache_t, true>>(grad_indice_weight1);
-                grad_indice_weight2 = warpReduceAllSum<at::acc_type<cache_t, true>>(grad_indice_weight2);
-                grad_indice_weight3 = warpReduceAllSum<at::acc_type<cache_t, true>>(grad_indice_weight3);
+                grad_indice_weight0 = warpReduceAllSum<at::acc_type<cache_t, true>, kWarpSize, embDimMatch>(grad_indice_weight0);
+                grad_indice_weight1 = warpReduceAllSum<at::acc_type<cache_t, true>, kWarpSize, embDimMatch>(grad_indice_weight1);
+                grad_indice_weight2 = warpReduceAllSum<at::acc_type<cache_t, true>, kWarpSize, embDimMatch>(grad_indice_weight2);
+                grad_indice_weight3 = warpReduceAllSum<at::acc_type<cache_t, true>, kWarpSize, embDimMatch>(grad_indice_weight3);
 
                 if (threadIdx.x == 0) {
                     grad_indice_weights[indices_start + l_start + j] = grad_indice_weight0;
@@ -340,7 +341,7 @@ __global__ __launch_bounds__(kForwardMaxThreads) void
                     {%- endif %}
                 }
                 grad_indice_weight =
-                    warpReduceAllSum<at::acc_type<cache_t, true>>(grad_indice_weight);
+                    warpReduceAllSum<at::acc_type<cache_t, true>, kWarpSize, embDimMatch>(grad_indice_weight);
                 if (threadIdx.x == 0) {
                     {%- if use_vec_blocking %}
                     if (vec_start == 0) {
@@ -386,6 +387,7 @@ kernel_error_handler:
 Tensor {{ mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_cuda(
     const Tensor& grad_output,
     const Tensor& dev_weights,
+    bool mixed_D,
     {%- if not dense %}
     const Tensor& uvm_weights,
     const Tensor& lxu_cache_weights,
@@ -495,13 +497,36 @@ Tensor {{ mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_cuda(
                     "{}_embedding_codegen_grad_indice_weights{}_{}kernel".format(
                         mdesc, vdesc, vbdesc)
                 %}
-                FBGEMM_LAUNCH_KERNEL(
-                    ({{ kernel_name }}<
+                auto kernel_name_ = {{ kernel_name }}<
                         emb_t,
                         grad_t,
                         cache_t,
                         index_t,
-                        kFixedMaxVecsPerThread>),
+                        kFixedMaxVecsPerThread,
+                        /*embDimMatch=*/ false>;
+#ifdef USE_ROCM
+
+                if (!mixed_D)
+                {
+                    {%- for kDimSize in [64, 128, 160, 192, 256, 320] %}
+                        if (max_D == {{ kDimSize }})
+                        {
+                            kernel_name_ =
+                                {{ kernel_name }}
+                                <
+                                    emb_t,
+                                    grad_t,
+                                    cache_t,
+                                    index_t,
+                                    kFixedMaxVecsPerThread,
+                                    /*embDimMatch=*/ true
+                                    >;
+                }
+                {%- endfor %}
+            }
+#endif          
+                FBGEMM_LAUNCH_KERNEL(
+                    kernel_name_,
                     div_round_up(total_B, kForwardMaxThreads / kWarpSize),
                     dim3(kWarpSize, kForwardMaxThreads / kWarpSize),
                     0,
@@ -544,6 +569,7 @@ Tensor {{ mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_cuda(
 Tensor {{ mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_meta(
     const Tensor& grad_output,
     const Tensor& dev_weights,
+    bool mixed_D,
     {%- if not dense %}
     const Tensor& uvm_weights,
     const Tensor& lxu_cache_weights,
@@ -594,6 +620,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
     m.def("{{ embedding_codegen_grad_indice_weights_op_cuda }}("
           "    Tensor grad_output, "
           "    Tensor dev_weights, "
+          "    bool mixed_D, "
           {%- if not dense %}
           "    Tensor uvm_weights, "
           "    Tensor lxu_cache_weights, "

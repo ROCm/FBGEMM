@@ -386,6 +386,7 @@ enum SSDTensor {
 Tensor {{ fwd_mdesc }}_embedding_codegen_grad_indice_weights{{ vdesc }}_cuda(
     const Tensor& grad_output,
     const Tensor& dev_weights,
+    bool mixed_D,
     {%- if not dense %}
     const Tensor& uvm_weights,
     const Tensor& lxu_cache_weights,
@@ -982,6 +983,7 @@ class {{ autograd_func }} :
       embedding_codegen_grad_indice_weights_op.call(
         grad_output,
         dev_weights,
+        mixed_D,
         {%- if not dense %}
         uvm_weights,
         lxu_cache_weights,
