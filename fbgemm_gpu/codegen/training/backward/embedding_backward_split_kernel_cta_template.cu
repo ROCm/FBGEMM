@@ -251,6 +251,33 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
         constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
         const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
 
+        {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+
+        compute_grad_sum_unweighted_unroll<
+          grad_t,
+          cache_t,
+          kFixedMaxVecsPerThread,
+          kThreadGroupSize,
+          VEC_WIDTH,
+          kUseVecBlocking>(
+            grad_sum,
+            smem_grad_sum,
+            grad_output,
+            D_offsets,
+            D,
+            T,
+            sorted_infos,
+            info_B_num_bits,
+            info_B_mask,
+            segment_start,
+            sl_start,
+            sl_end,
+            shfl_sync_mask,
+            num_vecs
+        );
+
+        {%- else %}
+
         compute_grad_sum_{{ kdesc }}<
           grad_t,
           cache_t,
@@ -288,6 +315,9 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
             shfl_sync_mask,
             num_vecs
         );
+
+        {%- endif %}
+
         // Do shared memory reduction only if we used multiple warps.
         if (SL > SL_per_warp) {
             __syncthreads();
