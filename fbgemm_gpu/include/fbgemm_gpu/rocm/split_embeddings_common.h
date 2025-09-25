@@ -67,6 +67,12 @@ __device__ half llvm_amdgcn_raw_buffer_load_fp16(
       __asm("llvm.amdgcn.raw.buffer.load.f16");
 #endif
 
+// __device__ float4 llvm_amdgcn_raw_buffer_load_fp32x4(
+//     int32x4_t srsrc,
+//     int32_t voffset,
+//     int32_t soffset,
+//     int32_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4f32");
+
 __device__ float llvm_amdgcn_raw_buffer_load_fp32(
     int32x4_t srsrc,
     int32_t voffset,
