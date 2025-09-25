@@ -86,7 +86,7 @@ DEVICE_INLINE void compute_grad_sum_weighted(
                     constexpr auto num_unroll = (kThreadGroupSize >= 16)? 16 : 8;
                     auto unroll_limit = min(kThreadGroupSize, (sl_end - sl)) / num_unroll * num_unroll;
                     for (int32_t j = 0; j < unroll_limit; j += num_unroll) {
-                        #pragma unroll num_unroll
+                        #pragma unroll
                         for (auto i = 0; i < num_unroll; ++i) {
                             int32_t b_j = SHFL_SYNC(b, j + i);
                             int32_t D_start_j = SHFL_SYNC(D_start, j + i);

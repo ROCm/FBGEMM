@@ -346,6 +346,7 @@ def device(  # noqa C901
     def context_factory(on_trace_ready: Callable[[profile], None]):
         return profile(on_trace_ready=on_trace_ready) if export_trace else nullcontext()
 
+    '''
     with context_factory(lambda p: _kineto_trace_handler(p, "fwd")):
         # forward
         time_per_iter = benchmark_requests(
@@ -367,6 +368,7 @@ def device(  # noqa C901
         f"BW: {read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "  # noqa: B950
         f"T: {time_per_iter * 1.0e6:.0f}us"
     )
+    '''
 
     if output_dtype == SparseType.INT8:
         # backward bench not representative
@@ -403,6 +405,7 @@ def device(  # noqa C901
         f"BW: {2 * read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "
         f"T: {time_per_iter * 1.0e6:.0f}us"
     )
+    logging.info('benchmark done 1')
 
 
 @cli.command()
@@ -1182,6 +1185,11 @@ def device_with_spec(  # noqa C901
         # pyre-fixme[61]: `D` is undefined, or not always defined.
         grad_output = torch.randn(requests[0].indices.numel(), D).to(get_device())
     # backward
+    print("grad_output.requires_grad")
+    print(grad_output.requires_grad)
+    print("emb parameters")
+    for para in emb.parameters():
+        print(para.grad)
     with profile(activities=[ProfilerActivity.CUDA ]) as prof:
         time_per_iter = benchmark_requests(
             requests,
@@ -1202,6 +1210,7 @@ def device_with_spec(  # noqa C901
             f"T: {time_per_iter * 1.0e6:.0f}us"
         )
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100, max_name_column_width=200))
+    logging.info('benchmark done 2')
 
 
 @cli.command()

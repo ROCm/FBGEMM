@@ -78,27 +78,38 @@ DEVICE_INLINE void compute_grad_sum_weighted(
                 : 0.0;
             if (kFixedMaxVecsPerThread == 1) {
                 if (((vec_start * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D) {
-                  const int32_t d = (vec_start * kThreadGroupSize + threadIdx.x) * VEC_WIDTH;
-                  constexpr auto num_unroll = 4;
-                  for (int32_t j = 0; j < (kThreadGroupSize / num_unroll * num_unroll) && (sl + j < sl_end); j += num_unroll) {
-                      int32_t b_j[num_unroll];
-                      int32_t D_start_j[num_unroll];
-                      Vec4TAcc<grad_t> grad_out_vec[num_unroll];
-                      #pragma unroll num_unroll
-                      for (auto i = 0; i < num_unroll; ++i) {
-                          b_j[i] = SHFL_SYNC(b, j + i);
-                          D_start_j[i] = SHFL_SYNC(D_start, j + i);
-                          // idx_weight_j[i] = SHFL_SYNC(idx_weight, j + i);
-                          if (sl + j + i < sl_end) {
-                              grad_out_vec[i].load(&grad_output[b_j[i]][0] + D_start_j[i] + d);
-                          }
-                      }
-                      #pragma unroll num_unroll
-                      for (auto i = 0; i < num_unroll; ++i) {
-                          at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j + i);
-                          grad_sum[vec_start].fma_(grad_out_vec[i], idx_weight_j);
-                      }
-                  }
+                    const int32_t d = (vec_start * kThreadGroupSize + threadIdx.x) * VEC_WIDTH;
+                    constexpr auto num_unroll = 4;
+                    auto unroll_limit = min(kThreadGroupSize, (sl_end - sl)) / num_unroll * num_unroll;
+                    for (int32_t j = 0; j < unroll_limit, j += num_unroll) {
+                        int32_t b_j[num_unroll];
+                        int32_t D_start_j[num_unroll];
+                        Vec4TAcc<grad_t> grad_out_vec[num_unroll];
+                        #pragma unroll num_unroll
+                        for (auto i = 0; i < num_unroll; ++i) {
+                            b_j[i] = SHFL_SYNC(b, j + i);
+                            D_start_j[i] = SHFL_SYNC(D_start, j + i);
+                            grad_out_vec[i].load(&grad_output[b_j[i]][0] + D_start_j[i] + d);
+                        }
+                        #pragma unroll num_unroll
+                        for (auto i = 0; i < num_unroll; ++i) {
+                            at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j + i);
+                            grad_sum[vec_start].fma_(grad_out_vec[i], idx_weight_j);
+                        }
+                    }
+                    for (int32_t j = unroll_limit; j < kThreadGroupSize && sl + j < sl_end; ++j) {
+                        int32_t b_j = SHFL_SYNC(b, j);
+                        int32_t D_start_j = SHFL_SYNC(D_start, j);
+                        at::acc_type<cache_t, true> idx_weight_j = SHFL_SYNC(idx_weight, j);
+                        #pragma unroll kFixedMaxVecsPerThread
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                            const int32_t d = (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                            Vec4TAcc<grad_t> grad_out_vec(
+                                &grad_output[b_j][0] + D_start_j + d // if nobag
+                            );
+                            grad_sum[vec].fma_(grad_out_vec, idx_weight_j);
+                        }
+                    }
                 }
             } else {
                 for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {

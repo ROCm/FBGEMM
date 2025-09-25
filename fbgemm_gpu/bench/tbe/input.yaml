@@ -3,11 +3,11 @@ GlobalParameters:
   AsmDebug: True
 jobs:
     -
-        kernel_include_regex: "backward_codegen"
+        kernel_include_regex: "split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1"
         kernel_exclude_regex:
-        kernel_iteration_range: "[20, [21-21]]"
-        output_file: out
-        output_directory: bwd5_perf_hip
+        kernel_iteration_range: "[1, [2-2]]"
+        output_file: out_opt
+        output_directory: split_embedding_bwd13_v23
         output_format: [json, csv, otf2, pftrace]
         truncate_kernels: true
         sys_trace: true # enable for pftrace and otf2

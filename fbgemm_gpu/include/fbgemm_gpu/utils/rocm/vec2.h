@@ -1,4 +1,5 @@
 /*******************************************************************************
+ *
  * Copyright (c) 2016 - 2024 Advanced Micro Devices, Inc. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -178,6 +179,9 @@ struct Vec2T<float> : public Vec2BaseT<float> {
 
 template <>
 struct Vec2T<at::Half> : public Vec2BaseT<at::Half> {
+
+  half2 h2;
+
   DEVICE_INLINE Vec2T() {}
 
   DEVICE_INLINE Vec2T(const at::Half* p) {
@@ -200,6 +204,8 @@ struct Vec2T<at::Half> : public Vec2BaseT<at::Half> {
 
     // uint2 = 2 uints = 8 bytes
     tmp_out.ui = *reinterpret_cast<uint32_t const*>(p);
+
+    h2 = tmp_out.h;
 
     float2 a = __half22float2(tmp_out.h);
 
@@ -250,8 +256,17 @@ struct Vec2T<at::Half> : public Vec2BaseT<at::Half> {
 
   // this <- this + a * b
   DEVICE_INLINE void fma_(const Vec2T<at::Half>& a, const float b) {
-    acc.x = __fmaf_rn(a.acc.x, b, acc.x);
-    acc.y = __fmaf_rn(a.acc.y, b, acc.y);
+#if 1
+    asm volatile(
+       "v_fma_mix_f32 %[acc_x], %[h2], %[b], %[acc_x] op_sel:[0,0,0] op_sel_hi:[1,0,0];\n\t"
+       "v_fma_mix_f32 %[acc_y], %[h2], %[b], %[acc_y] op_sel:[1,0,0] op_sel_hi:[1,0,0];\n\t"
+       :[acc_x]"=v"(acc.x), [acc_y]"=v"(acc.y)
+       :[h2]"v"(a.h2), [b]"v"(b)
+       : "memory");
+#else
+      acc.x = __fmaf_rn(a.acc.x, b, acc.x);
+      acc.y = __fmaf_rn(a.acc.y, b, acc.y);
+#endif
   }
 
   DEVICE_INLINE void fma_(const Vec2T<float>& a, const float b) {
@@ -288,6 +303,7 @@ struct Vec2T<at::Half> : public Vec2BaseT<at::Half> {
     acc.x *= scale;
     acc.y *= scale;
   }
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////

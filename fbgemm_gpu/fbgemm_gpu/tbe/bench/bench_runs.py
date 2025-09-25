@@ -275,6 +275,10 @@ def benchmark_requests(  # noqa: C901
 
         if bwd_only:
             out.backward(grad)
+            # print('weight grad')
+            # print(weights)
+            # print(weights.requires_grad)
+            # print(weights.grad)
         else:
             func(indices, offsets, weights)
 
