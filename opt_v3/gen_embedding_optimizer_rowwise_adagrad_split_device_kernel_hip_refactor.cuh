@@ -38,7 +38,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits>& dev_weights,
     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits>& uvm_weights,
     pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits>& lxu_cache_weights,
-    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& weights_placements,
+    int32_t weights_placement,
     int64_t weights_offset,
     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& sorted_lxu_cache_locations,
     Vec4TAcc<cache_t>* grad_sum,
@@ -56,7 +56,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
     const int32_t max_vecs_per_thread,
     pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_dev,
     pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_uvm,
-    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& momentum1_placements,
+    int32_t momentum1_placement,
     int64_t momentum1_offset,
     float learning_rate = 0,
     float eps = 0,
@@ -77,21 +77,21 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
     if constexpr (kIsInt8) {
         D_emb += kINT8QparamsBytes;
     }
-    const auto weights_placement = static_cast<PlacementType>(weights_placements[t]);
-    if (FORCE_DEVICE==true || weights_placement == PlacementType::DEVICE) {
+    // const auto weights_placement = static_cast<PlacementType>(weights_placements[t]);
+    if (FORCE_DEVICE==true || static_cast<PlacementType>(weights_placement) == PlacementType::DEVICE) {
         weights = &dev_weights[weights_offset + idx * D_emb];
     } else {
         weights = &uvm_weights[weights_offset + idx * D_emb];
     }
-    if (FORCE_DEVICE == false && weights_placement == PlacementType::MANAGED_CACHING) {
+    if (FORCE_DEVICE == false && static_cast<PlacementType>(weights_placement) == PlacementType::MANAGED_CACHING) {
         const auto cache_idx = sorted_lxu_cache_locations[cache_loc_run_id];
         if (cache_idx != kCacheLocationMissing) {
           cache_weights = &lxu_cache_weights[cache_idx][0];
         }
     }
     at::acc_type<cache_t, true>* __restrict__ momentum1;
-    const auto momentum1_placement = static_cast<PlacementType>(momentum1_placements[t]);
-    if (FORCE_DEVICE == true || momentum1_placement == PlacementType::DEVICE) {
+    // const auto momentum1_placement = static_cast<PlacementType>(momentum1_placement);
+    if (FORCE_DEVICE == true || static_cast<PlacementType>(momentum1_placement) == PlacementType::DEVICE) {
         momentum1 = &momentum1_dev[momentum1_offset];
     } else {
         momentum1 = &momentum1_uvm[momentum1_offset];
