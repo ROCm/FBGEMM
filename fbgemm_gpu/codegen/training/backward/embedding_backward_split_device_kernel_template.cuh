@@ -184,13 +184,17 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                     {%- elif vbe %}
                     Vec4TAcc<grad_t> grad_out_vec(&grad_output[0][grad_offset_j + d]);
                     {%- else %}
-                    int32x4_t emb_res = fbgemm_gpu::rocm::amdgcn_make_buffer_resource(&grad_output[b_j][0] + D_start_j);
+                    int32x4_t emb_res = fbgemm_gpu::rocm::amdgcn_make_buffer_resource(&grad_output[b_j][0] + D_start_j + d);
 
                     Vec4TAcc<grad_t> grad_out_vec;
-                    grad_out_vec.acc.x = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp32(emb_res, d + 0 * sizeof(float), 0, 0);
-                    grad_out_vec.acc.y = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp32(emb_res, d + 1 * sizeof(float), 0, 0);
-                    grad_out_vec.acc.z = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp32(emb_res, d + 2 * sizeof(float), 0, 0);
-                    grad_out_vec.acc.w = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp32(emb_res, d + 3 * sizeof(float), 0, 0);
+                    // Vec4TAcc<grad_t> grad_out_vec(
+                    //     &grad_output[b_j][0] + D_start_j + d
+                    // // if nobag
+                    // );
+                    grad_out_vec.acc.x = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp16(emb_res, 0 * sizeof(half), 0, 0);
+                    grad_out_vec.acc.y = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp16(emb_res, 1 * sizeof(half), 0, 0);
+                    grad_out_vec.acc.z = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp16(emb_res, 2 * sizeof(half), 0, 0);
+                    grad_out_vec.acc.w = fbgemm_gpu::rocm::llvm_amdgcn_raw_buffer_load_fp16(emb_res, 3 * sizeof(half), 0, 0);
                     // grad_out_vec.acc.x = val0;
                     // grad_out_vec.acc.y = val1;
                     // grad_out_vec.acc.z = val2;
