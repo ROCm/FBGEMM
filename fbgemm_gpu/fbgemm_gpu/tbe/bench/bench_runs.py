@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -11,15 +10,14 @@ import logging
 import statistics
 import threading
 import time
-import gzip
 from subprocess import Popen
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
 from fbgemm_gpu.tbe.utils import b_indices, TBERequest
-from fbgemm_gpu.tbe.utils.common import get_device
-from fbgemm_gpu.split_table_batched_embeddings_ops_training import SplitTableBatchedEmbeddingBagsCodegen
+
+
 logging.basicConfig(level=logging.DEBUG)
 
 
@@ -41,31 +39,6 @@ def bench_warmup(
     else:
         for _ in range(warmup_runs):
             out = func(indices, offsets, weights)
-            if bwd_only:
-                out.backward(grad)
-
-
-def bench_warmup_with_spec(
-    request: TBERequest,
-    warmup_ms: int,
-    warmup_runs: int,
-    func: Callable[
-        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list[list[int]]]],
-        torch.Tensor,
-    ],
-    bwd_only: bool = False,
-    grad: Optional[torch.Tensor] = None,
-) -> None:
-    indices, offsets, weights, batch_size_per_feature_per_rank = request.unpack_4()
-    if warmup_ms:
-        start_time_ms = time.time() * 1000
-        while time.time() * 1000 - start_time_ms < warmup_ms:
-            out = func(indices, offsets, weights, batch_size_per_feature_per_rank)
-            if bwd_only:
-                out.backward(grad)
-    else:
-        for _ in range(warmup_runs):
-            out = func(indices, offsets, weights, batch_size_per_feature_per_rank)
             if bwd_only:
                 out.backward(grad)
 
@@ -93,7 +66,7 @@ cpu_bm_barrier = BMBarrier()
 
 
 def cpu_tbe_worker(
-    requests_: list[TBERequest],
+    requests_: List[TBERequest],
     func_: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     use_barrier: bool = False,
 ) -> float:
@@ -125,7 +98,7 @@ def cpu_tbe_worker(
 
 
 def benchmark_cpu_requests_mp(
-    requests: list[TBERequest],
+    requests: List[TBERequest],
     emb_module: torch.nn.Module,
     num_warmups: int = 0,
     num_copies: int = 1,
@@ -208,7 +181,7 @@ def benchmark_cpu_requests_mp(
 
 
 def benchmark_cpu_requests(
-    requests: list[TBERequest],
+    requests: List[TBERequest],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     num_warmups: int = 0,
 ) -> float:
@@ -226,7 +199,7 @@ def benchmark_cpu_requests(
 
 
 def benchmark_requests(  # noqa: C901
-    requests: list[TBERequest],
+    requests: List[TBERequest],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     flush_gpu_cache_size_mb: int = 0,
     check_median: bool = False,
@@ -242,43 +215,36 @@ def benchmark_requests(  # noqa: C901
     periodic_logs: bool = False,
     warmup_ms: Optional[int] = None,
     iters: int = -1,
-    emb: Optional[SplitTableBatchedEmbeddingBagsCodegen] = None,
-    save: Optional[str] = None,
-    load: Optional[str] = None,
-    compressed: bool = False,
-    slice_min: Optional[int] = None,
-    slice_max: Optional[int] = None,
 ) -> float:
     times = []
     # Run at least one warmup iteration to avoid the long cudaLaunchKernel time
     # for the first kernel if warmup_ms > 0
     # warmup_ms is prioritized over num_warmups
-    import copy
+
     if warmup_ms is None:
         num_warmups = num_warmups + 1 if num_warmups >= 0 else 1
 
-    if not (load or save):
-        # warm-up the GPU before profiling
-        bench_warmup(
-            requests[0],
-            # pyre-ignore[6]
-            warmup_ms,
-            num_warmups,
-            lambda indices, offsets, per_sample_weights: func(
-                indices,
-                offsets,
-                per_sample_weights,
-            ),
-            bwd_only=bwd_only,
-            grad=grad,
-        )
+    # warm-up the GPU before profiling
+    bench_warmup(
+        requests[0],
+        # pyre-ignore[6]
+        warmup_ms,
+        num_warmups,
+        lambda indices, offsets, per_sample_weights: func(
+            indices,
+            offsets,
+            per_sample_weights,
+        ),
+        bwd_only=bwd_only,
+        grad=grad,
+    )
 
-        if callback_after_warmup is not None:
-            callback_after_warmup()
+    if callback_after_warmup is not None:
+        callback_after_warmup()
 
     num_reqs = len(requests)
     iters = num_reqs if iters == -1 else iters
-    sliced = slice_min is not None and slice_max is not None
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
@@ -286,86 +252,7 @@ def benchmark_requests(  # noqa: C901
     else:
         start_events = []
         end_events = []
-    if save and emb:
-        for it in range(iters):
-            req = requests[it % num_reqs]
 
-            indices, offsets, weights = req.unpack_3()
-            out = emb(indices, offsets, weights)
-            torch.cuda.synchronize()
-            if compressed:
-                with gzip.open(f"{save}/{it}_fwd_grad_out.pt.gz", "wb") as f:
-                    torch.save(out, f)
-            else:
-                torch.save(out, f"{save}/{it}_fwd_grad_out.pt")
-            
-            out.backward(grad)
-            torch.cuda.synchronize()
-            torch.save(out, f"{save}/{it}_bwd_grad_out.pt")
- 
-            if sliced:
-                for id, t in enumerate(emb.split_embedding_weights()):
-                    if compressed:
-                        with gzip.open(f"{save}/{it}_{id}_bwd_weights_out.pt.gz", "wb") as f:
-                            torch.save(t[slice_min:slice_max,:].clone(), f)
-                    else:
-                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
-                else:
-                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
-                torch.save(emb.momentum1_dev, f"{save}/{it}_bwd_momentum1_dev_out.pt")
-                torch.save(emb.momentum1_uvm, f"{save}/{it}_bwd_momentum1_uvm_out.pt")
-            
-            else:
-                if compressed:
-                    with gzip.open(f"{save}/{it}_bwd_state_out.pth.gz", "wb") as f:
-                        torch.save(emb.state_dict(), f)
-                else:
-                    torch.save(emb.state_dict(), f"{save}/{it}_bwd_state_out.pth")
-
-    if load and emb:
-        for it in range(iters):
-            req = requests[it % num_reqs]
-
-            indices, offsets, weights = req.unpack_3()
-            out = emb(indices, offsets, weights)
-            torch.cuda.synchronize()
-            
-            out.backward(grad)
-            torch.cuda.synchronize()
-            emb_ref = copy.deepcopy(emb)
-            if not sliced:
-                if compressed:
-                    with gzip.open(f"{load}/{it}_bwd_state_out.pth.gz", "rb") as f:
-                        emb_ref.load_state_dict(torch.load(f))
-                else:
-                    emb_ref.load_state_dict(torch.load(f"{load}/{it}_bwd_state_out.pth"))
-
-            print(f"[{it + 1}/{iters}] Backward weights check... ", end="", flush=True)
-            if sliced:
-                for id, t in enumerate(emb.split_embedding_weights()):
-                    if compressed:
-                        with gzip.open(f"{it}_{id}_bwd_weights_out.pt.gz", "rb") as f:
-                            w_ref = torch.load(f)
-                    else:
-                        w_ref = torch.load(f"{load}/{it}_{id}_bwd_weights_out.pt")
-                    torch.testing.assert_close(t[slice_min:slice_max,:], w_ref,
-                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
-            else:
-                for id, t in enumerate(emb.split_embedding_weights()):
-                    torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
-                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
-            print("PASS")
-            
-            print(f"[{it + 1}/{iters}] Backward momentum check... ", end="", flush=True)
-            if sliced:
-                m_dev_ref = torch.load(f"{load}/{it}_bwd_momentum1_dev_out.pt")
-                m_uvm_ref = torch.load(f"{load}/{it}_bwd_momentum1_uvm_out.pt")
-            else:
-                m_dev_ref = emb_ref.momentum1_dev
-                m_uvm_ref = emb_ref.momentum1_uvm
-            torch.testing.assert_close(emb.momentum1_dev, m_dev_ref, atol=1.0e-4, rtol=1.0e-4)
-            torch.testing.assert_close(emb.momentum1_uvm, m_uvm_ref, atol=1.0e-4, rtol=1.0e-4)
-            print("PASS")
     for it in range(iters):
         req = requests[it % num_reqs]
 
@@ -379,7 +266,7 @@ def benchmark_requests(  # noqa: C901
                 _ = torch.rand(
                     flush_gpu_cache_size_mb * 1024 * 1024 // 4,
                     dtype=torch.float,
-                    device=get_device(),
+                    device="cuda",
                 )
             start_events[it].record()
 
@@ -421,123 +308,8 @@ def benchmark_requests(  # noqa: C901
     return median_time if check_median else avg_time
 
 
-def benchmark_requests_with_spec(  # noqa: C901
-    requests: list[TBERequest],
-    func: Callable[
-        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list[list[int]]]],
-        torch.Tensor,
-    ],
-    flush_gpu_cache_size_mb: int = 0,
-    check_median: bool = False,
-    num_warmups: int = 0,
-    bwd_only: bool = False,
-    grad: Optional[torch.Tensor] = None,
-    # Used to label benchmark iterations differently in nsys profile result
-    # so that we can compare performance of two different models for example.
-    # If empty string is provided, it won't have any effect.
-    nvtx_range: str = "",
-    # Can be used to clear model's stats after warmup for example.
-    callback_after_warmup: Optional[Callable[[], None]] = None,
-    periodic_logs: bool = False,
-    warmup_ms: Optional[int] = None,
-    iters: int = -1,
-) -> float:
-    times = []
-    # Run at least one warmup iteration to avoid the long cudaLaunchKernel time
-    # for the first kernel if warmup_ms > 0
-    # warmup_ms is prioritized over num_warmups
-
-    if warmup_ms is None:
-        num_warmups = num_warmups + 1 if num_warmups >= 0 else 1
-
-    # warm-up the GPU before profiling
-    bench_warmup_with_spec(
-        requests[0],
-        # pyre-ignore[6]
-        warmup_ms,
-        num_warmups,
-        lambda indices, offsets, per_sample_weights, batch_size_per_feature_per_rank: func(
-            indices, offsets, per_sample_weights, batch_size_per_feature_per_rank
-        ),
-        bwd_only=bwd_only,
-        grad=grad,
-    )
-
-    if callback_after_warmup is not None:
-        callback_after_warmup()
-
-    num_reqs = len(requests)
-    iters = num_reqs if iters == -1 else iters
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    else:
-        start_events = []
-        end_events = []
-
-    for it in range(iters):
-        req = requests[it % num_reqs]
-
-        indices, offsets, weights, batch_size_per_feature_per_rank = req.unpack_4()
-        # logging.info(
-        #     f"[Benchmark Request] batch_size_per_feature_per_rank {batch_size_per_feature_per_rank} {indices.device}"
-        # )
-
-        if bwd_only:
-            # Run forward before profiling if does backward only
-            out = func(indices, offsets, weights, batch_size_per_feature_per_rank)
-        start_time = time.time()
-        if torch.cuda.is_available():
-            if flush_gpu_cache_size_mb:
-                _ = torch.rand(
-                    flush_gpu_cache_size_mb * 1024 * 1024 // 4,
-                    dtype=torch.float,
-                    device=get_device(),
-                )
-            start_events[it].record()
-
-        if nvtx_range:
-            torch.cuda.nvtx.range_push(f"{nvtx_range}-{it}")
-
-        if bwd_only:
-            out.backward(grad)
-        else:
-            func(indices, offsets, weights, batch_size_per_feature_per_rank)
-
-        if nvtx_range:
-            torch.cuda.nvtx.range_pop()
-
-        if torch.cuda.is_available():
-            end_events[it].record()
-        else:
-            it_time = time.time() - start_time
-            times.append(it_time)
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        times = [
-            start.elapsed_time(end) * 1.0e-3
-            for start, end in zip(start_events, end_events)
-        ]
-
-    if periodic_logs:
-        for it in range(100, iters + 1, 100):
-            times_ = times[0:it]
-            avg_time = sum(times_) / len(times_) * 1.0e6
-            last_100_avg = sum(times_[-100:]) / 100 * 1.0e6
-            logging.info(
-                f"Iteration [{it}/{len(requests)}]: Last 100: {last_100_avg:.2f} us, Running avg: {avg_time:.2f} us"
-            )
-
-    avg_time = sum(times) / iters
-    median_time = statistics.median(times)
-    return median_time if check_median else avg_time
-
-
 def benchmark_requests_refer(
-    requests: list[TBERequest],
+    requests: List[TBERequest],
     T: int,
     B: int,
     L: int,
@@ -576,7 +348,7 @@ def benchmark_requests_refer(
                 _ = torch.rand(
                     flush_gpu_cache_size_mb * 1024 * 1024 // 4,
                     dtype=torch.float,
-                    device=get_device(),
+                    device="cuda",
                 )
                 torch.cuda.synchronize()
             start_event.record()
@@ -629,12 +401,12 @@ def benchmark_requests_refer(
 
 
 def benchmark_pipelined_requests(
-    requests: list[TBERequest],
+    requests: List[TBERequest],
     func1: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], None],
     func2: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], None],
     flush_gpu_cache_size_mb: int = 0,
     check_median: bool = False,
-) -> tuple[float, float]:
+) -> Tuple[float, float]:
     torch.cuda.synchronize()
     start_events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -650,7 +422,7 @@ def benchmark_pipelined_requests(
             _ = torch.rand(
                 flush_gpu_cache_size_mb * 1024 * 1024 // 4,
                 dtype=torch.float,
-                device=get_device(),
+                device="cuda",
             )
             torch.cuda.synchronize()
         start_event[0].record()
@@ -686,10 +458,10 @@ def benchmark_pipelined_requests(
 
 
 def benchmark_vbe(
-    requests: list[tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
+    requests: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     num_warmups: int = 0,
-) -> tuple[float, float]:
+) -> Tuple[float, float]:
     """
     A benchmark function to return the average execution time in seconds of
     forward and backward of VBE kernels.
