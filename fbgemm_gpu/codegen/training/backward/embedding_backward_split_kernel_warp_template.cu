@@ -168,6 +168,239 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 #else
     const unsigned int shfl_sync_mask = 0xffffffffu;
 #endif
+
+
+    {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+
+#define BROADCAST(val, srcLane) __builtin_amdgcn_readlane(val,srcLane)
+
+    constexpr int VEC_WIDTH = 4;
+    constexpr auto kIsInt8 = std::is_same<emb_t, uint8_t>::value;
+    // printf("%s block3 dim %d, %d %d\n", __FILE__, blockDim.x, blockDim.y, blockDim.z);
+
+    struct SharedMemory<Vec4TAcc<cache_t>> smem;
+    const int32_t grad_sum_stride = max_D / VEC_WIDTH;
+    auto* smem_grad_sum = (kUseVecBlocking || kIsInt8)
+      ? smem.getPointer() + threadIdx.y * grad_sum_stride
+      : nullptr;
+
+    constexpr int num_unroll = 32;
+
+    auto num_run_id = min(sorted_linear_indices_run.size(0), sorted_linear_indices_num_runs[0]);
+
+    for (uint32_t out_run_id = start_run_id * num_unroll; out_run_id < num_run_id; out_run_id += gridDim.x * blockDim.y * num_unroll) {
+
+        auto stride = gridDim.x * blockDim.y;
+        // auto num_valid_id = min(num_unroll, (num_run_id - out_run_id + stride - 1) / stride);
+        auto num_valid_id = min(num_unroll, num_run_id - out_run_id);
+
+        auto is_valid = threadIdx.x < num_valid_id;
+
+        int32_t s_segment_start = is_valid? sorted_linear_indices_cumulative_run_lengths[(out_run_id + threadIdx.x)] : -1;
+        int32_t s_segment_end = is_valid? sorted_linear_indices_cumulative_run_lengths[(out_run_id + threadIdx.x + 1)] : -1;
+        int64_t s_idx = is_valid? sorted_linear_indices_run[out_run_id + threadIdx.x] : -1;
+
+        uint32_t s_t_0 = is_valid? reinterpret_cast<const uint32_t*>(&sorted_infos[0])[s_segment_start] : -1;
+        s_t_0 = s_t_0 >> info_B_num_bits;
+
+        int64_t s_hash_size = is_valid? hash_size_cumsum[s_t_0] : -1;
+        int32_t s_D_offsets_0 = is_valid? D_offsets[s_t_0] : 0;
+        int32_t s_D_offsets_1 = is_valid? D_offsets[s_t_0 + 1] : 0;
+        int32_t s_table_unique_indice_offset = is_valid? table_unique_indices_offsets[s_t_0] : 0;
+
+        s_idx -= s_hash_size;
+        auto s_D = s_D_offsets_1 - s_D_offsets_0;
+        // int64_t s_weights_offset = is_valid? weights_offsets[s_t_0] : 0;
+
+        for (auto i = 0; i < num_valid_id; ++i) {
+            // if (threadIdx.x == 0) {
+            //   printf("tag0\n");
+            // }
+            auto run_id = out_run_id + i;
+            auto t_0 = BROADCAST(s_t_0, i);
+            auto idx = BROADCAST(s_idx, i);
+            auto segment_start = BROADCAST(s_segment_start, i);
+            auto segment_end = BROADCAST(s_segment_end, i);
+            auto D = BROADCAST(s_D, i);
+            int32_t table_unique_indice_offset = BROADCAST(s_table_unique_indice_offset, i);
+            const int32_t SL = segment_end - segment_start;
+            const int64_t weights_offset = weights_offsets[t_0];
+            const int64_t momentum1_offset = momentum1_offsets[t_0];
+            // const int64_t weights_offset = SHFL_SYNC(s_weights_offset, i);
+
+            const auto weights_placement = static_cast<PlacementType>(weights_placements[t_0]);
+            const auto momentum1_placement = static_cast<PlacementType>(momentum1_placements[t_0]);
+
+            if (SL >= max_segment_length_per_warp) {
+                continue;
+            }
+
+
+            // now, each segment corresponds to exactly one table `t` and row in
+            // that table (`idx`). Thus, we can hoist out some of the book-keeping.
+
+            // D can be hoisted here because D is the same if features share the
+            // same table, but D_start is different
+
+            const int32_t SL_per_warp = div_round_up(SL, blockDim.y);
+            const int32_t sl_start = 0;
+            const int32_t sl_end = SL;
+            Vec4TAcc<cache_t> grad_sum[kFixedMaxVecsPerThread];
+            constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
+            const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
+
+            if constexpr (kUseVecBlocking) {
+                compute_grad_sum_unweighted<
+                grad_t,
+                cache_t,
+                kFixedMaxVecsPerThread,
+                kThreadGroupSize,
+                VEC_WIDTH,
+                kUseVecBlocking>(
+                    grad_sum,
+                    smem_grad_sum,
+                    grad_output,
+                    D_offsets,
+                    D,
+                    T,
+                    sorted_infos,
+                    info_B_num_bits,
+                    info_B_mask,
+                    segment_start,
+                    sl_start,
+                    sl_end,
+                    shfl_sync_mask,
+                    num_vecs
+                );
+            } else {
+                #pragma unroll kFixedMaxVecsPerThread
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; vec++) {
+                    grad_sum[vec].acc.x = 0;
+                    grad_sum[vec].acc.y = 0;
+                    grad_sum[vec].acc.z = 0;
+                    grad_sum[vec].acc.w = 0;
+                }
+
+                // for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
+                // auto sl_j = threadIdx.x;
+                const auto b_t = threadIdx.x < sl_end
+                    ? reinterpret_cast<const uint32_t*>(
+                        &sorted_infos[0])[segment_start + threadIdx.x]
+                    : 0;
+                const auto b = b_t & info_B_mask;
+                const auto t = b_t >> info_B_num_bits; // if vbe
+                int32_t D_start = threadIdx.x < sl_end ? D_offsets[t] : 0; // if vbe // if not nobag
+                int32_t j = 0;
+                for (; j + 3 < sl_end; j+=4) {
+                    int32_t b_j_0 = SHFL_SYNC(b, j);
+                    int32_t b_j_1 = SHFL_SYNC(b, j + 1);
+                    int32_t b_j_2 = SHFL_SYNC(b, j + 2);
+                    int32_t b_j_3 = SHFL_SYNC(b, j + 3);
+
+                    int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
+                    int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
+                    int32_t D_start_j_2 = SHFL_SYNC(D_start, j + 2);
+                    int32_t D_start_j_3 = SHFL_SYNC(D_start, j + 3);
+
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                        const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                        Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                        Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                        Vec4TAcc<grad_t> grad_out_vec_2(&grad_output[b_j_2][0] + D_start_j_2 + d);  // if nobag
+                        Vec4TAcc<grad_t> grad_out_vec_3(&grad_output[b_j_3][0] + D_start_j_3 + d);  // if nobag
+                        grad_sum[vec].add_(grad_out_vec_0);
+                        grad_sum[vec].add_(grad_out_vec_1);
+                        grad_sum[vec].add_(grad_out_vec_2);
+                        grad_sum[vec].add_(grad_out_vec_3);
+                    }
+                }
+                for (; j + 1 < sl_end; j+=2) {
+                    int32_t b_j_0 = SHFL_SYNC(b, j);
+                    int32_t b_j_1 = SHFL_SYNC(b, j + 1);
+
+                    int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
+                    int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
+
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                        const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                        Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                        Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                        grad_sum[vec].add_(grad_out_vec_0);
+                        grad_sum[vec].add_(grad_out_vec_1);
+                    }
+                }
+                for (; j < sl_end; ++j) {
+                    int32_t b_j = SHFL_SYNC(b, j);
+                    int32_t D_start_j = SHFL_SYNC(D_start, j);
+
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                        const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                        Vec4TAcc<grad_t> grad_out_vec(
+                            &grad_output[b_j][0] + D_start_j + d // if nobag
+                        );
+                        grad_sum[vec].add_(grad_out_vec);
+                    }
+            }
+            // }
+
+                if (smem_grad_sum) {
+                    // Store grad_sum in smem_grad_sum
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0;
+                        (vec < kFixedMaxVecsPerThread) && (vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH < D;
+                        ++vec) {
+                        const int32_t d_vec = (vec * kThreadGroupSize + threadIdx.x);
+                        smem_grad_sum[d_vec] = grad_sum[vec];
+                        }
+                }
+            }
+
+            // Copy value to max_vecs to make max_vecs_per_thread known at compile time
+            // when kUseVecBlocking == false
+            const int32_t max_vecs =
+                kUseVecBlocking ? max_vecs_per_thread : kFixedMaxVecsPerThread;
+            split_rowwise_adagrad_table_update_kernel_device<
+              emb_t,
+              cache_t,
+              kFixedMaxVecsPerThread,
+              kThreadGroupSize,
+              VEC_WIDTH,
+              kUseVecBlocking>(
+                  dev_weights,
+                  uvm_weights,
+                  lxu_cache_weights,
+                //   weights_placements,
+                //   weights_offsets,
+                  weights_placement,
+                  weights_offset,
+                  sorted_lxu_cache_locations,
+                  grad_sum,
+                  smem_grad_sum,
+                  smem_grad_sum, // shared_weight_update_row (reuse smem_grad_sum)
+                  stochastic_rounding,
+                  stochastic_rounding_philox_args,
+                  run_id,
+                  use_uniq_cache_locations
+                      ? (run_id - table_unique_indice_offset)
+                      : segment_start,
+                  D,
+                  t_0,
+                  idx,
+                  1, // global_weight_decay
+                  shfl_sync_mask,
+                  max_vecs,
+                  momentum1_dev, momentum1_uvm, momentum1_placement, momentum1_offset, learning_rate, eps, weight_decay, weight_decay_mode, max_norm
+            ); // if not dense and optimizer != "none"
+        }
+    }
+
+
+
+    {%- else %}
+
     constexpr int VEC_WIDTH = 4;
     constexpr auto kIsInt8 = std::is_same<emb_t, uint8_t>::value;
 
@@ -339,6 +572,10 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
         );
         {%- endif %} // if not dense and optimizer != "none"
     }
+
+    {%- endif %}
+
+
 }
 
 
@@ -365,7 +602,11 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 %}
 
 {%- set gwddesc = "_gwd" if is_gwd_kernel else "" %}
+{%- if grad_type == 'at::Half' and emb_type == 'at::Half' and cache_type == 'float' and index_type == 'int64_t' %}
+template __global__ __launch_bounds__(kBackwardMaxThreads, 8) void
+{%- else %}
 template __global__ __launch_bounds__(kBackwardMaxThreads) void
+{%- endif %}
 {%- if is_index_select %}
 batch_index_select_dim0_codegen_backward_kernel_warp_per_row
 {%- else %}
