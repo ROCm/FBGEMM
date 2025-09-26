@@ -141,7 +141,50 @@ DEVICE_INLINE void compute_grad_sum_{{ kdesc }}(
                 ? sorted_indice_weights[segment_start + sl_j]
                 : 0.0;
             {%- endif %}
-            for (int32_t j = 0; j < kThreadGroupSize && sl + j < sl_end; ++j) {
+            int32_t j = 0;
+            {%- if kdesc == "unweighted" and not ssd and not nobag and not vbe and not weighted and not is_index_select%}
+            for (; j + 3 < kThreadGroupSize && sl + j + 3 < sl_end; j+=4) {
+                int32_t b_j_0 = SHFL_SYNC(b, j);
+                int32_t b_j_1 = SHFL_SYNC(b, j + 1);
+                int32_t b_j_2 = SHFL_SYNC(b, j + 2);
+                int32_t b_j_3 = SHFL_SYNC(b, j + 3);
+
+                int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
+                int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
+                int32_t D_start_j_2 = SHFL_SYNC(D_start, j + 2);
+                int32_t D_start_j_3 = SHFL_SYNC(D_start, j + 3);
+
+                #pragma unroll kFixedMaxVecsPerThread
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                    const int32_t d = (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                    Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                    Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                    Vec4TAcc<grad_t> grad_out_vec_2(&grad_output[b_j_2][0] + D_start_j_2 + d);  // if nobag
+                    Vec4TAcc<grad_t> grad_out_vec_3(&grad_output[b_j_3][0] + D_start_j_3 + d);  // if nobag
+                    grad_sum[vec].add_(grad_out_vec_0);
+                    grad_sum[vec].add_(grad_out_vec_1);
+                    grad_sum[vec].add_(grad_out_vec_2);
+                    grad_sum[vec].add_(grad_out_vec_3);
+                }
+            }
+            for (; j + 1 < kThreadGroupSize && sl + j + 1 < sl_end; j+=2) {
+                int32_t b_j_0 = SHFL_SYNC(b, j);
+                int32_t b_j_1 = SHFL_SYNC(b, j + 1);
+
+                int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
+                int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
+
+                #pragma unroll kFixedMaxVecsPerThread
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                    const int32_t d = (((vec + vec_start) * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                    Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                    Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                    grad_sum[vec].add_(grad_out_vec_0);
+                    grad_sum[vec].add_(grad_out_vec_1);
+                }
+            }
+            {%- endif %}
+            for (; j < kThreadGroupSize && sl + j < sl_end; ++j) {
                 {%- if nobag %}
                 int32_t l_j = SHFL_SYNC(l, j);
                 {%- elif vbe %}
