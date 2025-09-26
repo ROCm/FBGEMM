@@ -179,6 +179,303 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
   const auto warp_id = threadIdx.y;
   const auto lane_id = threadIdx.x;
 
+  {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+
+  // Copy value to max_vecs to make max_vecs_per_thread known at compile time
+  // when kUseVecBlocking == false
+  const int32_t max_vecs =
+      kUseVecBlocking ? max_vecs_per_thread : kFixedMaxVecsPerThread;
+  struct SharedMemory<Vec4TAcc<cache_t>> smem;
+  auto* smem_grad_sum =
+      smem.getPointer() + warp_id * max_vecs * kThreadGroupSize;
+  for (auto long_run_id = blockIdx.x; long_run_id < num_long_runs; long_run_id += gridDim.x) {
+        // The first thread block in the really long run has run_id in long_run_ids
+        // and the rest have the negative of its offset (see find_long_segments kernel).
+        int32_t cta_rank_on_current_run = 0;
+        int32_t current_run_id = long_run_ids[long_run_id];
+        if (current_run_id < 0) {
+            cta_rank_on_current_run = -long_run_ids[long_run_id];
+            current_run_id = long_run_ids[long_run_id - cta_rank_on_current_run];
+        }
+        const int32_t run_length =
+            sorted_linear_indices_cumulative_run_lengths[current_run_id + 1] -
+            sorted_linear_indices_cumulative_run_lengths[current_run_id];
+        // This computation must agree with how we compute num_ctas_for_run in
+        // find_long_segments kernel!
+        const int32_t num_ctas_on_current_run =
+            use_deterministic_algorithms ? 1 : div_round_up(run_length, max_segment_length_per_cta);
+
+
+        const int64_t linear_index = sorted_linear_indices_run[current_run_id];
+        const int32_t segment_start =
+            sorted_linear_indices_cumulative_run_lengths[current_run_id] +
+            cta_rank_on_current_run * max_segment_length_per_cta;
+        const int32_t segment_end = ::min(
+            use_deterministic_algorithms ? INT_MAX : segment_start + max_segment_length_per_cta,
+            sorted_linear_indices_cumulative_run_lengths[current_run_id + 1]);
+        const int32_t SL = segment_end - segment_start;
+
+        // Note that with shared embedding tables we can have multiple tables
+        // (i.e. different values of `t` sharing the same segment).
+        const auto info_0 = reinterpret_cast<const uint32_t*>(&sorted_infos[0])[segment_start];
+        const auto t_0 = info_0 >> info_B_num_bits;
+
+        int64_t hash_size = hash_size_cumsum[t_0];
+        const int32_t D_start_t0 = D_offsets[t_0];
+        // D can be hoisted here because D is the same if features share the
+        // same table, but D_start is different
+        const int32_t D = D_offsets[t_0 + 1] - D_start_t0;
+        int64_t idx = linear_index - hash_size;
+
+        const int32_t SL_per_warp = div_round_up(SL, blockDim.y);
+        const int32_t sl_start = SL_per_warp * warp_id;
+        const int32_t sl_end = min(SL_per_warp * (warp_id + 1), SL);
+
+        // Accumulate gradients (compute grad_sum)
+        Vec4TAcc<cache_t> grad_sum[kFixedMaxVecsPerThread];
+        constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
+        const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
+
+        compute_grad_sum_unweighted_unroll<
+          grad_t,
+          cache_t,
+          kFixedMaxVecsPerThread,
+          kThreadGroupSize,
+          VEC_WIDTH,
+          kUseVecBlocking>(
+            grad_sum,
+            smem_grad_sum,
+            grad_output,
+            D_offsets,
+            D,
+            T,
+            sorted_infos,
+            info_B_num_bits,
+            info_B_mask,
+            segment_start,
+            sl_start,
+            sl_end,
+            shfl_sync_mask,
+            num_vecs
+        );
+        // Do shared memory reduction only if we used multiple warps.
+        if (SL > SL_per_warp) {
+            __syncthreads();
+
+            
+    if (blockDim.y >= 32) {
+      if (warp_id < 16) {
+        for (int32_t vec = 0; vec < max_vecs && (vec * kThreadGroupSize + lane_id) * VEC_WIDTH < D; ++vec) {
+          const int32_t d_vec = (vec * kThreadGroupSize + lane_id);
+          smem_grad_sum[d_vec] = vec4_acc(
+              smem_grad_sum[d_vec],
+              smem_grad_sum[d_vec +
+                  16 * max_vecs * kThreadGroupSize]);
+        }
+      }
+      __syncthreads();
+  }
+            
+    if (blockDim.y >= 16) {
+      if (warp_id < 8) {
+        for (int32_t vec = 0; vec < max_vecs && (vec * kThreadGroupSize + lane_id) * VEC_WIDTH < D; ++vec) {
+          const int32_t d_vec = (vec * kThreadGroupSize + lane_id);
+          smem_grad_sum[d_vec] = vec4_acc(
+              smem_grad_sum[d_vec],
+              smem_grad_sum[d_vec +
+                  8 * max_vecs * kThreadGroupSize]);
+        }
+      }
+      __syncthreads();
+  }
+            
+    if (blockDim.y >= 8) {
+      if (warp_id < 4) {
+        for (int32_t vec = 0; vec < max_vecs && (vec * kThreadGroupSize + lane_id) * VEC_WIDTH < D; ++vec) {
+          const int32_t d_vec = (vec * kThreadGroupSize + lane_id);
+          smem_grad_sum[d_vec] = vec4_acc(
+              smem_grad_sum[d_vec],
+              smem_grad_sum[d_vec +
+                  4 * max_vecs * kThreadGroupSize]);
+        }
+      }
+      __syncthreads();
+  }
+            
+    if (blockDim.y >= 4) {
+      if (warp_id < 2) {
+        for (int32_t vec = 0; vec < max_vecs && (vec * kThreadGroupSize + lane_id) * VEC_WIDTH < D; ++vec) {
+          const int32_t d_vec = (vec * kThreadGroupSize + lane_id);
+          smem_grad_sum[d_vec] = vec4_acc(
+              smem_grad_sum[d_vec],
+              smem_grad_sum[d_vec +
+                  2 * max_vecs * kThreadGroupSize]);
+        }
+      }
+      __syncthreads();
+  }
+
+            if (warp_id == 0) {
+                
+    if constexpr (kUseVecBlocking) {
+        // max_vecs is not known at compile time
+        for (int32_t vec = 0;
+            vec < max_vecs &&
+            (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                        smem_grad_sum[d_vec] = vec4_acc(
+                            smem_grad_sum[d_vec],
+                            smem_grad_sum[d_vec + max_vecs * kThreadGroupSize]
+                        );
+                       
+        }
+    
+    } else {
+        // kFixedMaxVecsPerThread is known at compile time
+        #pragma unroll kFixedMaxVecsPerThread
+        for (int32_t vec = 0;
+            vec < kFixedMaxVecsPerThread
+                && (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                        grad_sum[vec] = vec4_acc(
+                            smem_grad_sum[d_vec],
+                            smem_grad_sum[d_vec + max_vecs * kThreadGroupSize]
+                        );
+                       
+        }
+    }
+    
+            }
+        }
+
+        if (warp_id != 0) {
+            continue;
+        }
+
+        if (num_ctas_on_current_run > 1) {
+            int really_long_run_id = long_run_id_to_really_long_run_ids[long_run_id];
+            Vec4TAcc<cache_t> *temp_grad_accum_ptr =
+                reinterpret_cast<Vec4TAcc<cache_t>*>(&temp_grad_accum[really_long_run_id][0]);
+            
+    if constexpr (kUseVecBlocking) {
+        // max_vecs is not known at compile time
+        for (int32_t vec = 0;
+            vec < max_vecs &&
+            (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.x, smem_grad_sum[d_vec].acc.x);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.y, smem_grad_sum[d_vec].acc.y);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.z, smem_grad_sum[d_vec].acc.z);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.w, smem_grad_sum[d_vec].acc.w);
+                    
+        }
+    
+    } else {
+        // kFixedMaxVecsPerThread is known at compile time
+        #pragma unroll kFixedMaxVecsPerThread
+        for (int32_t vec = 0;
+            vec < kFixedMaxVecsPerThread
+                && (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.x, grad_sum[vec].acc.x);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.y, grad_sum[vec].acc.y);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.z, grad_sum[vec].acc.z);
+                    gpuAtomicAdd(&temp_grad_accum_ptr[d_vec].acc.w, grad_sum[vec].acc.w);
+                    
+        }
+    }
+    
+
+            int counter;
+            if (threadIdx.x == 0) {
+                __threadfence();
+                counter = gpuAtomicAdd(&grad_accum_counter[really_long_run_id], -1);
+            }
+            counter = SHFL_SYNC(counter, 0);
+            // Only the thread block accumulated the gradient last does the weight update.
+            if (counter > 1) {
+                continue;
+            }
+            CUDA_KERNEL_ASSERT(counter == 1 && "Invalid grad_accum_counter. Race condition?");
+            
+    if constexpr (kUseVecBlocking) {
+        // max_vecs is not known at compile time
+        for (int32_t vec = 0;
+            vec < max_vecs &&
+            (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                    smem_grad_sum[d_vec] = temp_grad_accum_ptr[d_vec];
+                    
+        }
+    
+    } else {
+        // kFixedMaxVecsPerThread is known at compile time
+        #pragma unroll kFixedMaxVecsPerThread
+        for (int32_t vec = 0;
+            vec < kFixedMaxVecsPerThread
+                && (kThreadGroupSize * vec + threadIdx.x) * VEC_WIDTH < D;
+            ++vec) {
+            const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
+            [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
+            
+                    grad_sum[vec] = temp_grad_accum_ptr[d_vec];
+                    
+        }
+    }
+    
+        }
+
+        
+        split_rowwise_adagrad_table_update_kernel<
+          emb_t,
+          cache_t,
+          kFixedMaxVecsPerThread,
+          kThreadGroupSize,
+          VEC_WIDTH,
+          kUseVecBlocking>(
+              dev_weights,
+              uvm_weights,
+              lxu_cache_weights,
+              weights_placements,
+              weights_offsets,
+              sorted_lxu_cache_locations,
+              grad_sum,
+              kUseVecBlocking ? smem_grad_sum : nullptr,
+              kIsInt8 ? smem_grad_sum : nullptr,
+              stochastic_rounding,
+              stochastic_rounding_philox_args,
+              current_run_id,
+              use_uniq_cache_locations
+                  ? (current_run_id - table_unique_indices_offsets[t_0])
+                  : segment_start,
+              D,
+              t_0,
+              idx,
+              
+              1, // global_weight_decay
+              shfl_sync_mask,
+              max_vecs,
+              momentum1_dev, momentum1_uvm, momentum1_placements, momentum1_offsets, learning_rate, eps, weight_decay, weight_decay_mode, max_norm
+        );
+    } // for each run
+
+  {%- else %}
+
   // Copy value to max_vecs to make max_vecs_per_thread known at compile time
   // when kUseVecBlocking == false
   const int32_t max_vecs =
@@ -251,33 +548,6 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
         constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
         const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
 
-        {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
-
-        compute_grad_sum_unweighted_unroll<
-          grad_t,
-          cache_t,
-          kFixedMaxVecsPerThread,
-          kThreadGroupSize,
-          VEC_WIDTH,
-          kUseVecBlocking>(
-            grad_sum,
-            smem_grad_sum,
-            grad_output,
-            D_offsets,
-            D,
-            T,
-            sorted_infos,
-            info_B_num_bits,
-            info_B_mask,
-            segment_start,
-            sl_start,
-            sl_end,
-            shfl_sync_mask,
-            num_vecs
-        );
-
-        {%- else %}
-
         compute_grad_sum_{{ kdesc }}<
           grad_t,
           cache_t,
@@ -315,8 +585,6 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
             shfl_sync_mask,
             num_vecs
         );
-
-        {%- endif %}
 
         // Do shared memory reduction only if we used multiple warps.
         if (SL > SL_per_warp) {
@@ -451,6 +719,8 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
         );
         {%- endif %}
     } // for each run
+
+    {%- endif %}
 }
 
 ////////////////////////////////////////////////////////////////////////////////

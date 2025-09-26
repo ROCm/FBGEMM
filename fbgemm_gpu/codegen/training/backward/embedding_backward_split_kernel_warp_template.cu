@@ -210,6 +210,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 
         s_idx -= s_hash_size;
         auto s_D = s_D_offsets_1 - s_D_offsets_0;
+        // int64_t s_weights_offset = is_valid? weights_offsets[s_t_0] : 0;
 
         for (auto i = 0; i < num_valid_id; ++i) {
             // if (threadIdx.x == 0) {
@@ -223,6 +224,12 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
             auto D = BROADCAST(s_D, i);
             int32_t table_unique_indice_offset = BROADCAST(s_table_unique_indice_offset, i);
             const int32_t SL = segment_end - segment_start;
+            const int64_t weights_offset = weights_offsets[t_0];
+            const int64_t momentum1_offset = momentum1_offsets[t_0];
+            // const int64_t weights_offset = SHFL_SYNC(s_weights_offset, i);
+
+            const auto weights_placement = static_cast<PlacementType>(weights_placements[t_0]);
+            const auto momentum1_placement = static_cast<PlacementType>(momentum1_placements[t_0]);
 
             if (SL >= max_segment_length_per_warp) {
                 continue;
@@ -355,7 +362,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
             // when kUseVecBlocking == false
             const int32_t max_vecs =
                 kUseVecBlocking ? max_vecs_per_thread : kFixedMaxVecsPerThread;
-            split_rowwise_adagrad_table_update_kernel<
+            split_rowwise_adagrad_table_update_kernel_device<
               emb_t,
               cache_t,
               kFixedMaxVecsPerThread,
@@ -365,8 +372,10 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
                   dev_weights,
                   uvm_weights,
                   lxu_cache_weights,
-                  weights_placements,
-                  weights_offsets,
+                //   weights_placements,
+                //   weights_offsets,
+                  weights_placement,
+                  weights_offset,
                   sorted_lxu_cache_locations,
                   grad_sum,
                   smem_grad_sum,
@@ -383,10 +392,11 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
                   1, // global_weight_decay
                   shfl_sync_mask,
                   max_vecs,
-                  momentum1_dev, momentum1_uvm, momentum1_placements, momentum1_offsets, learning_rate, eps, weight_decay, weight_decay_mode, max_norm
+                  momentum1_dev, momentum1_uvm, momentum1_placement, momentum1_offset, learning_rate, eps, weight_decay, weight_decay_mode, max_norm
             ); // if not dense and optimizer != "none"
         }
     }
+
 
 
     {%- else %}
