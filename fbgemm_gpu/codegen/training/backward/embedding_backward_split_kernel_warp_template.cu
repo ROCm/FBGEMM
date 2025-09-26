@@ -602,7 +602,11 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
 %}
 
 {%- set gwddesc = "_gwd" if is_gwd_kernel else "" %}
+{%- if grad_type == 'at::Half' and emb_type == 'at::Half' and cache_type == 'float' and index_type == 'int64_t' %}
+template __global__ __launch_bounds__(kBackwardMaxThreads, 8) void
+{%- else %}
 template __global__ __launch_bounds__(kBackwardMaxThreads) void
+{%- endif %}
 {%- if is_index_select %}
 batch_index_select_dim0_codegen_backward_kernel_warp_per_row
 {%- else %}
