@@ -159,19 +159,13 @@ void all_to_one(
   // the target device. Since target device can be different across each call,
   // we store all the events in a 2-dimentionsal vector.
   using PerDeviceEventList = std::vector<at::cuda::CUDAEvent>;
-  static thread_local std::vector<PerDeviceEventList> two_hop_copy_begin_events;
   static thread_local std::vector<PerDeviceEventList> copy_begin_events;
   static thread_local std::vector<PerDeviceEventList> copy_completion_events;
   static thread_local std::once_flag flag1;
   std::call_once(flag1, [num_gpus]() {
-    two_hop_copy_begin_events.reserve(num_gpus);
-    copy_begin_events.reserve(num_gpus);
-    copy_completion_events.reserve(num_gpus);
-
     for (auto i = 0; i < num_gpus; i++) {
-      two_hop_copy_begin_events.emplace_back(num_gpus);
-      copy_begin_events.emplace_back(num_gpus);
-      copy_completion_events.emplace_back(num_gpus);
+      copy_begin_events.push_back(PerDeviceEventList(num_gpus));
+      copy_completion_events.push_back(PerDeviceEventList(num_gpus));
     }
   });
 
@@ -196,37 +190,27 @@ void all_to_one(
     auto intermediate_node =
         intermediate_nodes(src_device_id, target_device_index);
     if (intermediate_node != -1) {
-      Tensor dst = at::empty_like(
-          src, src.options().device(at::Device(at::kCUDA, intermediate_node)));
-
-      // This is a cross-device copy from the src device to the dst device.
-      // We need to synchronize src with dst to ensure that the dst memory
-      // is ready; Write-after-Write or Write-after-Read dependencies are
-      // handled. E.g. CudaCachingAllocator might reuse existing tensor memory
-      // space that has ongoing kernel ops
-      //
-      // To address this, we use cudaEvent to make src stream wait on all
-      // kernels on the dst stream (after dst memory initialization) to be
-      // completed prior to the copy
-      const auto source_device_id = src.get_device();
-      at::cuda::CUDAStream copy_stream =
-          at::cuda::getCurrentCUDAStream(source_device_id);
-
-      auto& dst_ready =
-          two_hop_copy_begin_events[intermediate_node][source_device_id];
-      dst_ready.record(at::cuda::getCurrentCUDAStream(intermediate_node));
-      dst_ready.block(copy_stream);
-
       two_hop_transfers.push_back(
-          {.intermediate_tensor = dst,
+          {.intermediate_tensor = at::empty(
+               src.sizes(),
+               src.options().device(at::Device(at::kCUDA, intermediate_node))),
            .output_idx = i,
            .transfer_cuda_event =
                std::make_unique<at::cuda::CUDAEvent>(cudaEventDisableTiming)});
+      auto& dst = two_hop_transfers.back().intermediate_tensor;
+      at::cuda::CUDAStream copy_stream =
+          at::cuda::getCurrentCUDAStream(src_device_id);
+      void* tmp1 = nullptr;
+      void* tmp2 = nullptr;
+      size_t srcPitchBytes;
+      size_t dstPitchBytes;
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
       AT_CUDA_CHECK(cudaMemcpy2DAsync(
           dst.data_ptr(),
-          dst.stride(0) * dst.element_size(),
+          dstPitchBytes,//dst.stride(0) * dst.element_size(),
           src.data_ptr(),
-          src.stride(0) * src.element_size(),
+          srcPitchBytes,//src.stride(0) * src.element_size(),
           src.size(1) * src.element_size(),
           src.size(0),
           cudaMemcpyDeviceToDevice,
@@ -248,11 +232,13 @@ void all_to_one(
     }
 
     // synchronize source streams and launch copies on source stream.
+    at::cuda::CUDAGuard device_guard(src_device);
     // We always perform the copy on the source device, using the current
     // stream on the source device, and we fully synchronize on both src and
     // dst's current streams for completion of the copy. We have to explicitly
     // do this for non-contig copies. This mimics the behavior of cross-device
     // cudaMemcpyAsync on the default stream.
+
     at::cuda::CUDAStream copy_stream =
         at::cuda::getCurrentCUDAStream(device_id);
     // This is a cross-device copy on the src current stream and dst current
@@ -262,7 +248,9 @@ void all_to_one(
     // that no one is operating on the dst memory when we perform the copy.
     // src waits on dst barrier (src already waits on src)
     auto& dst_ready = copy_begin_events[target_device_index][device_id];
+    device_guard.set_device(target_device);
     dst_ready.record(at::cuda::getCurrentCUDAStream(target_device_index));
+    device_guard.set_device(src_device);
     dst_ready.block(copy_stream);
     for (const auto i : c10::irange(input_tensors.size())) {
       const auto metadata = is_two_hop_transfer.at(i);
@@ -279,11 +267,17 @@ void all_to_one(
 
       auto& dst = output_tensors[i];
       // on source device, launch memcpy.
+      void* tmp1 = nullptr;
+      void* tmp2 = nullptr;
+      size_t srcPitchBytes;
+      size_t dstPitchBytes;
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+      AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
       AT_CUDA_CHECK(cudaMemcpy2DAsync(
           dst.data_ptr(),
-          dst.stride(0) * dst.element_size(),
+          dstPitchBytes,//dst.stride(0) * dst.element_size(),
           src.data_ptr(),
-          src.stride(0) * src.element_size(),
+          srcPitchBytes,//src.stride(0) * src.element_size(),
           src.size(1) * src.element_size(),
           src.size(0),
           cudaMemcpyDeviceToDevice,
@@ -300,24 +294,34 @@ void all_to_one(
       continue;
     }
 
-    // source rank stream
+    // intermediate rank
+    at::cuda::CUDAGuard device_guard(src_device);
+    // intermediate rank stream
     at::cuda::CUDAStream copy_stream =
         at::cuda::getCurrentCUDAStream(src_device_id);
     // wait on first hop transfer
     two_hop_transfer.transfer_cuda_event->block(copy_stream);
     // synchronize with target rank
     auto& dst_ready = copy_begin_events[target_device_index][src_device_id];
+    device_guard.set_device(target_device);
     dst_ready.record(at::cuda::getCurrentCUDAStream(target_device_index));
+    device_guard.set_device(src_device);
     dst_ready.block(copy_stream);
     // originating tensor output position
     const auto output_index = two_hop_transfer.output_idx;
     auto& dst = output_tensors.at(output_index);
     // on source device, launch memcpy.
+    size_t srcPitchBytes;
+    void* tmp1 = nullptr;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    size_t dstPitchBytes;
+    void* tmp2 = nullptr;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//dst.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
@@ -333,11 +337,17 @@ void all_to_one(
         // single device memcpy, not that src_device == dst_device.
         at::cuda::CUDAStream copy_stream =
             at::cuda::getCurrentCUDAStream(target_device_index);
+        void* tmp1 = nullptr;
+        void* tmp2 = nullptr;
+        size_t srcPitchBytes;
+        size_t dstPitchBytes;
+        AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+        AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
         AT_CUDA_CHECK(cudaMemcpy2DAsync(
             dst.data_ptr(),
-            dst.stride(0) * dst.element_size(),
+            dstPitchBytes,//dst.stride(0) * dst.element_size(),
             src.data_ptr(),
-            src.stride(0) * src.element_size(),
+            srcPitchBytes,//src.stride(0) * src.element_size(),
             src.size(1) * src.element_size(),
             src.size(0),
             cudaMemcpyDeviceToDevice,
@@ -350,12 +360,15 @@ void all_to_one(
   for (const auto device_id : c10::irange(num_gpus)) {
     if (device_id != target_device_index) {
       auto src_device = at::Device(at::kCUDA, device_id);
-      // record stream event
+      // Still on src_device, record stream event
+      at::cuda::CUDAGuard device_guard(src_device);
       at::cuda::CUDAStream copy_stream =
           at::cuda::getCurrentCUDAStream(device_id);
 
       auto& src_ready = copy_completion_events[target_device_index][device_id];
       src_ready.record(copy_stream);
+
+      device_guard.set_device(target_device);
       src_ready.block(at::cuda::getCurrentCUDAStream(target_device_index));
     }
   }
@@ -371,19 +384,11 @@ Tensor sum_reduce_to_one(
   // the target device. Since target device can be different across each call,
   // we store all the events in a 2-dimentionsal vector.
   using PerDeviceEventList = std::vector<at::cuda::CUDAEvent>;
-  static thread_local std::vector<PerDeviceEventList> two_hop_copy_begin_events;
-  static thread_local std::vector<PerDeviceEventList> copy_begin_events;
   static thread_local std::vector<PerDeviceEventList> copy_completion_events;
   static thread_local std::once_flag flag1;
   std::call_once(flag1, [num_gpus]() {
-    two_hop_copy_begin_events.reserve(num_gpus);
-    copy_begin_events.reserve(num_gpus);
-    copy_completion_events.reserve(num_gpus);
-
     for (auto i = 0; i < num_gpus; i++) {
-      two_hop_copy_begin_events.emplace_back(num_gpus);
-      copy_begin_events.emplace_back(num_gpus);
-      copy_completion_events.emplace_back(num_gpus);
+      copy_completion_events.push_back(PerDeviceEventList(num_gpus));
     }
   });
 
@@ -412,8 +417,6 @@ Tensor sum_reduce_to_one(
           ten.device() == input_tensors[j].device()) {
         ten.add_(input_tensors[j]);
         // Replace with a dummy tensor without storage to mark reduced away
-        // With CudaCachingAllocator, ops follow stream semantics. Thus data
-        // will not be corrupted.
         input_tensors[j] = Tensor();
       }
     }
@@ -434,37 +437,33 @@ Tensor sum_reduce_to_one(
     if (intermediate_node == -1) {
       continue;
     }
+    auto intermediate_device = at::Device(at::kCUDA, intermediate_node);
+    Tensor dst = at::empty_like(src, intermediate_device);
 
-    // This is a cross-device copy from the src device to the dst device.
-    // We need to synchronize src with dst to ensure that the dst memory
-    // is ready; Write-after-Write or Write-after-Read dependencies are handled.
-    // E.g. CudaCachingAllocator might reuse existing tensor memory space that
-    // has ongoing kernel ops
-    //
-    // To address this, we use cudaEvent to make src stream wait on all kernels
-    // on the dst stream (after dst memory initialization) to be completed prior
-    // to the copy
-    const auto intermediate_device = at::Device(at::kCUDA, intermediate_node);
-    copied_tensors[i] = at::empty_like(src, intermediate_device);
+    // This is a cross-device copy on the src current stream and dst current
+    // stream.
+    // Unlike all_to_one case, we don't need to wait for dst ready to worry
+    // about write-after-write and write-after-read dependencies because we're
+    // creating a temp tensor, dst.
 
-    const auto src_device_idx = src.get_device();
-    const auto& copy_stream = at::cuda::getCurrentCUDAStream(src_device_idx);
-    auto& dst_ready =
-        two_hop_copy_begin_events[intermediate_node][src_device_idx];
-    dst_ready.record(at::cuda::getCurrentCUDAStream(intermediate_node));
-    dst_ready.block(copy_stream);
-
+    at::cuda::CUDAGuard device_guard(src.device());
     // on source device, launch memcpy.
-    auto& dst = copied_tensors[i];
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//dst.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
-        copy_stream));
+        at::cuda::getCurrentCUDAStream(src.get_device())));
+    copied_tensors[i] = dst;
   }
 
   // Wait for cross-device copies to complete, then reduce
@@ -476,11 +475,15 @@ Tensor sum_reduce_to_one(
     auto intermediate_device = at::Device(at::kCUDA, intermediate_node);
 
     auto src_device = at::Device(at::kCUDA, device_id);
+    // Still on src_device, record stream event
+    at::cuda::CUDAGuard device_guard(src_device);
     at::cuda::CUDAStream copy_stream =
         at::cuda::getCurrentCUDAStream(device_id);
 
     auto& src_ready = copy_completion_events[target_device_index][device_id];
     src_ready.record(copy_stream);
+
+    device_guard.set_device(intermediate_device);
     src_ready.block(at::cuda::getCurrentCUDAStream(intermediate_node));
 
     // Find any tensor in the intermediate GPU to reduce to.
@@ -501,8 +504,6 @@ Tensor sum_reduce_to_one(
         continue;
       }
       if (ten_at_intermediate_node.has_storage()) {
-        // With CudaCachingAllocator, ops follow stream semantics. Thus data
-        // will not be corrupted.
         ten_at_intermediate_node.add_(ten);
         input_tensors[i] = Tensor();
       } else {
@@ -520,33 +521,25 @@ Tensor sum_reduce_to_one(
       continue;
     }
 
-    // This is a cross-device copy from the src device to the dst device.
-    // We need to synchronize src with dst to ensure that the dst memory
-    // is ready; Write-after-Write or Write-after-Read dependencies are handled.
-    // E.g. CudaCachingAllocator might reuse existing tensor memory space that
-    // has ongoing kernel ops
-    //
-    // To address this, we use cudaEvent to make src stream wait on all kernels
-    // on the dst stream (after dst memory initialization) to be completed prior
-    // to the copy
-    copied_tensors[i] = at::empty_like(src, target_device);
+    Tensor dst = at::empty_like(src, target_device);
 
-    const auto src_idx = src.get_device();
-    const auto& copy_stream = at::cuda::getCurrentCUDAStream(src_idx);
-    auto& dst_ready = copy_begin_events[target_device_index][src_idx];
-    dst_ready.record(at::cuda::getCurrentCUDAStream(target_device_index));
-    dst_ready.block(copy_stream);
-
-    auto& dst = copied_tensors[i];
+    at::cuda::CUDAGuard device_guard(src.device());
+    void* tmp1 = nullptr;
+    void* tmp2 = nullptr;
+    size_t srcPitchBytes;
+    size_t dstPitchBytes;
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp1, &srcPitchBytes, src.size(1) * src.element_size(), src.size(0))); 
+    AT_CUDA_CHECK(cudaMallocPitch(&tmp2, &dstPitchBytes, dst.size(1) * dst.element_size(), dst.size(0)));
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
         dst.data_ptr(),
-        dst.stride(0) * dst.element_size(),
+        dstPitchBytes,//.stride(0) * dst.element_size(),
         src.data_ptr(),
-        src.stride(0) * src.element_size(),
+        srcPitchBytes,//.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
         cudaMemcpyDeviceToDevice,
-        copy_stream));
+        at::cuda::getCurrentCUDAStream(src.get_device())));
+    copied_tensors[i] = dst;
   }
 
   // Wait for cross-device copies to complete, then reduce
@@ -554,11 +547,14 @@ Tensor sum_reduce_to_one(
     if (device_id != target_device_index) {
       auto src_device = at::Device(at::kCUDA, device_id);
       // Still on src_device, record stream event
+      at::cuda::CUDAGuard device_guard(src_device);
       at::cuda::CUDAStream copy_stream =
           at::cuda::getCurrentCUDAStream(device_id);
 
       auto& src_ready = copy_completion_events[target_device_index][device_id];
       src_ready.record(copy_stream);
+
+      device_guard.set_device(target_device);
       src_ready.block(at::cuda::getCurrentCUDAStream(target_device_index));
 
       for (const auto i : c10::irange(input_tensors.size())) {
@@ -628,7 +624,7 @@ Tensor cat_dim_2d(
     int64_t uncat_dim_size,
     at::Device output_device,
     int64_t cat_dim = 1) {
-  if (tensors.empty()) {
+  if (tensors.size() == 0) {
     return at::empty({0}, at::TensorOptions().device(output_device));
   }
   // only support 2d tensor concatenation.
@@ -636,12 +632,8 @@ Tensor cat_dim_2d(
       cat_dim_2d_output_shape(tensors, uncat_dim_size, cat_dim);
 
   auto* prop = at::cuda::getCurrentDeviceProperties();
-  auto output = at::empty(
-      output_shape,
-      tensors.front()
-          .options()
-          .device(output_device)
-          .dtype(tensors[0].dtype()));
+  auto output =
+      at::empty(output_shape, tensors.front().options().device(output_device));
   TORCH_CHECK(
       output.stride(0) * output.element_size() <=
       static_cast<int64_t>(prop->memPitch));
@@ -727,7 +719,7 @@ std::vector<Tensor> all_to_one_device(
 Tensor sum_reduce_to_one_device(
     std::vector<Tensor> input_tensors,
     at::Device target_device) {
-  TORCH_CHECK(!input_tensors.empty(), "reducing no tensor is undefined");
+  TORCH_CHECK(input_tensors.size() > 0, "reducing no tensor is undefined");
 
   init_p2p_access();
 
