@@ -123,12 +123,10 @@ struct load_row_per_warp<float, embedding_dim, index_t> {
 #pragma unroll
     for (int i = 0; i < dword_per_row; i++) {
       if constexpr (embedding_dim == 160) {
-        if ((lane_id + i * THREADS_PER_ROW) % 192 < 160) {
-          emb_data[i] = llvm_amdgcn_raw_buffer_load_fp32(
-              emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0);
-        } else {
-          emb_data[i] = 0.f;
-        }
+        emb_data[i] = ((lane_id + i * THREADS_PER_ROW) < 160)
+            ? llvm_amdgcn_raw_buffer_load_fp32(
+                emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0)
+            : 0.f;
       } else {
         emb_data[i] = llvm_amdgcn_raw_buffer_load_fp32(
             emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0);
@@ -167,12 +165,9 @@ struct load_row_per_warp<half, 160, index_t> {
         amdgcn_make_buffer_resource(p_emb_table + row_index * 192);
     *reinterpret_cast<half2*>(emb_data) = llvm_amdgcn_raw_buffer_load_fp16x2(
         emb_res, lane_id * sizeof(half2), 0, 0);
-    if ((lane_id + 128) % 192 < 160) {
-      emb_data[2] = llvm_amdgcn_raw_buffer_load_fp16(
-          emb_res, (lane_id + 128) * sizeof(half), 0, 0);
-    } else {
-      emb_data[2] = __float2half(0.0);
-    }
+    emb_data[2] = (lane_id < 32) 
+        ? llvm_amdgcn_raw_buffer_load_fp16(emb_res, (lane_id + 128) * sizeof(half), 0, 0)
+        : __float2half(0.0);
   }
 };
 
