@@ -137,6 +137,75 @@ def early_config_prune(configs, named_args, dtsize=None, dtype=None, **kwargs):
             BLOCK_N,
             BLOCK_K,
             num_stages,
+            use_tma_load_on_scales,
+        ) = (
+            kw["BLOCK_SIZE_M"],
+            kw["BLOCK_SIZE_N"],
+            kw["BLOCK_SIZE_K"],
+            config.num_stages,
+            kw.get("USE_TMA_LOAD_ON_SCALES", False),
+        )
+        G, M, N = (
+            named_args["G"],
+            named_args["M_BUCKET"],
+            named_args["N"],
+        )
+
+        # 1. make sure we have enough smem
+        max_shared_memory = driver.active.utils.get_device_properties(device)[
+            "max_shared_mem"
+        ]
+        if torch.version.hip:
+            required_shared_memory = BLOCK_N * BLOCK_K * num_stages * dtsize
+        else:
+            required_shared_memory = (BLOCK_M + BLOCK_N) * BLOCK_K * num_stages * dtsize
+        if required_shared_memory > max_shared_memory:
+            continue
+
+        M_PER_GROUP = M // G
+        MIN_M_TILES = 32 if torch.version.hip else 64
+        # 2. make sure we don't load M tiles that are too big
+        if BLOCK_M > MIN_M_TILES and BLOCK_M > (M_PER_GROUP * 2):
+            continue
+        # 3. make sure we don't load N tiles that are too small
+        if BLOCK_M < 128 and BLOCK_M < (M_PER_GROUP // 2):
+            continue
+
+        num_sm = driver.active.utils.get_device_properties(device)[
+            "multiprocessor_count"
+        ]
+        N_TILES = (N + BLOCK_N - 1) // BLOCK_N
+        MIN_N_TILES = 32 if torch.version.hip else 64
+        # 4. make sure we don't load N tiles that are too big
+        if BLOCK_N > MIN_N_TILES and M * N_TILES < num_sm:
+            continue
+        # 5. make sure we don't load N tiles that are too small
+        if BLOCK_N < 128 and M * N_TILES > 2 * num_sm:
+            continue
+        if dtsize >= 2:
+            if use_tma_load_on_scales:
+                continue
+        pruned_configs.append(config)
+
+    return pruned_configs
+
+
+def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs):
+    device = torch.cuda.current_device()
+    # BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
+    if dtsize is None:
+        dtsize = named_args["c_ptr"].element_size()
+    if dtype is None:
+        dtype = named_args["c_ptr"].dtype
+
+    pruned_configs = []
+    for config in configs:
+        kw = config.kwargs
+        (
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            num_stages,
             num_warps,
             num_consumer_groups,
             use_tma_load_on_scales,
@@ -227,7 +296,6 @@ def _fbgemm_grouped_gemm(
     a_desc_ptr,
     b_desc_ptr,
     c_ptr,
-    workspace,
     scatter_add_indices,
     m_sizes,
     # problem sizes
@@ -254,11 +322,6 @@ def _fbgemm_grouped_gemm(
     tidx = tl.program_id(0)
 
     dtype: tl.dtype = c_ptr.dtype.element_ty
-    TMA_SIZE: tl.constexpr = tl.constexpr(128)
-    if USE_TMA_STORE:
-        c_desc_ptr = workspace + tidx * TMA_SIZE
-    else:
-        c_desc_ptr = None
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -278,16 +341,13 @@ def _fbgemm_grouped_gemm(
             num_tiles = num_m_tiles * num_n_tiles
 
             if USE_TMA_STORE:
-                # pyre-ignore
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=c_desc_ptr,
-                    global_address=c_ptr + M_start_offset * N,
-                    load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                    global_size=[m_size, n_size],
-                    element_ty=c_ptr.dtype.element_ty,
+                c_desc_ptr = tl.make_tensor_descriptor(
+                    c_ptr + M_start_offset * N,
+                    shape=[m_size, n_size],
+                    # pyre-ignore
+                    strides=[n_size, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
                 )
-                # pyre-ignore
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
 
             # Move across tiles
             while tidx >= iterated_tiles and tidx < iterated_tiles + num_tiles:
@@ -353,10 +413,9 @@ def _fbgemm_grouped_gemm(
                 if USE_TMA_STORE:
                     m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
-                    tl._experimental_descriptor_store(
-                        c_desc_ptr,
-                        accumulator.to(c_ptr.dtype.element_ty),
-                        [m_offset, n_offset],
+                    # pyre-ignore
+                    c_desc_ptr.store(
+                        [m_offset, n_offset], accumulator.to(c_ptr.dtype.element_ty)
                     )
                 elif FUSE_SCATTER_ADD:
                     offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -394,7 +453,7 @@ def _fbgemm_grouped_gemm(
 @triton.autotune(
     configs=_NV_WS_CONFIGS,
     key=["G", "M_BUCKET", "N", "K"],
-    prune_configs_by={"early_config_prune": early_config_prune},
+    prune_configs_by={"early_config_prune": early_config_prune_ws},
     restore_value=["c_ptr"],  # restore for scatter_add fusion
 )
 @triton.jit
@@ -402,7 +461,6 @@ def _fbgemm_grouped_gemm_ws(
     a_desc_ptr,
     b_desc_ptr,
     c_ptr,
-    workspace,
     scatter_add_indices,
     m_sizes,
     # problem sizes
@@ -432,11 +490,6 @@ def _fbgemm_grouped_gemm_ws(
     tidx = tl.program_id(0)
 
     dtype: tl.dtype = c_ptr.dtype.element_ty
-    TMA_SIZE: tl.constexpr = tl.constexpr(128)
-    if USE_TMA_STORE:
-        c_desc_ptr = workspace + tidx * TMA_SIZE
-    else:
-        c_desc_ptr = None
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -457,16 +510,13 @@ def _fbgemm_grouped_gemm_ws(
 
             if USE_TMA_STORE:
                 with tl.async_task([0]):
-                    # pyre-ignore
-                    tl.extra.cuda.experimental_device_tensormap_create2d(
-                        desc_ptr=c_desc_ptr,
-                        global_address=c_ptr + M_start_offset * N,
-                        load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                        global_size=[m_size, N],
-                        element_ty=c_ptr.dtype.element_ty,
+                    c_desc_ptr = tl.make_tensor_descriptor(
+                        c_ptr + M_start_offset * N,
+                        shape=[m_size, N],
+                        # pyre-ignore
+                        strides=[N, 1],
+                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
                     )
-                    # pyre-ignore
-                    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
 
             # Move across tiles
             next_iterated_tiles = iterated_tiles + num_tiles
@@ -507,10 +557,10 @@ def _fbgemm_grouped_gemm_ws(
                         with tl.async_task([1, NUM_CONSUMER_GROUPS]):
                             m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                             n_offset = (tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
-                            tl._experimental_descriptor_store(
-                                c_desc_ptr,
-                                accumulator.to(c_ptr.dtype.element_ty),
+                            # pyre-ignore
+                            c_desc_ptr.store(
                                 [m_offset, n_offset],
+                                accumulator.to(c_ptr.dtype.element_ty),
                             )
                     elif FUSE_SCATTER_ADD:
                         with tl.async_task([1, NUM_CONSUMER_GROUPS]):
@@ -577,7 +627,6 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
     b_scale_ptr,
     b_scale_desc_ptr,
     c_ptr,
-    workspace,
     scatter_add_indices,
     m_sizes,
     # problem sizes
@@ -604,11 +653,6 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
     tidx = tl.program_id(0)
 
     dtype = TT_FP8_DTYPE
-    TMA_SIZE: tl.constexpr = tl.constexpr(128)
-    if USE_TMA_STORE:
-        c_desc_ptr = workspace + tidx * TMA_SIZE
-    else:
-        c_desc_ptr = None
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -628,16 +672,13 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
             num_tiles = num_m_tiles * num_n_tiles
 
             if USE_TMA_STORE:
-                # pyre-ignore
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=c_desc_ptr,
-                    global_address=c_ptr + M_start_offset * N,
-                    load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                    global_size=[m_size, n_size],
-                    element_ty=c_ptr.dtype.element_ty,
+                c_desc_ptr = tl.make_tensor_descriptor(
+                    c_ptr + M_start_offset * N,
+                    shape=[m_size, n_size],
+                    # pyre-ignore
+                    strides=[n_size, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
                 )
-                # pyre-ignore
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
 
             # Move across tiles
             while tidx >= iterated_tiles and tidx < iterated_tiles + num_tiles:
@@ -704,11 +745,8 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
                 if USE_TMA_STORE:
                     m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
-                    tl._experimental_descriptor_store(
-                        c_desc_ptr,
-                        c.to(c_ptr.dtype.element_ty),
-                        [m_offset, n_offset],
-                    )
+                    # pyre-ignore
+                    c_desc_ptr.store([m_offset, n_offset], c.to(c_ptr.dtype.element_ty))
                 elif FUSE_SCATTER_ADD:
                     offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
                     mask = offs_am < m_size
@@ -743,7 +781,7 @@ def _fbgemm_grouped_gemm_fp8_rowwise(
     key=["G", "M_BUCKET", "N", "K"],
     prune_configs_by={
         "early_config_prune": functools.partial(
-            early_config_prune, dtype=TT_FP8_DTYPE, dtsize=1
+            early_config_prune_ws, dtype=TT_FP8_DTYPE, dtsize=1
         )
     },
     restore_value=["c_ptr"],  # restore for scatter_add fusion
@@ -756,7 +794,6 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
     b_scale_ptr,
     b_scale_desc_ptr,
     c_ptr,
-    workspace,
     scatter_add_indices,
     m_sizes,
     # problem sizes
@@ -785,11 +822,6 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
     tidx = tl.program_id(0)
 
     dtype = TT_FP8_DTYPE
-    TMA_SIZE: tl.constexpr = tl.constexpr(128)
-    if USE_TMA_STORE:
-        c_desc_ptr = workspace + tidx * TMA_SIZE
-    else:
-        c_desc_ptr = None
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -810,16 +842,13 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
 
             if USE_TMA_STORE:
                 with tl.async_task([0]):
-                    # pyre-ignore
-                    tl.extra.cuda.experimental_device_tensormap_create2d(
-                        desc_ptr=c_desc_ptr,
-                        global_address=c_ptr + M_start_offset * N,
-                        load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-                        global_size=[m_size, N],
-                        element_ty=c_ptr.dtype.element_ty,
+                    c_desc_ptr = tl.make_tensor_descriptor(
+                        c_ptr + M_start_offset * N,
+                        shape=[m_size, N],
+                        # pyre-ignore
+                        strides=[N, 1],
+                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
                     )
-                    # pyre-ignore
-                    tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(c_desc_ptr)
 
             # Move across tiles
             next_iterated_tiles = iterated_tiles + num_tiles
@@ -899,10 +928,9 @@ def _fbgemm_grouped_gemm_fp8_rowwise_ws(
                         with tl.async_task([1, NUM_CONSUMER_GROUPS]):
                             m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                             n_offset = (tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
-                            tl._experimental_descriptor_store(
-                                c_desc_ptr,
-                                c.to(c_ptr.dtype.element_ty),
-                                [m_offset, n_offset],
+                            # pyre-ignore
+                            c_desc_ptr.store(
+                                [m_offset, n_offset], c.to(c_ptr.dtype.element_ty)
                             )
                     elif FUSE_SCATTER_ADD:
                         with tl.async_task([1, NUM_CONSUMER_GROUPS]):
@@ -1040,7 +1068,6 @@ def _grouped_gemm(
     desc_x = x
     desc_w = w
     desc_ws = w_scale
-    workspace = None
 
     if USE_TMA_LOAD:
         desc_helper = utils.TmaAutoTuneHelper()
@@ -1053,11 +1080,11 @@ def _grouped_gemm(
             desc_ws = desc_helper.get_tma_descriptor_kernel_param("ws")
 
     if USE_TMA_STORE:
-        workspace = torch.empty(
-            NUM_SMS * utils.TmaAutoTuneHelper.TMA_SIZE,
-            device=x.device,
-            dtype=torch.uint8,
-        )
+
+        def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        triton.set_allocator(alloc_fn)
 
     def grid(META):
         if USE_TMA_LOAD:
@@ -1110,7 +1137,6 @@ def _grouped_gemm(
             w_scale,
             desc_ws,
             y,
-            workspace,
             scatter_add_indices,
             m_sizes,
             G,
@@ -1136,7 +1162,6 @@ def _grouped_gemm(
             desc_x,
             desc_w,
             y,
-            workspace,
             scatter_add_indices,
             m_sizes,
             G,

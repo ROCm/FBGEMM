@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 
@@ -100,6 +100,7 @@ def _cutlass_blackwell_fmha_backward(
     cu_seqlens_k: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
     max_seq_len_k: int | None = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     window_left: int = -1,
     window_right: int = -1,
@@ -123,6 +124,7 @@ def _cutlass_blackwell_fmha_backward(
         cu_seqlens_k=cu_seqlens_k,
         max_seq_len_q=max_seq_len_q,
         max_seq_len_k=max_seq_len_k,
+        softmax_scale=softmax_scale,
         causal=causal,
         window_size_left=window_left,
         window_size_right=window_right,
@@ -173,7 +175,7 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
         max_seq_len_q: Optional[int] = None,
         max_seq_len_k: Optional[int] = None,
         seqlen_kv: Optional[torch.Tensor] = None,
-        window_size: Tuple[int, int] = (-1, -1),
+        window_size: tuple[int, int] = (-1, -1),
         bottom_right: bool = True,
         deterministic: bool = False,
     ) -> torch.Tensor:
@@ -240,7 +242,7 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
             return out
 
     @staticmethod
-    def backward(ctx, dout: torch.Tensor, *args: Any) -> Tuple[  # type: ignore
+    def backward(ctx, dout: torch.Tensor, *args: Any) -> tuple[  # type: ignore
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -274,6 +276,7 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
             ctx.cu_seqlens_k,
             ctx.max_seq_len_q,
             ctx.max_seq_len_k,
+            ctx.softmax_scale,
             ctx.causal,
             window_left,
             window_right,

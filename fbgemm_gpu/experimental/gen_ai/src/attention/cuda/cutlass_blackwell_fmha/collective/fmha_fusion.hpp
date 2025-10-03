@@ -84,6 +84,26 @@ struct NoMask {
     return get_trip_count(blk_coord, tile_shape, problem_size);
   }
 
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_start_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return 0;
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_stop_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return ceil_div(get<1>(problem_size), get<1>(tile_shape));
+  }
+
   template<class AccQK, class IndexQK, class ProblemSize>
   CUTLASS_DEVICE
   void apply_mask(
@@ -138,6 +158,26 @@ struct ResidualMask : NoMask {
       return get_trip_count(blk_coord, tile_shape, problem_size) - 1;
     }
     return get_trip_count(blk_coord, tile_shape, problem_size);
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_start_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return 0;
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_stop_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return get_unmasked_trip_count(blk_coord, tile_shape, problem_size);
   }
 
   template<class AccQK, class IndexQK, class ProblemSize>
@@ -291,6 +331,26 @@ struct CausalMask : NoMask {
       ProblemSize const& problem_size) {
 
     return get_trip_count(blk_coord, tile_shape, problem_size) - get_masked_trip_count(blk_coord, tile_shape, problem_size);
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_start_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return 0;
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_stop_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+
+    return get_unmasked_trip_count(blk_coord, tile_shape, problem_size);
   }
 
   template<class AccQK, class IndexQK, class ProblemSize>
@@ -456,8 +516,55 @@ struct LocalMask : NoMask {
       TileShape const& tile_shape,
       ProblemSize const& problem_size) {
 
-    // TODO: follow CausalMask to improve this
-    return 0;
+    const int n_block_start_unmask = get_n_block_start_unmask(blk_coord, tile_shape, problem_size);
+    const int n_block_stop_unmask = get_n_block_stop_unmask(blk_coord, tile_shape, problem_size);
+
+    return n_block_stop_unmask - n_block_start_unmask;
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_start_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+    // this does not guarantee to be smaller than n_block_stop_unmask
+
+    const int kBlockM = get<0>(tile_shape);
+    const int kBlockN = get<1>(tile_shape);
+    const int seq_len_k = get<1>(problem_size);
+
+    const int m_block = get<0>(blk_coord);
+    const int offset_q = IsQBegin? 0 : get<1>(problem_size) - get<0>(problem_size);
+
+    const int m_idx_max = (m_block + 1) * kBlockM;
+
+    // -1 to make this inclusive
+    const int n_idx_max_left = std::max(m_idx_max + offset_q - window_size_left - 1, 0);
+
+    return ceil_div(n_idx_max_left, kBlockN);
+  }
+
+  template<class BlkCoord, class TileShape, class ProblemSize>
+  CUTLASS_DEVICE
+  int get_n_block_stop_unmask(
+      BlkCoord const& blk_coord,
+      TileShape const& tile_shape,
+      ProblemSize const& problem_size) {
+    // this does not guarantee to be larger than n_block_start_unmask
+
+    const int kBlockM = get<0>(tile_shape);
+    const int kBlockN = get<1>(tile_shape);
+    const int seq_len_k = get<1>(problem_size);
+
+    const int m_block = get<0>(blk_coord);
+    const int offset_q = IsQBegin? 0 : get<1>(problem_size) - get<0>(problem_size);
+
+    const int m_idx_min = m_block * kBlockM;
+    // +1 to make this exclusive
+    const int n_idx_min_right = std::min(m_idx_min + offset_q + window_size_right + 1, seq_len_k);
+
+    return n_idx_min_right / kBlockN;
   }
 
   template<class AccQK, class IndexQK, class ProblemSize>
@@ -634,6 +741,29 @@ apply_variable_length_offset(Shape const& shape, Coord const& coord) {
     }
   });
   return cute::make_tuple(result_shape, result_offset);
+}
+
+template <class Shape, class Idx>
+CUTE_HOST_DEVICE constexpr auto apply_variable_length_paddedkv(
+    Shape const& shape,
+    Idx const& idx,
+    int kv_length) {
+  // Use a position counter to track which element we're processing
+  int position_counter = 0;
+
+  return transform_leaf(shape, [&](auto const& s) {
+    if constexpr (is_variable_length_v<decltype(s)>) {
+      int current_pos = position_counter++;
+      if (current_pos == 1) {
+        return kv_length;
+      } else {
+        return s.cumulative_length[idx + 1] - s.cumulative_length[idx];
+      }
+    } else {
+      position_counter++;
+      return s;
+    }
+  });
 }
 
 }  // namespace cutlass::fmha::collective

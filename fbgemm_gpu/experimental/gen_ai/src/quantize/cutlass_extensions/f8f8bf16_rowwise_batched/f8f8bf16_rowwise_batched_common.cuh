@@ -33,10 +33,7 @@ template <
     int TBS_N,
     int TBS_K,
     int ARCH,
-    bool PONG,
-    bool FAST_ACCUM,
-    typename INPUT_DTYPE,
-    typename BIAS_DTYPE>
+    bool PONG>
 at::Tensor f8f8bf16_rowwise_batched_impl(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // FP8
@@ -60,8 +57,6 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
   }
 
   TORCH_CHECK(XQ.size(-1) == K);
-  TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
-  TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
 
   at::Tensor Y;
   if (output.has_value()) {
@@ -71,7 +66,7 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
     Y = at::empty({B, M, N}, XQ.options().dtype(at::kBFloat16));
   }
 
-  using ElementInputA = INPUT_DTYPE;
+  using ElementInputA = cutlass::float_e4m3_t;
   using LayoutInputA = cutlass::layout::RowMajor;
   constexpr int AlignmentInputA = 16 / sizeof(ElementInputA);
 
@@ -79,7 +74,7 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
   using LayoutInputB = cutlass::layout::ColumnMajor;
   constexpr int AlignmentInputB = 16 / sizeof(ElementInputB);
 
-  using ElementBias = BIAS_DTYPE;
+  using ElementBias = float;
 
   using ElementOutput = cutlass::bfloat16_t;
   using LayoutOutput = cutlass::layout::RowMajor;
@@ -168,7 +163,6 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
       cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
   using FastPongSchedule =
       cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
-  using SlowAccum = cute::conditional_t<PONG, PongSchedule, DefaultSchedule>;
   using FastAccum =
       cute::conditional_t<PONG, FastPongSchedule, FastDefaultSchedule>;
 
@@ -176,10 +170,8 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
   using EpilogueScheduleSM100 =
       cutlass::epilogue::collective::EpilogueScheduleAuto;
 
-  using MainLoopSchedule = cute::conditional_t<
-      ARCH == 10,
-      MainLoopScheduleSM100,
-      cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>>;
+  using MainLoopSchedule =
+      cute::conditional_t<ARCH == 10, MainLoopScheduleSM100, FastAccum>;
   using EpilogueSchedule = cute::conditional_t<
       ARCH == 10,
       EpilogueScheduleSM100,
@@ -307,157 +299,6 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
   return Y;
 }
 
-template <
-    int TB_M,
-    int TB_N,
-    int TB_K,
-    int TBS_M,
-    int TBS_N,
-    int TBS_K,
-    int ARCH,
-    bool PONG>
-at::Tensor f8f8bf16_rowwise_batched_wrapper(
-    at::Tensor XQ,
-    at::Tensor WQ,
-    at::Tensor x_scale,
-    at::Tensor w_scale,
-    bool use_fast_accum,
-    std::optional<at::Tensor> bias,
-    std::optional<at::Tensor> output) {
-  // Check datatypes.
-  TORCH_CHECK(
-      x_scale.dtype() == at::kFloat && w_scale.dtype() == at::kFloat,
-      "Scale tensors must be float32.");
-  if (bias.has_value()) {
-    TORCH_CHECK(
-        bias.value().dtype() == at::kFloat ||
-            bias.value().dtype() == at::kBFloat16,
-        "Bias type must be bfloat16 or float32 if provided.");
-  }
-  bool bf16_bias = bias.has_value() && bias.value().dtype() == at::kBFloat16;
-
-  // Templatize based on input dtype.
-  bool use_e5m2 = XQ.dtype() == at::kFloat8_e5m2;
-
-  if (bf16_bias) {
-    if (use_fast_accum) {
-      if (use_e5m2) {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            true,
-            cutlass::float_e5m2_t,
-            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-      } else {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            true,
-            cutlass::float_e4m3_t,
-            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-      }
-    } else {
-      if (use_e5m2) {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            false,
-            cutlass::float_e5m2_t,
-            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-      } else {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            false,
-            cutlass::float_e4m3_t,
-            cutlass::bfloat16_t>(XQ, WQ, x_scale, w_scale, bias, output);
-      }
-    }
-  } else {
-    if (use_fast_accum) {
-      if (use_e5m2) {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            true,
-            cutlass::float_e5m2_t,
-            float>(XQ, WQ, x_scale, w_scale, bias, output);
-      } else {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            true,
-            cutlass::float_e4m3_t,
-            float>(XQ, WQ, x_scale, w_scale, bias, output);
-      }
-    } else {
-      if (use_e5m2) {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            false,
-            cutlass::float_e5m2_t,
-            float>(XQ, WQ, x_scale, w_scale, bias, output);
-      } else {
-        return f8f8bf16_rowwise_batched_impl<
-            TB_M,
-            TB_N,
-            TB_K,
-            TBS_M,
-            TBS_N,
-            TBS_K,
-            ARCH,
-            PONG,
-            false,
-            cutlass::float_e4m3_t,
-            float>(XQ, WQ, x_scale, w_scale, bias, output);
-      }
-    }
-  }
-}
-
 #else
 
 template <
@@ -469,9 +310,7 @@ template <
     int TBS_K,
     int ARCH,
     bool PONG,
-    bool FAST_ACCUM,
-    typename INPUT_DTYPE,
-    typename BIAS_DTYPE>
+    typename INPUT_DTYPE>
 at::Tensor f8f8bf16_rowwise_batched_impl(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // FP8

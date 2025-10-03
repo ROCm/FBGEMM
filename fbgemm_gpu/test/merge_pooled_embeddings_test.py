@@ -30,7 +30,7 @@ else:
 
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:merge_pooled_embeddings")
 
-typed_gpu_unavailable: Tuple[bool, str] = gpu_unavailable
+typed_gpu_unavailable: tuple[bool, str] = gpu_unavailable
 
 def make_pitched_tensor(height, width, dtype, device, alignment=256):
     elem_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else torch.iinfo(dtype).bits // 8

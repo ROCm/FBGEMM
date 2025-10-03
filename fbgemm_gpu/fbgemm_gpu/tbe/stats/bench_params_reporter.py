@@ -11,7 +11,7 @@ import io
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Optional
 
 import fbgemm_gpu  # noqa F401
 import torch  # usort:skip
@@ -144,7 +144,7 @@ class TBEBenchmarkParamsReporter:
         indices: torch.Tensor,
         offsets: torch.Tensor,
         per_sample_weights: Optional[torch.Tensor] = None,
-        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+        batch_size_per_feature_per_rank: Optional[list[list[int]]] = None,
     ) -> TBEDataConfig:
         """
         Extracts parameters from the embedding operation, input indices, and offsets to create a TBEDataConfig.
@@ -177,7 +177,9 @@ class TBEBenchmarkParamsReporter:
         E = (
             Es[0]
             if len(set(Es)) == 1
-            else torch.ceil(torch.mean(torch.tensor(feature_rows)))
+            else torch.ceil(
+                torch.mean(torch.tensor(feature_rows, dtype=torch.float))
+            ).item()
         )
         # Set mixed_dim to be True if there are multiple dims
         mixed_dim = len(set(Ds)) > 1
@@ -185,7 +187,9 @@ class TBEBenchmarkParamsReporter:
         D = (
             Ds[0]
             if not mixed_dim
-            else torch.ceil(torch.mean(torch.tensor(feature_dims)))
+            else torch.ceil(
+                torch.mean(torch.tensor(feature_dims, dtype=torch.float))
+            ).item()
         )
 
         # Compute indices distribution parameters
@@ -198,7 +202,7 @@ class TBEBenchmarkParamsReporter:
 
         # Compute batch parameters
         batch_params = BatchParams(
-            B=((offsets.numel() - 1) // T),
+            B=int((offsets.numel() - 1) // T),
             sigma_B=(
                 int(
                     torch.ceil(
@@ -262,7 +266,7 @@ class TBEBenchmarkParamsReporter:
         offsets: torch.Tensor,
         op_id: str = "",
         per_sample_weights: Optional[torch.Tensor] = None,
-        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+        batch_size_per_feature_per_rank: Optional[list[list[int]]] = None,
     ) -> None:
         """
         Reports the configuration of the embedding operation and input data, then writes the TBE configuration to the filestore.

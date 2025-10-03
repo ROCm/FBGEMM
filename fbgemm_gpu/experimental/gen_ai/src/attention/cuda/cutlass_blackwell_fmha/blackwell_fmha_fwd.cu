@@ -225,7 +225,7 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
               static_cast<Element*>(v.data_ptr()), stride_V,
               window_size_left, window_size_right
           },
-          0.0f /* softmax_scale */,
+          static_cast<float>(softmax_scale.value_or(0.0f)) /* softmax_scale */,
           1.0f /* scale_q */,
           1.0f /* scale_k */,
           1.0f /* scale_v */,
@@ -319,6 +319,9 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
   auto dispatch_head_dim = [&](auto varlen, auto mask) {
     if (q.size(q.dim() - 1) == 128) {
       return dispatch_type(varlen, mask, std::integral_constant<int, 128>{});
+    }
+    else if (q.size(q.dim() - 1) == 64) {
+      return dispatch_type(varlen, mask, std::integral_constant<int, 64>{});
     }
     else {
       TORCH_CHECK(false, "Unsupported head dim: ", q.size(q.dim() - 1));

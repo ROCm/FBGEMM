@@ -10,8 +10,9 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "bf16bf16bf16_grouped/bf16bf16bf16_grouped_manifest.cuh"
-#include "fbgemm_gpu/quantize/tuning_cache.hpp"
+#include "fbgemm_gpu/quantize/tuning_cache.cuh"
 #include "fbgemm_gpu/quantize/utils.h"
+#include "fbgemm_gpu/quantize/utils_gpu.h"
 
 namespace fbgemm_gpu {
 
@@ -152,6 +153,76 @@ get_kernel_via_heuristic(int arch, int G, int total_M, int N, int K) {
       }
     }
 
+    // Llama4.x pretraining
+    if (N == 2560 && K == 5120) {
+      if (total_M <= 256) {
+        return bf16bf16bf16_grouped_128_64_128_2_2_1_9_f;
+      } else if (total_M <= 512) {
+        return bf16bf16bf16_grouped_128_128_128_2_1_1_9_f;
+      } else if (total_M <= 1024) {
+        return bf16bf16bf16_grouped_128_128_128_2_2_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      }
+    } else if (N == 5120 && K == 5120) {
+      if (total_M <= 256) {
+        return bf16bf16bf16_grouped_128_128_128_2_1_1_9_f;
+      } else if (total_M <= 1024) {
+        return bf16bf16bf16_grouped_128_128_128_2_2_1_9_t;
+      } else if (total_M <= 4096) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_4_4_1_9_t;
+      }
+    } else if (N == 3072 && K == 6144) {
+      if (total_M <= 512) {
+        return bf16bf16bf16_grouped_128_128_128_2_1_1_9_f;
+      } else if (total_M <= 1024) {
+        return bf16bf16bf16_grouped_128_128_128_2_2_1_9_t;
+      } else if (total_M <= 2048) {
+        return bf16bf16bf16_grouped_128_128_128_2_1_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      }
+    } else if (N == 6144 && K == 6144) {
+      if (total_M <= 512) {
+        return bf16bf16bf16_grouped_128_128_128_4_1_1_9_f;
+      } else if (total_M <= 1024) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_4_4_1_9_t;
+      }
+
+    } else if (N == 5120 && K == 1280) {
+      if (total_M <= 256) {
+        return bf16bf16bf16_grouped_128_128_128_4_1_1_9_f;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      }
+    } else if (N == 5120 && K == 2560) {
+      if (total_M <= 256) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_f;
+      } else if (total_M <= 1024) {
+        return bf16bf16bf16_grouped_128_128_128_2_2_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      }
+    } else if (N == 6144 && K == 1536) {
+      if (total_M <= 4096) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_f;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      }
+    } else if (N == 6144 && K == 3072) {
+      if (total_M <= 256) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_f;
+      } else if (total_M <= 4096) {
+        return bf16bf16bf16_grouped_128_128_128_1_2_1_9_t;
+      } else {
+        return bf16bf16bf16_grouped_128_128_128_1_4_1_9_t;
+      }
+    }
+
     // Fallback to legacy heuristic for now.
     if (total_M <= 16) {
       return bf16bf16bf16_grouped_128_16_128_1_1_1_9_f;
@@ -274,8 +345,11 @@ at::Tensor bf16bf16bf16_grouped_cat(at::TensorList X, at::TensorList W) {
   return _bf16bf16bf16_grouped<at::Tensor>(X, W);
 }
 
-at::Tensor
-bf16bf16bf16_grouped_stacked(at::Tensor X, at::Tensor W, at::Tensor M_sizes) {
+at::Tensor bf16bf16bf16_grouped_stacked(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor M_sizes,
+    std::optional<at::Tensor> out) {
   int64_t total_M = X.size(0);
   int64_t N = W.size(1);
   int64_t K = W.size(2);
@@ -285,15 +359,22 @@ bf16bf16bf16_grouped_stacked(at::Tensor X, at::Tensor W, at::Tensor M_sizes) {
       "M_sizes must be on same device as inputs.");
   TORCH_CHECK(
       W.dim() == 3 && W.size(0) == G, "Weights should be shape [G, N, K].")
-  at::Tensor Y = at::empty(total_M * N, X.options().dtype(at::kBFloat16));
+
+  at::Tensor Y;
+  if (out.has_value()) {
+    Y = out.value();
+  } else {
+    Y = at::empty(total_M * N, X.options().dtype(at::kBFloat16));
+  }
+
   // Early exit for empty inputs.
   if (total_M == 0) {
     return Y.view({total_M, N});
   }
   // Return continuous view of output.
-  at::Tensor out = dispatch_bf16_grouped_kernel<at::Tensor>(
+  at::Tensor output = dispatch_bf16_grouped_kernel<at::Tensor>(
       G, total_M, N, K, X, W, Y, std::nullopt, M_sizes);
-  return out.view({total_M, N});
+  return output.view({total_M, N});
 }
 
 at::Tensor bf16bf16bf16_grouped_dynamic(
@@ -340,7 +421,11 @@ at::Tensor bf16bf16bf16_grouped_dynamic(
       "CUDA version is older than 12.0"); // requires CUDA>=12
 }
 
-at::Tensor bf16bf16bf16_grouped_stacked(at::Tensor, at::Tensor, at::Tensor) {
+at::Tensor bf16bf16bf16_grouped_stacked(
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    std::optional<at::Tensor>) {
   throw std::runtime_error(
       "CUDA version is older than 12.0"); // requires CUDA>=12
 }

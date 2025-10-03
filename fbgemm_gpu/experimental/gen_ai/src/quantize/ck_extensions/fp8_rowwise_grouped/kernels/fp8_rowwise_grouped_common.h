@@ -5,12 +5,12 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
+#undef __HIP_NO_HALF_CONVERSIONS__
 #include <ATen/ATen.h>
-#ifdef USE_ROCM
 #include <c10/hip/HIPStream.h>
-#else
-#include <c10/cuda/CUDAStream.h>
+
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
 #endif
 
 #include "ck/ck.hpp"

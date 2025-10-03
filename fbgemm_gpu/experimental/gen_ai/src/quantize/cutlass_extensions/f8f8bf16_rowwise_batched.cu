@@ -11,6 +11,7 @@
 #include "f8f8bf16_rowwise_batched/f8f8bf16_rowwise_batched_manifest.cuh"
 
 #include "fbgemm_gpu/quantize/utils.h"
+#include "fbgemm_gpu/quantize/utils_gpu.h"
 
 namespace fbgemm_gpu {
 
@@ -29,11 +30,8 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
     at::Tensor WQ, // FP8
     at::Tensor x_scale, // FP32
     at::Tensor w_scale, // FP32
-    bool use_fast_accum = true,
     std::optional<at::Tensor> bias = std::nullopt,
     std::optional<at::Tensor> output = std::nullopt) {
-  const int arch = getDeviceArch();
-
   TORCH_CHECK(
       (XQ.dim() == 3 && WQ.dim() == 3),
       "FP8 rowwise batched GEMM only supports 3D inputs");
@@ -41,6 +39,20 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
   M = XQ.size(1);
   N = WQ.size(1);
 
+  TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
+  TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
+  TORCH_CHECK(XQ.dtype() == at::kFloat8_e4m3fn, "XQ must be FP8 e4m3fn");
+  TORCH_CHECK(WQ.dtype() == at::kFloat8_e4m3fn, "WQ must be FP8 e4m3fn");
+  TORCH_CHECK(
+      x_scale.dtype() == at::kFloat && w_scale.dtype() == at::kFloat,
+      "Scale tensors must be float32.");
+  if (bias.has_value()) {
+    TORCH_CHECK(
+        bias.value().dtype() == at::kFloat,
+        "Bias type must be float32 if provided.");
+  }
+
+  const int arch = getDeviceArch();
   if (arch == 10) {
     if ((M * N <= 4096 * 4096) || (N % 256 > 0 && M % 256 == 0) ||
         (M % 256 > 0 && N % 256 > 0) || M >= 1024 && N >= 1024) {
@@ -49,10 +61,10 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
               cute::size(
                   cute::Shape<cute::Int<2>, cute::Int<1>, cute::Int<1>>{})) {
         return f8f8bf16_rowwise_batched_64_128_128_2_1_1_10_f(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       } else {
         return f8f8bf16_rowwise_batched_128_128_128_2_1_1_10_t(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       }
     } else {
       if ((ceildiv(M, 64 * 2) * ceildiv(N, 128 * 1)) <=
@@ -60,10 +72,10 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
               cute::size(
                   cute::Shape<cute::Int<1>, cute::Int<2>, cute::Int<1>>{})) {
         return f8f8bf16_rowwise_batched_64_128_128_1_2_1_10_f(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       } else {
         return f8f8bf16_rowwise_batched_128_128_128_1_2_1_10_t(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       }
     }
   } else {
@@ -74,10 +86,10 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
               cute::size(
                   cute::Shape<cute::Int<2>, cute::Int<1>, cute::Int<1>>{})) {
         return f8f8bf16_rowwise_batched_64_128_128_2_1_1_9_f(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       } else {
         return f8f8bf16_rowwise_batched_128_128_128_2_1_1_9_t(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       }
     } else {
       if ((ceildiv(M, 64 * 2) * ceildiv(N, 128 * 1)) <=
@@ -85,10 +97,10 @@ at::Tensor dispatch_fp8_rowwise_batched_kernel(
               cute::size(
                   cute::Shape<cute::Int<1>, cute::Int<2>, cute::Int<1>>{})) {
         return f8f8bf16_rowwise_batched_64_128_128_1_2_1_9_f(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       } else {
         return f8f8bf16_rowwise_batched_128_128_128_1_2_1_9_t(
-            XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+            XQ, WQ, x_scale, w_scale, bias, output);
       }
     }
   }
@@ -102,8 +114,10 @@ at::Tensor f8f8bf16_rowwise_batched(
     std::optional<at::Tensor> bias = std::nullopt,
     bool use_fast_accum = true,
     std::optional<at::Tensor> output = std::nullopt) {
+  TORCH_CHECK(
+      use_fast_accum, "f8f8bf16_rowwise_batched only supports fast_accum=True");
   return dispatch_fp8_rowwise_batched_kernel(
-      XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
+      XQ, WQ, x_scale, w_scale, bias, output);
 }
 
 #else

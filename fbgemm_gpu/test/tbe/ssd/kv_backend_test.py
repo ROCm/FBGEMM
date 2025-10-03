@@ -15,7 +15,7 @@ import threading
 import time
 import unittest
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 from unittest.mock import patch
 
 import hypothesis.strategies as st
@@ -41,7 +41,7 @@ if not open_source:
 
 MAX_EXAMPLES = 100
 WORLD_SIZE = 4
-default_st: Dict[str, Any] = {
+default_st: dict[str, Any] = {
     "T": st.integers(min_value=1, max_value=10),
     "D": st.integers(min_value=2, max_value=128),
     "log_E": st.integers(min_value=2, max_value=3),
@@ -49,7 +49,7 @@ default_st: Dict[str, Any] = {
     "weights_precision": st.sampled_from([SparseType.FP32, SparseType.FP16]),
 }
 
-default_settings: Dict[str, Any] = {
+default_settings: dict[str, Any] = {
     "verbosity": Verbosity.verbose,
     "max_examples": MAX_EXAMPLES,
     "deadline": None,
@@ -103,7 +103,7 @@ class SSDCheckpointTest(unittest.TestCase):
             eviction_config = None
             if eviction_policy:
                 eviction_config = torch.classes.fbgemm.FeatureEvictConfig(
-                    eviction_policy.eviction_trigger_mode,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual
+                    eviction_policy.eviction_trigger_mode,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual, 4: id count
                     eviction_policy.eviction_strategy,  # evict_trigger_strategy: 0: timestamp, 1: counter, 2: counter + timestamp, 3: feature l2 norm, 4: timestamp threshold 5: feature score
                     eviction_policy.eviction_step_intervals,  # trigger_step_interval if trigger mode is iteration
                     None,  # mem_util_threshold_in_GB if trigger mode is mem_util
@@ -111,8 +111,8 @@ class SSDCheckpointTest(unittest.TestCase):
                     eviction_policy.counter_thresholds,  # counter_thresholds for each table if eviction strategy is counter
                     eviction_policy.counter_decay_rates,  # counter_decay_rates for each table if eviction strategy is counter
                     eviction_policy.feature_score_counter_decay_rates,  # feature_score_counter_decay_rates for each table if eviction strategy is feature score
-                    eviction_policy.max_training_id_num_per_table,  # max_training_id_num for each table
-                    eviction_policy.target_eviction_percent_per_table,  # target_eviction_percent for each table
+                    eviction_policy.training_id_eviction_trigger_count,  # training_id_eviction_trigger_count for each table
+                    eviction_policy.training_id_keep_count,  # training_id_keep_count for each table
                     eviction_policy.l2_weight_thresholds,  # l2_weight_thresholds for each table if eviction strategy is feature l2 norm
                     feature_dims.tolist() if feature_dims is not None else None,
                     eviction_policy.threshold_calculation_bucket_stride,  # threshold_calculation_bucket_stride if eviction strategy is feature score
@@ -146,7 +146,7 @@ class SSDCheckpointTest(unittest.TestCase):
         kv_zch_params: Optional[KVZCHParams] = None,
         backend_type: BackendType = BackendType.SSD,
         flushing_block_size: int = 1000,
-    ) -> Tuple[SSDTableBatchedEmbeddingBags, List[int], List[int]]:
+    ) -> tuple[SSDTableBatchedEmbeddingBags, list[int], list[int]]:
         E = int(10**log_E)
         D = D * 4
         if not mixed:
@@ -927,7 +927,7 @@ class SSDCheckpointTest(unittest.TestCase):
         )
         metaheader_dim: int = 16 // (weight_precision.bit_rate() // 8)
         eviction_policy: EvictionPolicy = EvictionPolicy(
-            eviction_trigger_mode=1,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual
+            eviction_trigger_mode=4,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual, 4: id count
             eviction_strategy=5,  # evict_trigger_strategy: 0: timestamp, 1: counter , 2: counter + timestamp, 3: feature l2 norm, 5: feature score
             eviction_step_intervals=1,  # trigger_step_interval if trigger mode is iteration
             feature_score_counter_decay_rates=[
@@ -936,17 +936,17 @@ class SSDCheckpointTest(unittest.TestCase):
                 0.9,
                 0.9,
             ],  # feature_score_counter_decay_rates for each table if eviction strategy is feature score`
-            max_training_id_num_per_table=[
+            training_id_eviction_trigger_count=[
                 20,
                 20,
                 20,
-                20,
+                19,
             ],
-            target_eviction_percent_per_table=[
-                0.1,
-                0.1,
-                0.1,
-                0.1,
+            training_id_keep_count=[
+                18,
+                18,
+                18,
+                18,
             ],
             ttls_in_mins=[
                 0,
@@ -1076,7 +1076,7 @@ class SSDCheckpointTest(unittest.TestCase):
             [0, E / T, 2 * E / T, 3 * E / T, 4 * E / T + 10], dtype=torch.int64
         )
         eviction_policy: EvictionPolicy = EvictionPolicy(
-            eviction_trigger_mode=1,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual
+            eviction_trigger_mode=4,  # eviction is disabled, 0: disabled, 1: iteration, 2: mem_util, 3: manual 4: id count
             eviction_strategy=5,  # evict_trigger_strategy: 0: timestamp, 1: counter , 2: counter + timestamp, 3: feature l2 norm, 5: feature score
             eviction_step_intervals=1,  # trigger_step_interval if trigger mode is iteration
             feature_score_counter_decay_rates=[
@@ -1085,17 +1085,17 @@ class SSDCheckpointTest(unittest.TestCase):
                 0.9,
                 0.9,
             ],  # feature_score_counter_decay_rates for each table if eviction strategy is feature score`
-            max_training_id_num_per_table=[
-                2000,
-                2000,
-                2000,
-                2000,
+            training_id_eviction_trigger_count=[
+                2400,
+                2400,
+                2400,
+                2400,
             ],
-            target_eviction_percent_per_table=[
-                0.1,
-                0.1,
-                0.1,
-                0.1,
+            training_id_keep_count=[
+                1800,
+                1800,
+                1800,
+                1800,
             ],
             ttls_in_mins=[
                 0,
