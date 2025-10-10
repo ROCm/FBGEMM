@@ -19,6 +19,9 @@ import click
 import numpy as np
 
 import torch
+import fbgemm_gpu
+
+print('fbgemm_gpu path %s', fbgemm_gpu.__path__)
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
@@ -402,6 +405,7 @@ def device(  # noqa C901
         f"BW: {2 * read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "
         f"T: {time_per_iter * 1.0e6:.0f}us"
     )
+    logging.info(f"benchmark done")
 
 
 @cli.command()
@@ -1343,6 +1347,7 @@ def device_with_spec(  # noqa C901
         f"BW: {2 * read_write_bytes / time_per_iter / 1.0e9: .2f} GB/s, "
         f"T: {time_per_iter * 1.0e6:.0f}us"
     )
+    logging.info(f"benchmark done 2")
 
 
 @cli.command()

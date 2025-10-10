@@ -16,12 +16,29 @@ from subprocess import Popen
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import pdb
+import numpy as np
 
 from fbgemm_gpu.tbe.utils import b_indices, TBERequest
 from fbgemm_gpu.tbe.utils.common import get_device
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import SplitTableBatchedEmbeddingBagsCodegen
 logging.basicConfig(level=logging.DEBUG)
 
+def get_topk_positions(tensor, k=10):
+    """
+    Get the positions of top k maximum elements in a tensor
+    Returns: list of tuples (value, coordinates)
+    """
+    k = min(k, tensor.numel())
+    values, flat_indices = torch.topk(tensor.flatten(), k)
+
+    positions = []
+    for i, idx in enumerate(flat_indices):
+        # Convert flat index to multi-dimensional coordinates
+        coords = np.unravel_index(idx.item(), tensor.shape)
+        positions.append((values[i].item(), coords))
+
+    return positions
 
 def bench_warmup(
     request: TBERequest,
@@ -351,6 +368,21 @@ def benchmark_requests(  # noqa: C901
                     torch.testing.assert_close(t[slice_min:slice_max,:], w_ref,
                                                msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
             else:
+                '''
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    print(t.shape)
+                    print(f'{id} max_diff {torch.max(torch.abs(t - emb_ref.split_embedding_weights()[id]))}')
+                    print(f'{id} avg_diff {torch.mean(torch.abs(t - emb_ref.split_embedding_weights()[id]))}')
+                    diff_mask = torch.abs(t - emb_ref.split_embedding_weights()[id]) > 1e-3
+                    count = torch.sum(diff_mask).item()
+                    print(f'{id} diff count {count}')
+                    top_positions = get_topk_positions(torch.abs(t - emb_ref.split_embedding_weights()[id]), 64)
+                    for val, pos in top_positions:
+                        print(f"Value {val:.4f}: position {pos}")
+                    # torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
+                    #                            msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
+                    # pdb.set_trace()
+                '''
                 for id, t in enumerate(emb.split_embedding_weights()):
                     torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
                                                msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
@@ -363,6 +395,10 @@ def benchmark_requests(  # noqa: C901
             else:
                 m_dev_ref = emb_ref.momentum1_dev
                 m_uvm_ref = emb_ref.momentum1_uvm
+            # pdb.set_trace()
+            # top_positions = get_topk_positions(torch.abs(m_dev_ref - emb.momentum1_dev), 64)
+            # for val, pos in top_positions:
+            #     print(f"Value {val:.4f}: position {pos}, ref: {m_dev_ref[pos].item()}, dev: {emb.momentum1_dev[pos].item()}")
             torch.testing.assert_close(emb.momentum1_dev, m_dev_ref, atol=1.0e-4, rtol=1.0e-4)
             torch.testing.assert_close(emb.momentum1_uvm, m_uvm_ref, atol=1.0e-4, rtol=1.0e-4)
             print("PASS")
