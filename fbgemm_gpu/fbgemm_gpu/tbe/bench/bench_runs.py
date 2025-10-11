@@ -330,6 +330,11 @@ def benchmark_requests(  # noqa: C901
             out = emb(indices, offsets, weights)
             torch.cuda.synchronize()
             
+            out_ref = torch.load(f"{load}/{it}_fwd_grad_out.pt")
+            torch.testing.assert_close(out, out_ref, atol=1.0e-3, rtol=1.0e-3)
+
+            print("FWD PASS")
+
             out.backward(grad)
             torch.cuda.synchronize()
             emb_ref = copy.deepcopy(emb)
