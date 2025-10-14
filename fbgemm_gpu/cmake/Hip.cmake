@@ -85,6 +85,7 @@ if(HIP_FOUND)
   #list(APPEND HIP_CXX_FLAGS -adhln)
   list(APPEND HIP_CXX_FLAGS -save-temps)
   list(APPEND HIP_CXX_FLAGS -fverbose-asm)
+  list(APPEND HIP_CXX_FLAGS -Rpass-analysis=kernel-resource-usage)
 
 
   set(HIP_HCC_FLAGS ${HIP_CXX_FLAGS})
