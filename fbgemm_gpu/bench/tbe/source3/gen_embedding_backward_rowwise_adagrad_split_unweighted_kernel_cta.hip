@@ -41,7 +41,7 @@ template <
     int32_t kFixedMaxVecsPerThread,
     int32_t _kThreadGroupSize,
     bool kUseVecBlocking>
-__global__ __launch_bounds__(kMaxThreads) void
+__global__ __launch_bounds__(kMaxThreads, 8) void
 split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1(
     const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits> grad_output,
     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
