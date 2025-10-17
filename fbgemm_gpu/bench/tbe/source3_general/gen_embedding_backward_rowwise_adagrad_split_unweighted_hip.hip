@@ -90,6 +90,53 @@ template <
     int32_t kFixedMaxVecsPerThread,
     int32_t kThreadGroupSize,
     bool kUseVecBlocking>
+__global__ __launch_bounds__(kMaxThreads, 8) void
+split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1_maxD_128(
+    const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits> grad_output,
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements, // if optimizer != "none"
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> long_run_ids,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> num_long_run_ids,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_lxu_cache_locations,
+    const bool use_uniq_cache_locations,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args, // if not dense and optimizer != "none"
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> long_run_id_to_really_long_run_ids,
+    pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 2, at::RestrictPtrTraits> temp_grad_accum,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> grad_accum_counter,
+    const int32_t max_segment_length_per_cta,
+    const bool use_deterministic_algorithms,
+    const int32_t max_vecs_per_thread,
+    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_dev,
+    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_uvm,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> momentum1_placements,
+    pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> momentum1_offsets,
+    float learning_rate = 0,
+    float eps = 0,
+    float weight_decay = 0.0,
+    int64_t weight_decay_mode = 0,
+    float max_norm = 0.0
+);
+
+template <
+    typename emb_t,
+    typename grad_t,
+    typename cache_t,
+    typename index_t,
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize,
+    bool kUseVecBlocking>
 __global__ __launch_bounds__(kBackwardMaxThreads) void
 split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1(
     const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits> grad_output,
@@ -125,48 +172,49 @@ split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_
     float max_norm = 0.0
 );
 
-// template <
-//     typename emb_t,
-//     typename grad_t,
-//     typename cache_t,
-//     typename index_t,
-//     int32_t kFixedMaxVecsPerThread,
-//     int32_t kThreadGroupSize,
-//     bool kUseVecBlocking>
-// __global__ __launch_bounds__(kBackwardMaxThreads) void
-// split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1_maxD_128(
-//     const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits> grad_output,
-//     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
-//     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
-//     pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
-//     const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
-//     const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
-//     const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_lxu_cache_locations,
-//     const bool use_uniq_cache_locations,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
-//     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_num_runs,
-//     int32_t max_segment_length_per_warp,
-//     bool stochastic_rounding,
-//     at::PhiloxCudaState stochastic_rounding_philox_args, // if not dense and optimizer != "none"
-//     const int32_t info_B_num_bits,
-//     const uint32_t info_B_mask,
-//     const int32_t max_D,
-//     const int32_t max_vecs_per_thread,
-//     pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_dev,
-//     pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_uvm,
-//     pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> momentum1_placements,
-//     pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> momentum1_offsets,
-//     float learning_rate = 0,
-//     float eps = 0,
-//     float weight_decay = 0.0,
-//     int64_t weight_decay_mode = 0,
-//     float max_norm = 0.0
-// );
+template <
+    typename emb_t,
+    typename grad_t,
+    typename cache_t,
+    typename index_t,
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize,
+    bool kUseVecBlocking>
+__global__ __launch_bounds__(kBackwardMaxThreads) void
+split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1_maxD_128(
+    const pta::PackedTensorAccessor64<grad_t, 2, at::RestrictPtrTraits> grad_output,
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_lxu_cache_locations,
+    const bool use_uniq_cache_locations,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_num_runs,
+    int32_t max_segment_length_per_warp,
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args, // if not dense and optimizer != "none"
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    const int32_t max_D,
+    const int32_t max_vecs_per_thread,
+    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_dev,
+    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> momentum1_uvm,
+    pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> momentum1_placements,
+    pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> momentum1_offsets,
+    float learning_rate = 0,
+    float eps = 0,
+    float weight_decay = 0.0,
+    int64_t weight_decay_mode = 0,
+    float max_norm = 0.0
+);
+
 #include "fbgemm_gpu/rocm/split_embeddings_common.h"
 template <
     typename emb_t,
@@ -704,7 +752,7 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                   "split_embedding_backward_rowwise_adagrad_exact_placeholder_type_kernel",
                   [&] {
 
-                    const auto backward_cta_per_row_kernel =
+                    auto backward_cta_per_row_kernel =
                         split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1
                             <emb_t,
                              grad_t,
@@ -713,6 +761,17 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                              kFixedMaxVecsPerThread,
                              kThreadGroupSize,
                              kUseVecBlocking>;
+                    if (max_D <= 128) {
+                        backward_cta_per_row_kernel =
+                        split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1_maxD_128
+                            <emb_t,
+                             grad_t,
+                             cache_t,
+                             index_t,
+                             kFixedMaxVecsPerThread,
+                             kThreadGroupSize,
+                             kUseVecBlocking>;
+                    }
 
                     // Compute shared memory size for cta_per_row
                     constexpr auto kCacheAccBytes = sizeof(at::acc_type<cache_t, true>);
@@ -745,11 +804,19 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                         div_round_up(total_unique_indices, work_group_size),
                         get_max_thread_blocks_());
 
+                    auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
+                    if (max_D <= 128) {
+                        cta_blockSize = dim3(32, num_cta_per_row_groups);
+                        int num_blocks_per_sm = 0;
+                        hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_cta_per_row_kernel, 256, cta_per_row_smem_bytes);
+                        printf("=======zhz4 %s cta_kernel %d %d shared_memory_size: %d num_block_per_sm: %d launch\n", __FILE__, kThreadGroupSize, num_cta_per_row_groups, cta_per_row_smem_bytes, num_blocks_per_sm);
+                    }
                     FBGEMM_LAUNCH_KERNEL(
                         backward_cta_per_row_kernel,
                         cta_per_row_grid_size,
                         // (64, 2)
-                        dim3(kThreadGroupSize, num_cta_per_row_groups),
+                        // dim3(kThreadGroupSize, num_cta_per_row_groups),
+                        cta_blockSize,
                         cta_per_row_smem_bytes,
                         at::hip::getCurrentHIPStreamMasqueradingAsCUDA(),
                         grad_output_accessor,
@@ -797,19 +864,17 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                              kFixedMaxVecsPerThread,
                              kThreadGroupSize,
                              kUseVecBlocking>;
-                    // if (max_D <= 128) {
-                    //     // kThreadGroupSize = 32;
-                    //     // num_warp_per_row_groups = 8;
-                    //     backward_warp_per_row_kernel =
-                    //         split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1
-                    //             <emb_t,
-                    //             grad_t,
-                    //             cache_t,
-                    //             index_t,
-                    //             kFixedMaxVecsPerThread,
-                    //             32,
-                    //             kUseVecBlocking>;
-                    // }
+                    if (max_D <= 128) {
+                        backward_warp_per_row_kernel =
+                            split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1_maxD_128
+                                <emb_t,
+                                grad_t,
+                                cache_t,
+                                index_t,
+                                kFixedMaxVecsPerThread,
+                                kThreadGroupSize,
+                                kUseVecBlocking>;
+                    }
 
                     // Compute shared memory size for warp_per_row
                     #ifdef USE_ROCM
@@ -859,7 +924,7 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                         int num_blocks_per_sm = 0;
                         hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_warp_per_row_kernel, 256, 0);
 
-                        printf("=======zhz4: %s warp kernel %d %d %d %d %d %d num_block_per_sm: %d launch\n", __FILE__, __LINE__, use_hip_kernel, mixed_D, kThreadGroupSize, num_warp_per_row_groups, warp_per_row_grid_size, num_blocks_per_sm);
+                        printf("=======zhz1: %s warp kernel %d %d %d %d %d %d num_block_per_sm: %d launch\n", __FILE__, __LINE__, use_hip_kernel, mixed_D, kThreadGroupSize, num_warp_per_row_groups, warp_per_row_grid_size, num_blocks_per_sm);
                     }
 
                     if (use_hip_kernel && !mixed_D && supported_weights_type && rocm::is_supported_cdna())
