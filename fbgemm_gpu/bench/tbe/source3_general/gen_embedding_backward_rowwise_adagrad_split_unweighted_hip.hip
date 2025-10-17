@@ -807,9 +807,9 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
                     if (max_D <= 128) {
                         cta_blockSize = dim3(32, num_cta_per_row_groups);
-                        int num_blocks_per_sm = 0;
-                        hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_cta_per_row_kernel, 256, cta_per_row_smem_bytes);
-                        printf("=======zhz4 %s cta_kernel %d %d shared_memory_size: %d num_block_per_sm: %d launch\n", __FILE__, kThreadGroupSize, num_cta_per_row_groups, cta_per_row_smem_bytes, num_blocks_per_sm);
+                        // int num_blocks_per_sm = 0;
+                        // hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_cta_per_row_kernel, 256, cta_per_row_smem_bytes);
+                        // printf("=======zhz4 %s cta_kernel %d %d shared_memory_size: %d num_block_per_sm: %d launch\n", __FILE__, kThreadGroupSize, num_cta_per_row_groups, cta_per_row_smem_bytes, num_blocks_per_sm);
                     }
                     FBGEMM_LAUNCH_KERNEL(
                         backward_cta_per_row_kernel,
@@ -919,13 +919,13 @@ Tensor split_embedding_backward_codegen_rowwise_adagrad_unweighted_exact_cuda(
 
                     const auto supported_weights_type = dev_weights.scalar_type() == at::ScalarType::Half
                                                       || dev_weights.scalar_type() == at::ScalarType::Float;
-                    if (max_D <= 128)
-                    {
-                        int num_blocks_per_sm = 0;
-                        hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_warp_per_row_kernel, 256, 0);
+                    // if (max_D <= 128)
+                    // {
+                    //     int num_blocks_per_sm = 0;
+                    //     hipOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, backward_warp_per_row_kernel, 256, 0);
 
-                        printf("=======zhz1: %s warp kernel %d %d %d %d %d %d num_block_per_sm: %d launch\n", __FILE__, __LINE__, use_hip_kernel, mixed_D, kThreadGroupSize, num_warp_per_row_groups, warp_per_row_grid_size, num_blocks_per_sm);
-                    }
+                    //     // printf("=======zhz1: %s warp kernel %d %d %d %d %d %d num_block_per_sm: %d launch\n", __FILE__, __LINE__, use_hip_kernel, mixed_D, kThreadGroupSize, num_warp_per_row_groups, warp_per_row_grid_size, num_blocks_per_sm);
+                    // }
 
                     if (use_hip_kernel && !mixed_D && supported_weights_type && rocm::is_supported_cdna())
                     {

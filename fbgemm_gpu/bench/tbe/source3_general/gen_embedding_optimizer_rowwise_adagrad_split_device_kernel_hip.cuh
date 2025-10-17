@@ -400,12 +400,14 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel_device(
     const float global_weight_decay,
     const uint32_t shfl_sync_mask,
     const int32_t max_vecs_per_thread,
-    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_dev,
-    pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_uvm,
+    // pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_dev,
+    // pta::PackedTensorAccessor64<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits>& momentum1_uvm,
     // pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>& momentum1_placements,
     // pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>& momentum1_offsets,
-    PlacementType momentum1_placement,
-    const int64_t momentum1_offset,
+    at::acc_type<cache_t, true>* momentum1,
+    cache_t momentum1_val,
+    // PlacementType momentum1_placement,
+    // const int64_t momentum1_offset,
     float learning_rate = 0,
     float eps = 0,
     float weight_decay = 0.0,
@@ -436,14 +438,14 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel_device(
           cache_weights = &lxu_cache_weights[cache_idx][0];
         }
     }
-    at::acc_type<cache_t, true>* __restrict__ momentum1;
+    // at::acc_type<cache_t, true>* __restrict__ momentum1;
     // const auto momentum1_placement = static_cast<PlacementType>(momentum1_placements[t]);
     // const int64_t momentum1_offset = momentum1_offsets[t];
-    if (momentum1_placement == PlacementType::DEVICE) {
-        momentum1 = &momentum1_dev[momentum1_offset];
-    } else {
-        momentum1 = &momentum1_uvm[momentum1_offset];
-    }
+    // if (momentum1_placement == PlacementType::DEVICE) {
+    //     momentum1 = &momentum1_dev[momentum1_offset];
+    // } else {
+    //     momentum1 = &momentum1_uvm[momentum1_offset];
+    // }
 
     auto weight_row_template =
         WeightRow<emb_t, cache_t, at::acc_type<cache_t, true>>(
@@ -541,7 +543,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel_device(
             optimizer->momentum = new_sum_square_grads;
 
         } else {
-            new_sum_square_grads += momentum1[idx];
+            new_sum_square_grads += momentum1_val;
             momentum1[idx] = new_sum_square_grads;
         }
 
