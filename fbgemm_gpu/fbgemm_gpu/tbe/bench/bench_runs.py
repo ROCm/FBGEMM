@@ -14,6 +14,7 @@ import time
 import gzip
 from subprocess import Popen
 from typing import Callable, Optional
+import copy
 
 import torch
 
@@ -253,7 +254,6 @@ def benchmark_requests(  # noqa: C901
     # Run at least one warmup iteration to avoid the long cudaLaunchKernel time
     # for the first kernel if warmup_ms > 0
     # warmup_ms is prioritized over num_warmups
-    import copy
     if warmup_ms is None:
         num_warmups = num_warmups + 1 if num_warmups >= 0 else 1
 
@@ -689,6 +689,12 @@ def benchmark_vbe(
     requests: list[tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     num_warmups: int = 0,
+    emb: Optional[SplitTableBatchedEmbeddingBagsCodegen] = None,
+    save: Optional[str] = None,
+    load: Optional[str] = None,
+    compressed: bool = False,
+    slice_min: Optional[int] = None,
+    slice_max: Optional[int] = None,
 ) -> tuple[float, float]:
     """
     A benchmark function to return the average execution time in seconds of
@@ -713,14 +719,16 @@ def benchmark_vbe(
     """
 
     use_cuda = torch.cuda.is_available()
+    sliced = slice_min is not None and slice_max is not None
 
+    if not (load or save):
     # Warm-ups.
-    for _ in range(num_warmups):
-        # Warm-up using the first request as done in benchmark_requests
-        indices, offsets, weights = requests[0]
-        out = func(indices, offsets, weights)
-        grad = torch.rand_like(out)
-        out.backward(grad)
+        for _ in range(num_warmups):
+            # Warm-up using the first request as done in benchmark_requests
+            indices, offsets, weights = requests[0]
+            out = func(indices, offsets, weights)
+            grad = torch.rand_like(out)
+            out.backward(grad)
 
     iters = len(requests)
     if use_cuda:
@@ -733,6 +741,91 @@ def benchmark_vbe(
         # Actual measurement in seconds.
         fwd_times_sec = []
         bwd_times_sec = []
+    
+    if save and emb:
+        for it, req in enumerate(requests):
+
+            indices, offsets, weights = req
+            out = func(indices, offsets, weights)
+            torch.cuda.synchronize()
+            grad = torch.rand_like(out)
+            if compressed:
+                with gzip.open(f"{save}/{it}_grad.pt.gz", "wb") as f:
+                    torch.save(grad, f)
+            else:
+                torch.save(grad, f"{save}/{it}_grad.pt")
+            
+            out.backward(grad)
+            torch.cuda.synchronize()
+
+            if sliced:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    if compressed:
+                        with gzip.open(f"{save}/{it}_{id}_bwd_weights_out.pt.gz", "wb") as f:
+                            torch.save(t[slice_min:slice_max,:].clone(), f)
+                    else:
+                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
+                else:
+                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
+                torch.save(emb.momentum1_dev, f"{save}/{it}_bwd_momentum1_dev_out.pt")
+                torch.save(emb.momentum1_uvm, f"{save}/{it}_bwd_momentum1_uvm_out.pt")
+            
+            else:
+                if compressed:
+                    with gzip.open(f"{save}/{it}_bwd_state_out.pth.gz", "wb") as f:
+                        torch.save(emb.state_dict(), f)
+                else:
+                    torch.save(emb.state_dict(), f"{save}/{it}_bwd_state_out.pth")
+
+    if load and emb:
+        for it, req in enumerate(requests):
+
+            indices, offsets, weights = req
+            out = func(indices, offsets, weights)
+            torch.cuda.synchronize()
+            
+            if compressed:
+                with gzip.open(f"{load}/{it}_grad.pt.gz", "rb") as f:
+                    grad = torch.load(f)
+            else:
+                grad = torch.load(f"{load}/{it}_grad.pt")
+            
+            out.backward(grad)
+            torch.cuda.synchronize()
+            emb_ref = copy.deepcopy(emb)
+            if not sliced:
+                if compressed:
+                    with gzip.open(f"{load}/{it}_bwd_state_out.pth.gz", "rb") as f:
+                        emb_ref.load_state_dict(torch.load(f))
+                else:
+                    emb_ref.load_state_dict(torch.load(f"{load}/{it}_bwd_state_out.pth"))
+
+            print(f"[{it + 1}/{iters}] Backward weights check... ", end="", flush=True)
+            if sliced:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    if compressed:
+                        with gzip.open(f"{it}_{id}_bwd_weights_out.pt.gz", "rb") as f:
+                            w_ref = torch.load(f)
+                    else:
+                        w_ref = torch.load(f"{load}/{it}_{id}_bwd_weights_out.pt")
+                    torch.testing.assert_close(t[slice_min:slice_max,:], w_ref,
+                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
+            else:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
+                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
+            print("PASS")
+            
+            print(f"[{it + 1}/{iters}] Backward momentum check... ", end="", flush=True)
+            if sliced:
+                m_dev_ref = torch.load(f"{load}/{it}_bwd_momentum1_dev_out.pt")
+                m_uvm_ref = torch.load(f"{load}/{it}_bwd_momentum1_uvm_out.pt")
+            else:
+                m_dev_ref = emb_ref.momentum1_dev
+                m_uvm_ref = emb_ref.momentum1_uvm
+            torch.testing.assert_close(emb.momentum1_dev, m_dev_ref)
+            torch.testing.assert_close(emb.momentum1_uvm, m_uvm_ref)
+            print("PASS")
 
     for i, (indices, offsets, weights) in enumerate(requests):
         # forward
