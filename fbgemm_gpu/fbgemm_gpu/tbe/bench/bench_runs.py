@@ -13,32 +13,16 @@ import threading
 import time
 import gzip
 from subprocess import Popen
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional
+import copy
 
 import torch
-import pdb
-import numpy as np
 
 from fbgemm_gpu.tbe.utils import b_indices, TBERequest
 from fbgemm_gpu.tbe.utils.common import get_device
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import SplitTableBatchedEmbeddingBagsCodegen
 logging.basicConfig(level=logging.DEBUG)
 
-def get_topk_positions(tensor, k=10):
-    """
-    Get the positions of top k maximum elements in a tensor
-    Returns: list of tuples (value, coordinates)
-    """
-    k = min(k, tensor.numel())
-    values, flat_indices = torch.topk(tensor.flatten(), k)
-
-    positions = []
-    for i, idx in enumerate(flat_indices):
-        # Convert flat index to multi-dimensional coordinates
-        coords = np.unravel_index(idx.item(), tensor.shape)
-        positions.append((values[i].item(), coords))
-
-    return positions
 
 def bench_warmup(
     request: TBERequest,
@@ -67,7 +51,7 @@ def bench_warmup_with_spec(
     warmup_ms: int,
     warmup_runs: int,
     func: Callable[
-        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[List[List[int]]]],
+        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list[list[int]]]],
         torch.Tensor,
     ],
     bwd_only: bool = False,
@@ -110,7 +94,7 @@ cpu_bm_barrier = BMBarrier()
 
 
 def cpu_tbe_worker(
-    requests_: List[TBERequest],
+    requests_: list[TBERequest],
     func_: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     use_barrier: bool = False,
 ) -> float:
@@ -142,7 +126,7 @@ def cpu_tbe_worker(
 
 
 def benchmark_cpu_requests_mp(
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     emb_module: torch.nn.Module,
     num_warmups: int = 0,
     num_copies: int = 1,
@@ -225,7 +209,7 @@ def benchmark_cpu_requests_mp(
 
 
 def benchmark_cpu_requests(
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     num_warmups: int = 0,
 ) -> float:
@@ -243,7 +227,7 @@ def benchmark_cpu_requests(
 
 
 def benchmark_requests(  # noqa: C901
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     flush_gpu_cache_size_mb: int = 0,
     check_median: bool = False,
@@ -270,7 +254,6 @@ def benchmark_requests(  # noqa: C901
     # Run at least one warmup iteration to avoid the long cudaLaunchKernel time
     # for the first kernel if warmup_ms > 0
     # warmup_ms is prioritized over num_warmups
-    import copy
     if warmup_ms is None:
         num_warmups = num_warmups + 1 if num_warmups >= 0 else 1
 
@@ -368,21 +351,6 @@ def benchmark_requests(  # noqa: C901
                     torch.testing.assert_close(t[slice_min:slice_max,:], w_ref,
                                                msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
             else:
-                '''
-                for id, t in enumerate(emb.split_embedding_weights()):
-                    print(t.shape)
-                    print(f'{id} max_diff {torch.max(torch.abs(t - emb_ref.split_embedding_weights()[id]))}')
-                    print(f'{id} avg_diff {torch.mean(torch.abs(t - emb_ref.split_embedding_weights()[id]))}')
-                    diff_mask = torch.abs(t - emb_ref.split_embedding_weights()[id]) > 1e-3
-                    count = torch.sum(diff_mask).item()
-                    print(f'{id} diff count {count}')
-                    top_positions = get_topk_positions(torch.abs(t - emb_ref.split_embedding_weights()[id]), 64)
-                    for val, pos in top_positions:
-                        print(f"Value {val:.4f}: position {pos}")
-                    # torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
-                    #                            msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
-                    # pdb.set_trace()
-                '''
                 for id, t in enumerate(emb.split_embedding_weights()):
                     torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
                                                msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
@@ -395,10 +363,6 @@ def benchmark_requests(  # noqa: C901
             else:
                 m_dev_ref = emb_ref.momentum1_dev
                 m_uvm_ref = emb_ref.momentum1_uvm
-            # pdb.set_trace()
-            # top_positions = get_topk_positions(torch.abs(m_dev_ref - emb.momentum1_dev), 64)
-            # for val, pos in top_positions:
-            #     print(f"Value {val:.4f}: position {pos}, ref: {m_dev_ref[pos].item()}, dev: {emb.momentum1_dev[pos].item()}")
             torch.testing.assert_close(emb.momentum1_dev, m_dev_ref, atol=1.0e-4, rtol=1.0e-4)
             torch.testing.assert_close(emb.momentum1_uvm, m_uvm_ref, atol=1.0e-4, rtol=1.0e-4)
             print("PASS")
@@ -458,9 +422,9 @@ def benchmark_requests(  # noqa: C901
 
 
 def benchmark_requests_with_spec(  # noqa: C901
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     func: Callable[
-        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[List[List[int]]]],
+        [torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[list[list[int]]]],
         torch.Tensor,
     ],
     flush_gpu_cache_size_mb: int = 0,
@@ -573,7 +537,7 @@ def benchmark_requests_with_spec(  # noqa: C901
 
 
 def benchmark_requests_refer(
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     T: int,
     B: int,
     L: int,
@@ -665,12 +629,12 @@ def benchmark_requests_refer(
 
 
 def benchmark_pipelined_requests(
-    requests: List[TBERequest],
+    requests: list[TBERequest],
     func1: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], None],
     func2: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], None],
     flush_gpu_cache_size_mb: int = 0,
     check_median: bool = False,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     torch.cuda.synchronize()
     start_events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -722,10 +686,16 @@ def benchmark_pipelined_requests(
 
 
 def benchmark_vbe(
-    requests: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
+    requests: list[tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     func: Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
     num_warmups: int = 0,
-) -> Tuple[float, float]:
+    emb: Optional[SplitTableBatchedEmbeddingBagsCodegen] = None,
+    save: Optional[str] = None,
+    load: Optional[str] = None,
+    compressed: bool = False,
+    slice_min: Optional[int] = None,
+    slice_max: Optional[int] = None,
+) -> tuple[float, float]:
     """
     A benchmark function to return the average execution time in seconds of
     forward and backward of VBE kernels.
@@ -749,14 +719,16 @@ def benchmark_vbe(
     """
 
     use_cuda = torch.cuda.is_available()
+    sliced = slice_min is not None and slice_max is not None
 
+    if not (load or save):
     # Warm-ups.
-    for _ in range(num_warmups):
-        # Warm-up using the first request as done in benchmark_requests
-        indices, offsets, weights = requests[0]
-        out = func(indices, offsets, weights)
-        grad = torch.rand_like(out)
-        out.backward(grad)
+        for _ in range(num_warmups):
+            # Warm-up using the first request as done in benchmark_requests
+            indices, offsets, weights = requests[0]
+            out = func(indices, offsets, weights)
+            grad = torch.rand_like(out)
+            out.backward(grad)
 
     iters = len(requests)
     if use_cuda:
@@ -769,6 +741,91 @@ def benchmark_vbe(
         # Actual measurement in seconds.
         fwd_times_sec = []
         bwd_times_sec = []
+    
+    if save and emb:
+        for it, req in enumerate(requests):
+
+            indices, offsets, weights = req
+            out = func(indices, offsets, weights)
+            torch.cuda.synchronize()
+            grad = torch.rand_like(out)
+            if compressed:
+                with gzip.open(f"{save}/{it}_grad.pt.gz", "wb") as f:
+                    torch.save(grad, f)
+            else:
+                torch.save(grad, f"{save}/{it}_grad.pt")
+            
+            out.backward(grad)
+            torch.cuda.synchronize()
+
+            if sliced:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    if compressed:
+                        with gzip.open(f"{save}/{it}_{id}_bwd_weights_out.pt.gz", "wb") as f:
+                            torch.save(t[slice_min:slice_max,:].clone(), f)
+                    else:
+                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
+                else:
+                        torch.save(t[slice_min:slice_max,:].clone(), f"{save}/{it}_{id}_bwd_weights_out.pt")
+                torch.save(emb.momentum1_dev, f"{save}/{it}_bwd_momentum1_dev_out.pt")
+                torch.save(emb.momentum1_uvm, f"{save}/{it}_bwd_momentum1_uvm_out.pt")
+            
+            else:
+                if compressed:
+                    with gzip.open(f"{save}/{it}_bwd_state_out.pth.gz", "wb") as f:
+                        torch.save(emb.state_dict(), f)
+                else:
+                    torch.save(emb.state_dict(), f"{save}/{it}_bwd_state_out.pth")
+
+    if load and emb:
+        for it, req in enumerate(requests):
+
+            indices, offsets, weights = req
+            out = func(indices, offsets, weights)
+            torch.cuda.synchronize()
+            
+            if compressed:
+                with gzip.open(f"{load}/{it}_grad.pt.gz", "rb") as f:
+                    grad = torch.load(f)
+            else:
+                grad = torch.load(f"{load}/{it}_grad.pt")
+            
+            out.backward(grad)
+            torch.cuda.synchronize()
+            emb_ref = copy.deepcopy(emb)
+            if not sliced:
+                if compressed:
+                    with gzip.open(f"{load}/{it}_bwd_state_out.pth.gz", "rb") as f:
+                        emb_ref.load_state_dict(torch.load(f))
+                else:
+                    emb_ref.load_state_dict(torch.load(f"{load}/{it}_bwd_state_out.pth"))
+
+            print(f"[{it + 1}/{iters}] Backward weights check... ", end="", flush=True)
+            if sliced:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    if compressed:
+                        with gzip.open(f"{it}_{id}_bwd_weights_out.pt.gz", "rb") as f:
+                            w_ref = torch.load(f)
+                    else:
+                        w_ref = torch.load(f"{load}/{it}_{id}_bwd_weights_out.pt")
+                    torch.testing.assert_close(t[slice_min:slice_max,:], w_ref,
+                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
+            else:
+                for id, t in enumerate(emb.split_embedding_weights()):
+                    torch.testing.assert_close(t, emb_ref.split_embedding_weights()[id], 
+                                               msg=f"FAILED table = {id}", atol=1.0e-3, rtol=10e-3)
+            print("PASS")
+            
+            print(f"[{it + 1}/{iters}] Backward momentum check... ", end="", flush=True)
+            if sliced:
+                m_dev_ref = torch.load(f"{load}/{it}_bwd_momentum1_dev_out.pt")
+                m_uvm_ref = torch.load(f"{load}/{it}_bwd_momentum1_uvm_out.pt")
+            else:
+                m_dev_ref = emb_ref.momentum1_dev
+                m_uvm_ref = emb_ref.momentum1_uvm
+            torch.testing.assert_close(emb.momentum1_dev, m_dev_ref)
+            torch.testing.assert_close(emb.momentum1_uvm, m_uvm_ref)
+            print("PASS")
 
     for i, (indices, offsets, weights) in enumerate(requests):
         # forward
@@ -823,3 +880,4 @@ def benchmark_vbe(
     bwd_time_sec = statistics.median(bwd_times_sec)
 
     return fwd_time_sec, bwd_time_sec
+

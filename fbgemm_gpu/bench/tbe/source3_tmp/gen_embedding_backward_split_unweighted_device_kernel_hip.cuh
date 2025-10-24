@@ -74,17 +74,14 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
             int32_t D_start = sl_j < sl_end ? D_offsets[t] : 0; // if vbe // if not nobag
             int32_t j = 0;
             for (; j + 3 < kThreadGroupSize && sl + j + 3 < sl_end; j+=4) {
-
                 int32_t b_j_0 = SHFL_SYNC(b, j);
-                int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
-
                 int32_t b_j_1 = SHFL_SYNC(b, j + 1);
-                int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
-
                 int32_t b_j_2 = SHFL_SYNC(b, j + 2);
-                int32_t D_start_j_2 = SHFL_SYNC(D_start, j + 2);
-
                 int32_t b_j_3 = SHFL_SYNC(b, j + 3);
+
+                int32_t D_start_j_0 = SHFL_SYNC(D_start, j);
+                int32_t D_start_j_1 = SHFL_SYNC(D_start, j + 1);
+                int32_t D_start_j_2 = SHFL_SYNC(D_start, j + 2);
                 int32_t D_start_j_3 = SHFL_SYNC(D_start, j + 3);
 
                 #pragma unroll kFixedMaxVecsPerThread

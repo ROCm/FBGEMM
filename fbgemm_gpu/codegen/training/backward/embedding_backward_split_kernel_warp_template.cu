@@ -1076,4 +1076,589 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
 #endif
 ////////////////////////////////////////////////////////////////////////////////
 {%- endif %}
+
+
+// the following is modified by yadai
+////////////////////////////////////////////////////////////////////////////////
+// Kernel Template Definition
+////////////////////////////////////////////////////////////////////////////////
+
+{#- /*
+    Generate a separate kernel to enable global weight decay using Jinja
+    as the kernel is sensitive to the number of registers. Additional variables
+    required to computer global weight decay increase number of registers and
+    thus reduce the kernel occupancy, which can degrade the kernel performance.
+    This increases the binary size, but the increase is minimal.
+*/ #}
+
+
+{%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+
+{%- set gwddesc = "_gwd" if is_gwd_kernel else "" %}
+template <
+    typename emb_t,
+    typename grad_t,
+    typename cache_t,
+    typename index_t,
+    {%- for ph_name in args.placeholder_tensor_names %}
+    typename {{ ph_name + "_ph_t"}},
+    {%- endfor %}
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize,
+    bool kUseVecBlocking>
+__global__ __launch_bounds__(kBackwardMaxThreads) void
+{%- if is_index_select %}
+batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
+{%- else %}
+{{ mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ desc_suffix }}_kernel_warp_per_row_1_aiter_v2(
+{%- endif %}
+    const pta::PackedTensorAccessor64<grad_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> grad_output,
+    {%- if optimizer != "none" %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
+    {%- if not nobag %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- else %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits> sorted_{{ locs_or_addrs_tensor }},
+    const bool use_uniq_cache_locations,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    {%- endif %}
+    {%- if weighted %}
+    const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_num_runs,
+    int32_t max_segment_length_per_warp,
+    {%- if not dense and optimizer != "none" %}
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args,
+    {%- else %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> grad_dev_weights,
+    {%- endif %} // if not dense and optimizer != "none"
+    {%- if not nobag and vbe %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> B_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> row_output_offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- endif %}
+    const int32_t max_D,
+    const int32_t max_vecs_per_thread,
+    {%- if is_gwd_kernel %}
+    {%- if "prev_iter_dev" not in args.split_function_arg_names %}
+    pta::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits> prev_iter_dev,
+    {%- endif %}
+    {%- if "iter" not in args.split_function_arg_names %}
+    const int64_t iter,
+    {%- endif %}
+    const float gwd_lower_bound,
+    {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const bool permute_output_dim_0_1
+    {%- else %}
+    {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
+    {%- endif %}
+) {
+    {%- if not nobag %}
+    int32_t T = D_offsets.size(0) - 1;
+    {%- else %}
+    int32_t T = weights_offsets.size(0);
+    {%- endif %}
+    const auto start_run_id = blockIdx.x * blockDim.y + threadIdx.y;
+    {%- if is_gwd_kernel %}
+    const float weight_decay_base = 1 - learning_rate * weight_decay;
+    {%- endif %}
+
+#define SUBWARP_SHFL_SYNC(val, srcLane) __shfl_sync(UINT64_MAX, val, srcLane, kThreadGroupSize)
+
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+    const unsigned int shfl_sync_mask =
+        ((1L << kThreadGroupSize) - 1) <<
+        (threadIdx.y % (kWarpSize / kThreadGroupSize) * kThreadGroupSize);
+#else
+    const unsigned int shfl_sync_mask = UINT64_MAX;
+#endif
+
+    constexpr int VEC_WIDTH = 4;
+    constexpr auto kIsInt8 = std::is_same<emb_t, uint8_t>::value;
+
+    struct SharedMemory<Vec4TAcc<cache_t>> smem;
+    const int32_t grad_sum_stride = max_D / VEC_WIDTH;
+    auto* smem_grad_sum = (kUseVecBlocking || kIsInt8)
+      ? smem.getPointer() + threadIdx.y * grad_sum_stride
+      : nullptr;
+
+    constexpr int num_unroll = kThreadGroupSize;
+
+    auto num_run_id = min(sorted_linear_indices_run.size(0), sorted_linear_indices_num_runs[0]);
+
+    for (uint32_t out_run_id = start_run_id * num_unroll; out_run_id < num_run_id; out_run_id += gridDim.x * blockDim.y * num_unroll) {
+
+        auto stride = gridDim.x * blockDim.y;
+        auto num_valid_id = min(num_unroll, num_run_id - out_run_id);
+
+        auto is_valid = threadIdx.x < num_valid_id;
+        int32_t s_segment_start = is_valid? sorted_linear_indices_cumulative_run_lengths[(out_run_id + threadIdx.x)] : -1;
+        int32_t s_segment_end = is_valid? sorted_linear_indices_cumulative_run_lengths[(out_run_id + threadIdx.x + 1)] : -1;
+        int32_t s_SL = s_segment_end - s_segment_start;
+        is_valid = is_valid && (s_SL < max_segment_length_per_warp);
+        int64_t s_idx = is_valid? sorted_linear_indices_run[out_run_id + threadIdx.x] : -1;
+
+        uint32_t s_t_0 = is_valid? reinterpret_cast<const uint32_t*>(&sorted_infos[0])[s_segment_start] : -1;
+        s_t_0 = s_t_0 >> info_B_num_bits;
+
+        int64_t s_hash_size = is_valid? hash_size_cumsum[s_t_0] : -1;
+        int32_t s_D_offsets_0 = is_valid? D_offsets[s_t_0] : 0;
+        int32_t s_D_offsets_1 = is_valid? D_offsets[s_t_0 + 1] : 0;
+        int32_t s_table_unique_indice_offset = is_valid? table_unique_indices_offsets[s_t_0] : 0;
+
+        s_idx -= s_hash_size;
+        auto s_D = s_D_offsets_1 - s_D_offsets_0;
+        const int64_t s_momentum1_offset = is_valid? momentum1_offsets[s_t_0] : 0;
+        const int64_t s_weights_offset = is_valid? weights_offsets[s_t_0] : 0;
+        const int32_t s_weights_placement = is_valid? weights_placements[s_t_0] : 0;
+        const int32_t s_momentum1_placement = is_valid? momentum1_placements[s_t_0] : 0;
+
+        at::acc_type<cache_t, true>* __restrict__ s_momentum1;
+        if (static_cast<PlacementType>(s_momentum1_placement) == PlacementType::DEVICE) {
+            s_momentum1 = &momentum1_dev[s_momentum1_offset];
+        } else {
+            s_momentum1 = &momentum1_uvm[s_momentum1_offset];
+        }
+        cache_t s_momentum1_val = is_valid? s_momentum1[s_idx]: 0;
+
+        for (auto i = 0; i < num_valid_id; ++i) {
+            auto segment_start = SUBWARP_SHFL_SYNC(s_segment_start, i);
+            auto segment_end = SUBWARP_SHFL_SYNC(s_segment_end, i);
+            const int32_t SL = segment_end - segment_start;
+            const int32_t sl_start = 0;
+            const int32_t sl_end = SL;
+            if (SL >= max_segment_length_per_warp) {
+                continue;
+            }
+
+            // extracted by yadai
+            const auto b_t = (sl_start + threadIdx.x) < sl_end
+                ? reinterpret_cast<const uint32_t*>(
+                    &sorted_infos[0])[segment_start + sl_start + threadIdx.x]
+                : 0;
+            auto b = b_t & info_B_mask;
+            const auto t = b_t >> info_B_num_bits; // if vbe
+
+            auto run_id = out_run_id + i;
+            auto t_0 = SUBWARP_SHFL_SYNC(s_t_0, i);
+            auto idx = SUBWARP_SHFL_SYNC(s_idx, i);
+            auto D = SUBWARP_SHFL_SYNC(s_D, i);
+            int32_t table_unique_indice_offset = SUBWARP_SHFL_SYNC(s_table_unique_indice_offset, i);
+            auto momentum1_val = SUBWARP_SHFL_SYNC(s_momentum1_val, i);
+            auto momentum1 = reinterpret_cast<at::acc_type<cache_t, true>*>(SUBWARP_SHFL_SYNC(reinterpret_cast<uint64_t>(s_momentum1), i));
+
+            // extracted by yadai
+            int32_t D_start = (sl_start + threadIdx.x < sl_end) ? D_offsets[t] : 0; // if vbe // if not nobag
+            // const int64_t weights_offset = weights_offsets[t_0];
+
+            // const auto weights_placement = static_cast<PlacementType>(weights_placements[t_0]);
+            // const auto momentum1_placement = static_cast<PlacementType>(momentum1_placements[t_0]);
+
+
+
+            // now, each segment corresponds to exactly one table `t` and row in
+            // that table (`idx`). Thus, we can hoist out some of the book-keeping.
+
+            // D can be hoisted here because D is the same if features share the
+            // same table, but D_start is different
+
+            const int32_t SL_per_warp = div_round_up(SL, blockDim.y);
+            Vec4TAcc<cache_t> grad_sum[kFixedMaxVecsPerThread];
+            constexpr int32_t kGroupVecWidth = kThreadGroupSize * VEC_WIDTH;
+            const int32_t num_vecs = (D + kGroupVecWidth - 1) / kGroupVecWidth;
+
+            if constexpr (kUseVecBlocking) {
+                compute_grad_sum_unweighted<
+                grad_t,
+                cache_t,
+                kFixedMaxVecsPerThread,
+                kThreadGroupSize,
+                VEC_WIDTH,
+                kUseVecBlocking>(
+                    grad_sum,
+                    smem_grad_sum,
+                    grad_output,
+                    D_offsets,
+                    D,
+                    T,
+                    sorted_infos,
+                    info_B_num_bits,
+                    info_B_mask,
+                    segment_start,
+                    sl_start,
+                    sl_end,
+                    shfl_sync_mask,
+                    num_vecs
+                );
+            } else {
+                #pragma unroll kFixedMaxVecsPerThread
+                for (int32_t vec = 0; vec < kFixedMaxVecsPerThread; vec++) {
+                    grad_sum[vec].acc.x = 0;
+                    grad_sum[vec].acc.y = 0;
+                    grad_sum[vec].acc.z = 0;
+                    grad_sum[vec].acc.w = 0;
+                }
+
+                for (int32_t sl = sl_start; sl < sl_end; sl += kThreadGroupSize) {
+                    const auto len = min(kThreadGroupSize, sl_end - sl);
+                    const auto b_t_prefetch = (sl + kThreadGroupSize + threadIdx.x) < sl_end
+                        ? reinterpret_cast<const uint32_t*>(
+                            &sorted_infos[0])[segment_start + sl + kThreadGroupSize + threadIdx.x]
+                        : 0;
+                    const auto b_prefetch = b_t_prefetch & info_B_mask;
+                    const auto t_prefetch = b_t_prefetch >> info_B_num_bits; // if vbe
+                    int32_t j = 0;
+                    for (; j + 3 < len; j+=4) {
+                        int32_t b_j_0 = SUBWARP_SHFL_SYNC(b, j);
+                        int32_t b_j_1 = SUBWARP_SHFL_SYNC(b, j + 1);
+                        int32_t b_j_2 = SUBWARP_SHFL_SYNC(b, j + 2);
+                        int32_t b_j_3 = SUBWARP_SHFL_SYNC(b, j + 3);
+
+                        int32_t D_start_j_0 = SUBWARP_SHFL_SYNC(D_start, j);
+                        int32_t D_start_j_1 = SUBWARP_SHFL_SYNC(D_start, j + 1);
+                        int32_t D_start_j_2 = SUBWARP_SHFL_SYNC(D_start, j + 2);
+                        int32_t D_start_j_3 = SUBWARP_SHFL_SYNC(D_start, j + 3);
+
+                        #pragma unroll kFixedMaxVecsPerThread
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                            const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                            Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                            Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                            Vec4TAcc<grad_t> grad_out_vec_2(&grad_output[b_j_2][0] + D_start_j_2 + d);  // if nobag
+                            Vec4TAcc<grad_t> grad_out_vec_3(&grad_output[b_j_3][0] + D_start_j_3 + d);  // if nobag
+                            grad_sum[vec].add_(grad_out_vec_0);
+                            grad_sum[vec].add_(grad_out_vec_1);
+                            grad_sum[vec].add_(grad_out_vec_2);
+                            grad_sum[vec].add_(grad_out_vec_3);
+                        }
+                    }
+                    int32_t D_start_prefetch = ((sl + kThreadGroupSize + threadIdx.x) < sl_end) ? D_offsets[t_prefetch] : 0; // if vbe // if not nobag
+                    for (; j + 1 < len; j+=2) {
+                        int32_t b_j_0 = SUBWARP_SHFL_SYNC(b, j);
+                        int32_t b_j_1 = SUBWARP_SHFL_SYNC(b, j + 1);
+
+                        int32_t D_start_j_0 = SUBWARP_SHFL_SYNC(D_start, j);
+                        int32_t D_start_j_1 = SUBWARP_SHFL_SYNC(D_start, j + 1);
+
+                        #pragma unroll kFixedMaxVecsPerThread
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                            const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                            Vec4TAcc<grad_t> grad_out_vec_0(&grad_output[b_j_0][0] + D_start_j_0 + d);  // if nobag
+                            Vec4TAcc<grad_t> grad_out_vec_1(&grad_output[b_j_1][0] + D_start_j_1 + d);  // if nobag
+                            grad_sum[vec].add_(grad_out_vec_0);
+                            grad_sum[vec].add_(grad_out_vec_1);
+                        }
+                    }
+                    for (; j < len; ++j) {
+                        int32_t b_j = SUBWARP_SHFL_SYNC(b, j);
+                        int32_t D_start_j = SUBWARP_SHFL_SYNC(D_start, j);
+
+                        #pragma unroll kFixedMaxVecsPerThread
+                        for (int32_t vec = 0; vec < kFixedMaxVecsPerThread && ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH) < D; ++vec) {
+                            const int32_t d = ((vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH);
+                            Vec4TAcc<grad_t> grad_out_vec(
+                                &grad_output[b_j][0] + D_start_j + d // if nobag
+                            );
+                            grad_sum[vec].add_(grad_out_vec);
+                        }
+                    }
+                    D_start = D_start_prefetch;
+                    b = b_prefetch;
+                }
+
+                if (smem_grad_sum) {
+                    // Store grad_sum in smem_grad_sum
+                    #pragma unroll kFixedMaxVecsPerThread
+                    for (int32_t vec = 0;
+                        (vec < kFixedMaxVecsPerThread) && (vec * kThreadGroupSize + threadIdx.x) * VEC_WIDTH < D;
+                        ++vec) {
+                        const int32_t d_vec = (vec * kThreadGroupSize + threadIdx.x);
+                        smem_grad_sum[d_vec] = grad_sum[vec];
+                        }
+                }
+            }
+
+            // Copy value to max_vecs to make max_vecs_per_thread known at compile time
+            // when kUseVecBlocking == false
+            const int32_t max_vecs =
+                kUseVecBlocking ? max_vecs_per_thread : kFixedMaxVecsPerThread;
+            const int64_t momentum1_offset = SUBWARP_SHFL_SYNC(s_momentum1_offset, i);
+            const int64_t weights_offset = SUBWARP_SHFL_SYNC(s_weights_offset, i);
+
+            const auto weights_placement = static_cast<PlacementType>(SUBWARP_SHFL_SYNC(s_weights_placement, i));
+            const auto momentum1_placement = static_cast<PlacementType>(SUBWARP_SHFL_SYNC(s_momentum1_placement, i));
+            split_rowwise_adagrad_table_update_kernel_device<
+              emb_t,
+              cache_t,
+              kFixedMaxVecsPerThread,
+              kThreadGroupSize,
+              VEC_WIDTH,
+              kUseVecBlocking>(
+                  dev_weights,
+                  uvm_weights,
+                  lxu_cache_weights,
+                //   weights_placements,
+                //   weights_offsets,
+                  weights_placement,
+                  weights_offset,
+                  sorted_lxu_cache_locations,
+                  grad_sum,
+                  smem_grad_sum,
+                  smem_grad_sum, // shared_weight_update_row (reuse smem_grad_sum)
+                  stochastic_rounding,
+                  stochastic_rounding_philox_args,
+                  run_id,
+                  use_uniq_cache_locations
+                      ? (run_id - table_unique_indice_offset)
+                      : segment_start,
+                  D,
+                  t_0,
+                  idx,
+                  1, // global_weight_decay
+                  shfl_sync_mask,
+                  max_vecs,
+                  momentum1, momentum1_val, learning_rate, eps, weight_decay, weight_decay_mode, max_norm
+            ); // if not dense and optimizer != "none"
+        }
+    }
+
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Explicit Template Instantiations
+////////////////////////////////////////////////////////////////////////////////
+
+/*
+    Explicitly instantiate the kernel function template.  The instantiations are
+    based on the types enumerated by DISPATCH_EMB_GRAD_CACHE_TYPES macro used in
+    embedding_backward_split_template.cu
+*/
+
+{%- macro template_instantiation(
+      emb_type,
+      grad_type,
+      cache_type,
+      index_type,
+      ph_type_combo,
+      kFixedMaxVecsPerThread,
+      kThreadGroupSize,
+      kUseVecBlocking
+    )
+%}
+
+{%- set gwddesc = "_gwd" if is_gwd_kernel else "" %}
+{%- if grad_type == 'at::Half' and emb_type == 'at::Half' and cache_type == 'float' and index_type == 'int64_t' and kFixedMaxVecsPerThread == 2 and kThreadGroupSize == 64 and kUseVecBlocking == 'false' %}
+template __global__ __launch_bounds__(kBackwardMaxThreads, 8) void
+{%- else %}
+template __global__ __launch_bounds__(kBackwardMaxThreads) void
+{%- endif %}
+{%- if is_index_select %}
+batch_index_select_dim0_codegen_backward_kernel_warp_per_row
+{%- else %}
+{{ mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ desc_suffix }}_kernel_warp_per_row_1_aiter_v2
+{%- endif %}
+< {{ emb_type }},
+  {{ grad_type }},
+  {{ cache_type }},
+  {{ index_type }},
+  {%- for ph_name in args.placeholder_tensor_names %}
+  {{ ph_type_combo[ph_name].primitive_type }},
+  {%- endfor %}
+  {{ kFixedMaxVecsPerThread }},
+  {{ kThreadGroupSize }},
+  {{ kUseVecBlocking }}
+> (
+    const pta::PackedTensorAccessor64<{{ grad_type }}, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> grad_output,
+    {%- if optimizer != "none" %}
+    pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<{{ cache_type }}, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
+    const pta::PackedTensorAccessor32<{{ index_type }}, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
+    {%- if not nobag %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- else %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits> sorted_{{ locs_or_addrs_tensor }},
+    const bool use_uniq_cache_locations,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    {%- endif %}
+    {%- if weighted %}
+    const pta::PackedTensorAccessor32<at::acc_type<{{ cache_type }}, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_num_runs,
+    int32_t max_segment_length_per_warp,
+    {%- if not dense and optimizer != "none" %}
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args,
+    {%- else %}
+    pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> grad_dev_weights,
+    {%- endif %} // if not dense and optimizer != "none"
+    {%- if not nobag and vbe %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> B_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> row_output_offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- endif %}
+    const int32_t max_D,
+    const int32_t max_vecs_per_thread,
+    {%- if is_gwd_kernel %}
+    {%- if "prev_iter_dev" not in args.split_function_arg_names %}
+    const pta::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits> prev_iter_dev,
+    {%- endif %}
+    {%- if "iter" not in args.split_function_arg_names %}
+    const int64_t iter,
+    {%- endif %}
+    const float gwd_lower_bound,
+    {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const bool permute_output_dim_0_1
+    {%- else %}
+    {{ args.split_kernel_args_no_defaults |
+         replace_pta_namespace() |
+         replace_placeholder_types(ph_type_combo) |
+         join(",\n    ") |
+         replace("cache_t", cache_type)
+    }}
+    {%- endif %}
+);
+{%- endmacro %}
+
+{%- macro bulk_template_instantiations(kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking) %}
+    {%- for grad_type in ['float', 'at::Half', 'at::BFloat16'] %}
+    {%- for emb_type in (['float', 'at::Half'] + (['at::Float8_e4m3fnuz'] if is_rocm else ['at::Float8_e4m3fn'])) %}
+    {%- for cache_type in ['float', 'at::Half'] %}
+    {%- for index_type in ['int32_t', 'int64_t'] %}
+    {%- for ph_type_combo in args.placeholder_type_combos %}
+        {{ template_instantiation(
+            emb_type,
+            grad_type,
+            cache_type,
+            index_type,
+            ph_type_combo,
+            kFixedMaxVecsPerThread,
+            kThreadGroupSize,
+            kUseVecBlocking
+          )
+        }}
+    {%- endfor %}
+    {%- endfor %}
+    {%- endfor %}
+    {%- endfor %}
+    {%- endfor %}
+{%- endmacro %}
+
+
+{%- if is_experimental_optimizer %}
+
+{{
+  bulk_template_instantiations(
+    fixed_max_vecs_per_thread["backward"],
+    'kWarpSize',
+    'true'
+  )
+}}
+
+{%- else %}
+
+{%- macro instantiate_templates(use_subwarp_shuffle) %}
+{%- for (kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking)
+    in get_max_vecs_template_configs(
+        items_per_warp,
+        fixed_max_vecs_per_thread["backward"],
+        use_subwarp_shuffle,
+        use_vec_blocking=True,
+    )
+%}
+    {{
+      bulk_template_instantiations(
+        kFixedMaxVecsPerThread,
+        kThreadGroupSize,
+        kUseVecBlocking,
+      )
+    }}
+{%- endfor %}
+{%- endmacro %}
+
+
+////////////////////////////////////////////////////////////////////////////////
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+////////////////////////////////////////////////////////////////////////////////
+
+{#- /*
+    Explicitly instantiate kernels for the FBGEMM_USE_SUBWARP_SHUFFLE case
+
+    Please see get_max_vecs_template_configs in
+    codegen/embedding_common_code_generator.py for more details
+*/ #}
+
+{{ instantiate_templates(use_subwarp_shuffle=True) }}
+
+////////////////////////////////////////////////////////////////////////////////
+#else
+////////////////////////////////////////////////////////////////////////////////
+
+{#- /*
+    Explicitly instantiate kernels for the non-FBGEMM_USE_SUBWARP_SHUFFLE case
+
+    Please see get_max_vecs_template_configs in
+    codegen/embedding_common_code_generator.py for more details
+*/ #}
+
+{{ instantiate_templates(use_subwarp_shuffle=False) }}
+
+////////////////////////////////////////////////////////////////////////////////
+#endif
+////////////////////////////////////////////////////////////////////////////////
+
+{%- endif %}
+
+{%- endif %}
         // clang-format on
