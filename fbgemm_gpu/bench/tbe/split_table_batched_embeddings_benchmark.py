@@ -1367,19 +1367,19 @@ def device_with_spec(  # noqa C901
 @click.option(
     "--batch-size-list",
     type=str,
-    required=True,
+    required=False,
     help="A comma separated list of batch sizes (B) for each table.",
 )
 @click.option(
     "--embedding-dim-list",
     type=str,
-    required=True,
+    required=False,
     help="A comma separated list of embedding dimensions (D) for each table.",
 )
 @click.option(
     "--bag-size-list",
     type=str,
-    required=True,
+    required=False,
     help="A comma separated list of bag sizes (L) for each table.",
 )
 @click.option(
@@ -1392,7 +1392,7 @@ def device_with_spec(  # noqa C901
 @click.option(
     "--num-embeddings-list",
     type=str,
-    required=True,
+    required=False,
     help="A comma separated list of number of embeddings (E) for each table.",
 )
 @click.option(
@@ -1405,7 +1405,7 @@ def device_with_spec(  # noqa C901
 @click.option(
     "--num-tables",
     type=int,
-    required=True,
+    required=False,
     help="The number of tables.",
 )
 @click.option(
@@ -1414,16 +1414,12 @@ def device_with_spec(  # noqa C901
     default=False,
     help="Whether the table is weighted or not",
 )
-@click.option(
-    "--print-kernel-summary",
-    is_flag=True,
-    default=False,
-    help="Whether the table is weighted or not",
-)
-@click.option("--ssd", is_flag=True, default=False)
-@click.option(
-    "--ssd-prefix", type=str, default="/tmp/ssd_benchmark", help="SSD directory prefix"
-)
+@click.option("--save", type=str, default=None)
+@click.option("--load", type=str, default=None)
+@click.option("--random-weights", is_flag=True, default=False)
+@click.option("--compressed", is_flag=True, default=False)
+@click.option("--slice-min", type=int, default=None)
+@click.option("--slice-max", type=int, default=None)
 @TBEBenchmarkingConfigLoader.options
 @EmbeddingOpsCommonConfigLoader.options
 @click.pass_context
@@ -1437,9 +1433,12 @@ def vbe(
     alpha_list: str,
     num_tables: int,
     weighted: bool,
-    print_kernel_summary: bool,
-    ssd: bool,
-    ssd_prefix: str,
+    save: str,
+    load: str,
+    random_weights: bool,
+    compressed: bool,
+    slice_min: int,
+    slice_max: int,
     # pyre-ignore[2]
     **kwargs,
 ) -> None:
@@ -1451,6 +1450,28 @@ def vbe(
     np.random.seed(42)
     torch.manual_seed(42)
 
+    if save:
+        os.makedirs(f"{save}", exist_ok=True)
+        with open(f"{save}/params.yaml", "w") as f:
+            yaml.dump(context.params, f, sort_keys=False)
+
+    if load:
+        with open(f"{load}/params.yaml", "r") as f:
+            context.params = yaml.load(f, Loader=yaml.UnsafeLoader)
+            params = context.params
+            batch_size_list = params["batch_size_list"]
+            embedding_dim_list = params["embedding_dim_list"]
+            bag_size_list = params["bag_size_list"]
+            bag_size_sigma_list = params["bag_size_sigma_list"]
+            num_embeddings_list = params["num_embeddings_list"]
+            alpha_list = params["alpha_list"]
+            num_tables = params["num_tables"]
+            weighted = params["weighted"]
+            random_weights = params["random_weights"]
+            compressed = params["compressed"]
+            slice_min = params["slice_min"]
+            slice_max = params["slice_max"]
+    
     # Load general TBE benchmarking configuration from cli arguments
     benchconfig = TBEBenchmarkingConfigLoader.load(context)
     if benchconfig.num_requests != benchconfig.iterations:
@@ -1458,6 +1479,9 @@ def vbe(
 
     if benchconfig.flush_gpu_cache_size_mb != 0:
         raise ValueError("--bench-flush-gpu-cache-size is not supported.")
+
+    if benchconfig.export_trace:
+        raise ValueError("--bench-export-trace is not supported.")
 
     # Load common embedding op configuration from cli arguments
     embconfig = EmbeddingOpsCommonConfigLoader.load(context)
@@ -1495,126 +1519,122 @@ def vbe(
         else EmbeddingLocation.HOST
     )
 
-    common_split_args: dict[str, Any] = {
-        "weights_precision": embconfig.weights_dtype,
-        "stochastic_rounding": embconfig.stochastic_rounding,
-        "output_dtype": embconfig.output_dtype,
-        "pooling_mode": embconfig.pooling_mode,
-        "bounds_check_mode": embconfig.bounds_check_mode,
-        "optimizer": optimizer,
-        "learning_rate": 0.1,
-        "eps": 0.1,
-        "feature_table_map": list(range(T)),
-    }
+    emb = SplitTableBatchedEmbeddingBagsCodegen(
+        [
+            (
+                E,
+                D,
+                managed_option,
+                get_available_compute_device(),
+            )
+            for E, D in zip(Es, Ds)
+        ],
+        optimizer=optimizer,
+        learning_rate=0.1,
+        eps=0.1,
+        cache_precision=embconfig.cache_dtype,
+        weights_precision=embconfig.weights_dtype,
+        stochastic_rounding=embconfig.stochastic_rounding,
+        output_dtype=embconfig.output_dtype,
+        pooling_mode=embconfig.pooling_mode,
+        bounds_check_mode=embconfig.bounds_check_mode,
+    ).to(get_device())
 
-    if ssd:
-        cache_set = max(T * max(Bs), 1)
-        tempdir = tempfile.mkdtemp(prefix=ssd_prefix)
-        emb = SSDTableBatchedEmbeddingBags(
-            [(E, D) for E, D in zip(Es, Ds)],
-            cache_sets=cache_set,
-            ssd_storage_directory=tempdir,
-            ssd_cache_location=EmbeddingLocation.DEVICE,
-            ssd_rocksdb_shards=8,
-            **common_split_args,
-        )
+    if random_weights:
+        emb.init_embedding_weights_uniform(-1.0, 1.0)
+
+    if save:
+        if compressed:
+            with gzip.open(f"{save}/model_state.pth.gz", "wb") as f:
+                torch.save(emb.state_dict(), f)
+        else:
+            torch.save(emb.state_dict(), f"{save}/model_state.pth")
+
+    if load:
+        if compressed:
+            with gzip.open(f"{load}/model_state.pth.gz", "rb") as f:
+                emb.load_state_dict(torch.load(f))
+        else:
+            emb.load_state_dict(torch.load(f"{load}/model_state.pth"))
+
+    if load:
+        requests = []
+        for i in range(benchconfig.iterations):
+            indices = torch.load(f"{load}/{i}_indices.pt")
+            offsets = torch.load(f"{load}/{i}_offsets.pt")
+            per_sample_weights = torch.load(f"{load}/{i}_per_sample_weights.pt")
+            requests.append((indices, offsets, per_sample_weights))
     else:
-        emb = SplitTableBatchedEmbeddingBagsCodegen(
-            [
-                (
-                    E,
-                    D,
-                    managed_option,
-                    get_available_compute_device(),
-                )
-                for E, D in zip(Es, Ds)
-            ],
-            cache_precision=embconfig.cache_dtype,
-            **common_split_args,
-        )
-    emb = emb.to(get_device())
-    all_requests = {
-        "indices": [[] for _ in range(benchconfig.iterations)],
-        "offsets": [[] for _ in range(benchconfig.iterations)],
-        "weights": [[] for _ in range(benchconfig.iterations)],
-    }
-    for t, (E, B, L, sigma_L, alpha) in enumerate(zip(Es, Bs, Ls, sigma_Ls, alphas)):
-        # Generate a request for a single table.
-        local_requests = generate_requests(
-            benchconfig.iterations,
-            B,
-            1,
-            L,
-            E,
-            alpha=alpha,
-            weighted=weighted,
-            sigma_L=sigma_L,
-            zipf_oversample_ratio=3 if L > 5 else 5,
-            use_cpu=get_available_compute_device() == ComputeDevice.CPU,
-            index_dtype=torch.long,
-            offset_dtype=torch.long,
-        )
+        all_requests = {
+            "indices": [[] for _ in range(benchconfig.iterations)],
+            "offsets": [[] for _ in range(benchconfig.iterations)],
+            "weights": [[] for _ in range(benchconfig.iterations)],
+        }
+        for t, (E, B, L, sigma_L, alpha) in enumerate(zip(Es, Bs, Ls, sigma_Ls, alphas)):
+            # Generate a request for a single table.
+            local_requests = generate_requests(
+                benchconfig.iterations,
+                B,
+                1,
+                L,
+                E,
+                alpha=alpha,
+                weighted=weighted,
+                sigma_L=sigma_L,
+                zipf_oversample_ratio=3 if L > 5 else 5,
+                use_cpu=get_available_compute_device() == ComputeDevice.CPU,
+                index_dtype=torch.long,
+                offset_dtype=torch.long,
+            )
 
-        # Store requests for each table in all_requests.
-        for i, req in enumerate(local_requests):
-            indices, offsets, weights = req.unpack_3()
-            all_requests["indices"][i].append(indices)
-            if t > 0:
-                offsets = offsets[1:]  # remove the first element
-                offsets += all_requests["offsets"][i][t - 1][-1]
-            all_requests["offsets"][i].append(offsets)
-            all_requests["weights"][i].append(weights)
+            # Store requests for each table in all_requests.
+            for i, req in enumerate(local_requests):
+                indices, offsets, weights = req.unpack_3()
+                all_requests["indices"][i].append(indices)
+                if t > 0:
+                    offsets = offsets[1:]  # remove the first element
+                    offsets += all_requests["offsets"][i][t - 1][-1]
+                all_requests["offsets"][i].append(offsets)
+                all_requests["weights"][i].append(weights)
 
-    # pyre-ignore[53]
-    def _kineto_trace_handler(
-        p: profile, emb_op_type: str = "vbe", print_summary: bool = False
-    ) -> None:
-        p.export_chrome_trace(
-            benchconfig.trace_url.format(emb_op_type=emb_op_type, ospid=os.getpid())
-        )
-        if print_summary:
-            print(p.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        # Combine the requests for all tables by
+        requests = [
+            (
+                torch.concat(all_requests["indices"][i]),
+                torch.concat(all_requests["offsets"][i]),
+                torch.concat(all_requests["weights"][i]) if weighted else None,
+            )
+            for i in range(benchconfig.iterations)
+        ]
+        
+        del all_requests
 
-    emb_op_type = "vbe"
+    if save:
+        for i, (indices, offsets, weights) in enumerate(requests):        
+            torch.save(indices, f"{save}/{i}_indices.pt")
+            torch.save(offsets, f"{save}/{i}_offsets.pt")
+            torch.save(weights, f"{save}/{i}_per_sample_weights.pt")
 
-    # pyre-ignore[3, 53]
-    def context_factory(on_trace_ready: Callable[[profile], None]):
-        return (
-            profile(on_trace_ready=on_trace_ready)
-            if benchconfig.export_trace
-            else nullcontext()
-        )
-
-    # Combine the requests for all tables by
-    requests = [
-        (
-            torch.concat(all_requests["indices"][i]),
-            torch.concat(all_requests["offsets"][i]),
-            torch.concat(all_requests["weights"][i]) if weighted else None,
-        )
-        for i in range(benchconfig.iterations)
-    ]
-
-    del all_requests
-
-    with context_factory(
-        lambda p: _kineto_trace_handler(p, emb_op_type, print_kernel_summary)
-    ):
-        fwd_time_sec, bwd_time_sec = benchmark_vbe(
-            requests,
-            func=lambda indices, offsets, per_sample_weights: emb.forward(
-                indices,
-                offsets,
-                per_sample_weights,
-                batch_size_per_feature_per_rank=[[B] for B in Bs],
-            ),
-            num_warmups=benchconfig.warmup_iterations,
-        )
+    fwd_time_sec, bwd_time_sec = benchmark_vbe(
+        requests,
+        func=lambda indices, offsets, per_sample_weights: emb.forward(
+            indices,
+            offsets,
+            per_sample_weights,
+            batch_size_per_feature_per_rank=[[B] for B in Bs],
+        ),
+        num_warmups=benchconfig.warmup_iterations,
+        emb=emb,
+        save=save,
+        load=load,
+        compressed=compressed,
+        slice_min=slice_min,
+        slice_max=slice_max,
+    )
     logging.info(
         f"T: {T}, Bs: {Bs}, Ds: {Ds}, Ls: {Ls}, Es: {Es}\n"
         f"fwd: {fwd_time_sec * 1.0e6:.0f}us, bwd: {bwd_time_sec * 1.0e6:.0f}us"
     )
-
 
 if __name__ == "__main__":
     cli()
