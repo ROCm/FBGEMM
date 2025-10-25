@@ -1652,7 +1652,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
     codegen/embedding_common_code_generator.py for more details
 */ #}
 
-{{ instantiate_templates(use_subwarp_shuffle=False) }}
+{{ instantiate_templates(use_subwarp_shuffle=True) }}
 
 ////////////////////////////////////////////////////////////////////////////////
 #endif

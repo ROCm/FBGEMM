@@ -236,6 +236,98 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     {%- endif %}
 );
 
+
+{%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+
+{%- set gwddesc = "_gwd" if is_gwd_kernel else "" %}
+template <
+    typename emb_t,
+    typename grad_t,
+    typename cache_t,
+    typename index_t,
+    {%- for ph_name in args.placeholder_tensor_names %}
+    typename {{ ph_name + "_ph_t"}},
+    {%- endfor %}
+    int32_t kFixedMaxVecsPerThread,
+    int32_t kThreadGroupSize,
+    bool kUseVecBlocking>
+__global__ __launch_bounds__(kBackwardMaxThreads) void
+{%- if is_index_select %}
+batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
+{%- else %}
+{{ mdesc }}_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ desc_suffix }}_kernel_warp_per_row_1_aiter_v2(
+{%- endif %}
+    const pta::PackedTensorAccessor64<grad_t, {{ "1" if is_index_select else "2" }}, at::RestrictPtrTraits> grad_output,
+    {%- if optimizer != "none" %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    {%- if not dense %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    {%- endif %}
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    {%- if not nobag or is_index_select %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> D_offsets,
+    {%- else %}
+    int64_t D,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> hash_size_cumsum,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> sorted_linear_indices_run,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_cumulative_run_lengths,
+    {%- if not nobag %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- else %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> sorted_infos,
+    {%- endif %}
+    {%- if not dense %}
+    const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits> sorted_{{ locs_or_addrs_tensor }},
+    const bool use_uniq_cache_locations,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    {%- endif %}
+    {%- if weighted %}
+    const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
+    {%- endif %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_linear_indices_num_runs,
+    int32_t max_segment_length_per_warp,
+    {%- if not dense and optimizer != "none" %}
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args,
+    {%- else %}
+    pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> grad_dev_weights,
+    {%- endif %} // if not dense and optimizer != "none"
+    {%- if not nobag and vbe %}
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> B_offsets,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> row_output_offsets,
+    {%- endif %}
+    {%- if not nobag %}
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    {%- endif %}
+    const int32_t max_D,
+    const int32_t max_vecs_per_thread,
+    {%- if is_gwd_kernel %}
+    {%- if "prev_iter_dev" not in args.split_function_arg_names %}
+    pta::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits> prev_iter_dev,
+    {%- endif %}
+    {%- if "iter" not in args.split_function_arg_names %}
+    const int64_t iter,
+    {%- endif %}
+    const float gwd_lower_bound,
+    {%- endif %}
+    {%- if ssd %}
+    const bool enable_optimizer_offloading,
+    {%- endif %}
+    {%- if is_index_select %}
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
+    const bool permute_output_dim_0_1
+    {%- else %}
+    {{ args.split_kernel_args | replace_pta_namespace() | join(",\n    ") }}
+    {%- endif %}
+);
+{%- endif %}
+
+
 {%- if is_optimized_hip_kernel_supported_mode %}
 #include "fbgemm_gpu/rocm/split_embeddings_common.h"
 template <
@@ -1194,6 +1286,21 @@ Tensor {{ embedding_cuda_op }}(
                              kThreadGroupSize,
                              kUseVecBlocking>;
 
+
+                    {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+                    if (max_D <= 128) {
+                        backward_warp_per_row_kernel = split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_warp_per_row_1_aiter_v2
+                            <emb_t,
+                             grad_t,
+                             cache_t,
+                             index_t,
+                             1,
+                             32,
+                             false>;
+                    }
+                    {%- endif %}
+
+
                     // Compute shared memory size for warp_per_row
                     #ifdef USE_ROCM
                         int32_t num_warp_per_row_groups;
@@ -1223,6 +1330,11 @@ Tensor {{ embedding_cuda_op }}(
                     }
 
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    {%- if not is_index_select and optimizer == "rowwise_adagrad" and not dense and not nobag and not weighted and not vbe and not is_gwd_kernel and not ssd %}
+                    if (max_D <= 128) {
+                        blockSize = dim3(32, num_warp_per_row_groups);
+                    }
+                    {%- endif %}
 
                     int32_t warp_per_row_grid_size = std::min(
                         div_round_up(total_unique_indices, num_warp_per_row_groups),
