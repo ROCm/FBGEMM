@@ -1166,10 +1166,10 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
 {%- endmacro %}
 
 {%- macro hip_bulk_template_instantiations(kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking) %}
-    {%- for grad_type in ['float', 'at::Half'] %}
-    {%- for emb_type in (['float', 'at::Half'] + (['at::Float8_e4m3fnuz'] if is_rocm else ['at::Float8_e4m3fn'])) %}
-    {%- for cache_type in ['float', 'at::Half'] %}
-    {%- for index_type in ['int32_t', 'int64_t'] %}
+    {%- for grad_type in ['float', 'at::Half', 'at::BFloat16'] %}
+    {%- for emb_type in (['float', 'at::Half', 'at::BFloat16'] + (['at::Float8_e4m3fnuz'] if is_rocm else ['at::Float8_e4m3fn'])) %}
+    {%- for cache_type in ['float', 'at::Half', 'at::BFloat16'] %}
+    {%- for index_type in ['int32_t', 'int64_t', 'at::BFloat16'] %}
     {%- for kEmbeddingDim in [64, 128, 160, 192, 256] %}
     {%- for kWeighDecayMode in [0, 1, 2] %}
         {{ hip_template_instantiation(
