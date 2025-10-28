@@ -471,13 +471,11 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
         int64_t s_weights_offset = is_valid? weights_offsets[s_t_0] : 0;
         int32_t s_weights_placement = is_valid? weights_placements[s_t_0] : 0;
 
-        {#
         {%- for tensor in args.split_tensors %}
         {{ args.split_tensor_types[tensor] }}* __restrict__ {{ tensor }};
-        const auto s_{{ tensor }}_placement = static_cast<PlacementType>({{ tensor }}_placements[t]);
-        const int64_t s_{{ tensor }}_offset = {{ tensor }}_offsets[t];
+        const auto s_{{ tensor }}_placement = {{ tensor }}_placements[s_t_0];
+        const int64_t s_{{ tensor }}_offset = {{ tensor }}_offsets[s_t_0];
         {%- endfor %}
-        #}
 
         // at::acc_type<cache_t, true>* __restrict__ s_momentum1;
         // if (static_cast<PlacementType>(s_momentum1_placement) == PlacementType::DEVICE) {
@@ -503,13 +501,10 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
             {%- endif %}
             int32_t table_unique_indice_offset = SUBWARP_SHFL_SYNC(s_table_unique_indice_offset, i);
 
-            {#
             {%- for tensor in args.split_tensors %}
-            {{ args.split_tensor_types[tensor] }}* __restrict__ {{ tensor }};
-            const auto s_{{ tensor }}_placement = static_cast<PlacementType>({{ tensor }}_placements[t]);
-            const int64_t s_{{ tensor }}_offset = {{ tensor }}_offsets[t];
+            const auto {{ tensor }}_placement = SUBWARP_SHFL_SYNC(s_{{ tensor }}_placement, i);
+            const int64_t {{ tensor }}_offset = SUBWARP_SHFL_SYNC(s_{{ tensor }}_offset, i);
             {%- endfor %}
-            #}
 
             // const int64_t momentum1_offset = SHFL_SYNC(s_momentum1_offset, i);
             // const auto momentum1_placement = static_cast<PlacementType>(SHFL_SYNC(s_momentum1_placement, i));
@@ -582,8 +577,8 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
                   dev_weights,
                   uvm_weights,
                   lxu_cache_weights,
-                  weights_placements,
-                  weights_offsets,
+                  weights_placement,
+                  weights_offset,
                   sorted_{{ locs_or_addrs_tensor }},
                   grad_sum,
                   smem_grad_sum,
@@ -608,6 +603,10 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
                   {%- if ssd %}
                   enable_optimizer_offloading,
                   {%- endif %}
+                  {%- for tensor in args.split_tensors %}
+                  {{ tensor }}_placement,
+                  {{ tensor }}_offset,
+                  {%- endfor %}
                   {{ args.split_kernel_arg_names | join(", ") }}
             );
             {%- else %}
