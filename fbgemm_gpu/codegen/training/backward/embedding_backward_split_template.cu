@@ -1212,7 +1212,7 @@ Tensor {{ embedding_cuda_op }}(
                              kUseVecBlocking>;
                     
                     {%- if is_optimized_hip_kernel_supported_mode %}
-                    if (use_hip_kernel && mixed_D) {
+                    if (false) {
                         backward_cta_per_row_kernel =
                         {{ hip_mixed_d_cta_kernel }}
                             <emb_t,
@@ -1350,7 +1350,8 @@ Tensor {{ embedding_cuda_op }}(
                              kUseVecBlocking>;
 
                     {%- if is_optimized_hip_kernel_supported_mode %}
-                    if (use_hip_kernel && mixed_D) {
+                    if (true) {
+                        printf("%s:%d call here\n", __FILE__, __LINE__);
                         backward_warp_per_row_kernel =
                         {{ hip_mixed_d_warp_kernel }}
                             <emb_t,
@@ -1360,9 +1361,9 @@ Tensor {{ embedding_cuda_op }}(
                              {%- for ph_name in args.placeholder_tensor_names %}
                              {{ ph_name + "_ph_t" }},
                              {%- endfor %}
-                             kFixedMaxVecsPerThread,
-                             kThreadGroupSize,
-                             kUseVecBlocking>;
+                             1,
+                             32,
+                             false>;
                     }
                     {%- endif %}
 
@@ -1383,7 +1384,8 @@ Tensor {{ embedding_cuda_op }}(
                           used_shared_bytes);
                     }
 
-                    auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    // auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    auto blockSize = dim3(32, num_warp_per_row_groups);
 
                     int32_t warp_per_row_grid_size = std::min(
                         div_round_up(total_unique_indices, num_warp_per_row_groups),
@@ -1426,6 +1428,7 @@ Tensor {{ embedding_cuda_op }}(
                     }
                     {%- endif %}
 #endif
+
 
                     FBGEMM_LAUNCH_KERNEL(
                         backward_warp_per_row_kernel,
