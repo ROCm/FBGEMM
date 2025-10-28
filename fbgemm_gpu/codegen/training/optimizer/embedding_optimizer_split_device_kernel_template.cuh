@@ -239,6 +239,10 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {%- if ssd %}
     const bool enable_optimizer_offloading,
     {%- endif %}
+    {%- for tensor in args.split_tensors %}
+    const int32_t {{ tensor }}_placement,
+    const int64_t {{ tensor }}_offset,
+    {%- endfor %}
     {{ args.split_ref_kernel_args | replace_pta_namespace() | join(",\n    ") }}
 ) {
     constexpr auto kIsInt8 = std::is_same_v<emb_t, uint8_t>;
@@ -270,9 +274,9 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     }
     {%- for tensor in args.split_tensors %}
     {{ args.split_tensor_types[tensor] }}* __restrict__ {{ tensor }};
-    const auto {{ tensor }}_placement = static_cast<PlacementType>({{ tensor }}_placements[t]);
-    const int64_t {{ tensor }}_offset = {{ tensor }}_offsets[t];
-    if ({{ tensor }}_placement == PlacementType::DEVICE) {
+    // const auto {{ tensor }}_placement = static_cast<PlacementType>({{ tensor }}_placements[t]);
+    // const int64_t {{ tensor }}_offset = {{ tensor }}_offsets[t];
+    if (static_cast<PlacementType>({{ tensor }}_placement) == PlacementType::DEVICE) {
         {{ tensor }} = &{{ tensor }}_dev[{{ tensor }}_offset];
     } else {
         {{ tensor }} = &{{ tensor }}_uvm[{{ tensor }}_offset];

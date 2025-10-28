@@ -1391,6 +1391,7 @@ Tensor {{ embedding_cuda_op }}(
                         div_round_up(total_unique_indices, num_warp_per_row_groups),
                         get_max_thread_blocks_());
 
+{#
 #ifdef USE_ROCM
                     {%- if is_rocm and not is_index_select and optimizer == "rowwise_adagrad" and
                         not dense and not is_gwd_kernel and not vbe and not ssd and not nobag %}
@@ -1428,8 +1429,7 @@ Tensor {{ embedding_cuda_op }}(
                     }
                     {%- endif %}
 #endif
-
-
+#}
                     FBGEMM_LAUNCH_KERNEL(
                         backward_warp_per_row_kernel,
                         warp_per_row_grid_size,
