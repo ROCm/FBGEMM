@@ -31,7 +31,7 @@ from fbgemm_gpu.tbe.utils import (
     round_up,
     to_device,
 )
-from hypothesis import given, HealthCheck, settings, Verbosity
+from hypothesis import given, HealthCheck, settings, Verbosity, reproduce_failure
 
 from .. import common  # noqa E402
 from ..common import (
@@ -405,6 +405,7 @@ class BackwardSGDTest(unittest.TestCase):
         deadline=None,
         suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.data_too_large],
     )
+    @reproduce_failure('5.35.1', b'AB+/AQAAAAEAAAAAAAAA')
     def test_backward_sgd(  # noqa C901
         self,
         T: int,
