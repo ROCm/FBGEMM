@@ -1138,7 +1138,11 @@ Tensor {{ embedding_cuda_op }}(
                 auto num_long_run_ids = at::zeros({1}, indices.options().dtype(at::kInt));
 
                 const bool use_deterministic_algorithms = at::globalContext().deterministicAlgorithms();
-                const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 1024;
+                {% if is_rocm %}
+                    const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 4096;
+                {% else %}
+                    const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 1024;
+                {%- endif %}
 
                 Tensor long_run_id_to_really_long_run_ids;
                 if (use_deterministic_algorithms) {
@@ -1212,7 +1216,22 @@ Tensor {{ embedding_cuda_op }}(
                              kThreadGroupSize,
                              kUseVecBlocking>;
                     
-                    int32_t num_cta_per_row_groups = kMaxThreads / kWarpSize;
+                    {% if is_rocm %}
+                        int32_t total_L = indices.numel();
+                        int32_t num_cta_per_row_groups;
+                        int32_t work_group_size;
+                        if (total_L/total_B > 1){
+                            num_cta_per_row_groups = (kMaxThreads/4) / kWarpSize;
+                            work_group_size = (kMaxThreads/4);
+                        }
+                        else{
+                            num_cta_per_row_groups = kMaxThreads / kWarpSize;
+                            work_group_size = kMaxThreads;
+                        }
+                    {%- else %}
+                        int32_t num_cta_per_row_groups = kMaxThreads / kWarpSize;
+                        int32_t work_group_size = kMaxThreads;
+                    {%- endif %}
                     {%- if is_optimized_hip_kernel_supported_mode %}
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
                     if (max_D <= 128) {
@@ -1355,7 +1374,17 @@ Tensor {{ embedding_cuda_op }}(
                              kThreadGroupSize,
                              kUseVecBlocking>;
 
-                    int32_t num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
+                    {%- if is_rocm %}
+                        int32_t num_warp_per_row_groups;
+                        if (total_L/total_B > 1){
+                            num_warp_per_row_groups = (kBackwardMaxThreads/2) / kThreadGroupSize;
+                        }
+                        else{
+                            num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
+                        }
+                    {%- else %}
+                        int32_t num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
+                    {%- endif %}
                     {%- if is_optimized_hip_kernel_supported_mode %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
                     if (use_hip_kernel && mixed_D) {
