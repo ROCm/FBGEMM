@@ -33,7 +33,10 @@ class DramKvInferenceTest(unittest.TestCase):
         uniform_init_upper: float = 0.01
 
         kv_embedding_cache = torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper(
-            num_shards, uniform_init_lower, uniform_init_upper
+            num_shards,
+            uniform_init_lower,
+            uniform_init_upper,
+            False,  # disable_random_init
         )
         serialized_result = kv_embedding_cache.serialize()
 
@@ -48,12 +51,15 @@ class DramKvInferenceTest(unittest.TestCase):
         uniform_init_upper: float = 0.01
 
         kv_embedding_cache = torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper(
-            num_shards, uniform_init_lower, uniform_init_upper
+            num_shards,
+            uniform_init_lower,
+            uniform_init_upper,
+            False,  # disable_random_init
         )
         serialized_result = kv_embedding_cache.serialize()
 
         kv_embedding_cache_2 = torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper(
-            0, 0.0, 0.0
+            0, 0.0, 0.0, False  # disable_random_init
         )
         kv_embedding_cache_2.deserialize(serialized_result)
 
@@ -65,7 +71,10 @@ class DramKvInferenceTest(unittest.TestCase):
         uniform_init_upper: float = 0.0
 
         kv_embedding_cache = torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper(
-            num_shards, uniform_init_lower, uniform_init_upper
+            num_shards,
+            uniform_init_lower,
+            uniform_init_upper,
+            False,  # disable_random_init
         )
         kv_embedding_cache.init(
             [(20, 4, SparseType.INT8.as_int())],
@@ -122,7 +131,10 @@ class DramKvInferenceTest(unittest.TestCase):
         uniform_init_upper: float = 0.0
 
         kv_embedding_cache = torch.classes.fbgemm.DramKVEmbeddingInferenceWrapper(
-            num_shards, uniform_init_lower, uniform_init_upper
+            num_shards,
+            uniform_init_lower,
+            uniform_init_upper,
+            False,  # disable_random_init
         )
         kv_embedding_cache.init(
             [(20, 4, SparseType.INT8.as_int())],

@@ -1984,12 +1984,13 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                     # Store info for evicting the previous iteration's
                     # scratch pad after the corresponding backward pass is
                     # done
-                    self.ssd_location_update_data.append(
-                        (
-                            sp_curr_prev_map_gpu,
-                            inserted_rows,
+                    if self.training:
+                        self.ssd_location_update_data.append(
+                            (
+                                sp_curr_prev_map_gpu,
+                                inserted_rows,
+                            )
                         )
-                    )
 
             # Ensure the previous iterations eviction is complete
             current_stream.wait_event(self.ssd_event_sp_evict)
@@ -2088,7 +2089,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                         torch.tensor(
                             [weights.shape[0]], device="cpu", dtype=torch.long
                         ),
-                        weights.cpu().view(torch.float32).view(-1, 2),
+                        weights.cpu(),
                     )
 
             # Generate row addresses (pointing to either L1 or the current
@@ -2173,7 +2174,7 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
 
             # Store scratch pad info for post backward eviction only for training
             # for eval job, no backward pass, so no need to store this info
-            if self.training and not self._embedding_cache_mode:
+            if self.training:
                 self.ssd_scratch_pad_eviction_data.append(
                     (
                         inserted_rows,
@@ -3971,8 +3972,8 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             self.step, stats_reporter.report_interval  # pyre-ignore
         )
 
-        if len(dram_kv_perf_stats) != 23:
-            logging.error("dram cache perf stats should have 23 elements")
+        if len(dram_kv_perf_stats) != 36:
+            logging.error("dram cache perf stats should have 36 elements")
             return
 
         dram_read_duration = dram_kv_perf_stats[0]
@@ -4001,6 +4002,20 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
         dram_kv_allocated_bytes = dram_kv_perf_stats[20]
         dram_kv_actual_used_chunk_bytes = dram_kv_perf_stats[21]
         dram_kv_num_rows = dram_kv_perf_stats[22]
+        dram_kv_read_counts = dram_kv_perf_stats[23]
+        dram_metadata_write_sharding_total_duration = dram_kv_perf_stats[24]
+        dram_metadata_write_total_duration = dram_kv_perf_stats[25]
+        dram_metadata_write_allocate_avg_duration = dram_kv_perf_stats[26]
+        dram_metadata_write_lookup_cache_avg_duration = dram_kv_perf_stats[27]
+        dram_metadata_write_acquire_lock_avg_duration = dram_kv_perf_stats[28]
+        dram_metadata_write_cache_miss_avg_count = dram_kv_perf_stats[29]
+
+        dram_read_metadata_total_duration = dram_kv_perf_stats[30]
+        dram_read_metadata_sharding_total_duration = dram_kv_perf_stats[31]
+        dram_read_metadata_cache_hit_copy_avg_duration = dram_kv_perf_stats[32]
+        dram_read_metadata_lookup_cache_total_avg_duration = dram_kv_perf_stats[33]
+        dram_read_metadata_acquire_lock_avg_duration = dram_kv_perf_stats[34]
+        dram_read_read_metadata_load_size = dram_kv_perf_stats[35]
 
         stats_reporter.report_duration(
             iteration_step=self.step,
@@ -4144,6 +4159,13 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
 
         stats_reporter.report_data_amount(
             iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_kv_read_counts",
+            data_bytes=dram_kv_read_counts,
+            enable_tb_metrics=True,
+        )
+
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
             event_name=self.dram_kv_allocated_bytes_stats_name,
             data_bytes=dram_kv_allocated_bytes,
             enable_tb_metrics=True,
@@ -4158,6 +4180,88 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
             iteration_step=self.step,
             event_name=self.dram_kv_mem_num_rows_stats_name,
             data_bytes=dram_kv_num_rows,
+            enable_tb_metrics=True,
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_sharding_total_duration_us",
+            duration_ms=dram_metadata_write_sharding_total_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_total_duration_us",
+            duration_ms=dram_metadata_write_total_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_allocate_avg_duration_us",
+            duration_ms=dram_metadata_write_allocate_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_lookup_cache_avg_duration_us",
+            duration_ms=dram_metadata_write_lookup_cache_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_acquire_lock_avg_duration_us",
+            duration_ms=dram_metadata_write_acquire_lock_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.set.dram_eviction_score_write_cache_miss_avg_count",
+            data_bytes=dram_metadata_write_cache_miss_avg_count,
+            enable_tb_metrics=True,
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_total_duration_us",
+            duration_ms=dram_read_metadata_total_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_sharding_total_duration_us",
+            duration_ms=dram_read_metadata_sharding_total_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_cache_hit_copy_avg_duration_us",
+            duration_ms=dram_read_metadata_cache_hit_copy_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_lookup_cache_total_avg_duration_us",
+            duration_ms=dram_read_metadata_lookup_cache_total_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_duration(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_acquire_lock_avg_duration_us",
+            duration_ms=dram_read_metadata_acquire_lock_avg_duration,
+            enable_tb_metrics=True,
+            time_unit="us",
+        )
+        stats_reporter.report_data_amount(
+            iteration_step=self.step,
+            event_name="dram_kv.perf.get.dram_eviction_score_read_load_size",
+            data_bytes=dram_read_read_metadata_load_size,
             enable_tb_metrics=True,
         )
 
@@ -4445,6 +4549,12 @@ class SSDTableBatchedEmbeddingBags(nn.Module):
                 if len(self.ssd_scratch_pad_eviction_data) > 0:
                     self.ssd_scratch_pad_eviction_data.pop(0)
                     if len(self.ssd_scratch_pad_eviction_data) > 0:
+                        # Wait for any pending backend reads to the next scratch pad
+                        # to complete before we write to it. Otherwise, stale backend data
+                        # will overwrite our direct_write updates.
+                        # The ssd_event_get marks completion of backend fetch operations.
+                        current_stream.wait_event(self.ssd_event_get)
+
                         # if scratch pad exists, write to next batch scratch pad
                         sp = self.ssd_scratch_pad_eviction_data[0][0]
                         sp_idx = self.ssd_scratch_pad_eviction_data[0][1].to(

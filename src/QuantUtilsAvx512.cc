@@ -6,12 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <stdexcept>
 #define FBGEMM_EXPORTS
 #include "fbgemm/QuantUtilsAvx512.h"
 #if defined(__x86_64__) || defined(__i386__) || \
     (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)))
 #include <immintrin.h>
 #endif
+#include <cpuinfo.h>
+#include <fbgemm/FloatConversion.h>
 #include <cassert>
 
 namespace fbgemm {
@@ -120,8 +123,9 @@ void requantizeOutputProcessingGConvAvx512(
          j += VLEN) {
       __m512i x_v;
       if constexpr (C_PER_G != 8) {
-        x_v = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
-            inp + (i - block.row_start) * ld_in + (j - block.col_start)));
+        x_v = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(
+                inp + (i - block.row_start) * ld_in + (j - block.col_start)));
       } else {
         // as of now we only have C_per_G = 2,4,8,16 thus this j loop all only
         // execute one iteration, the following point will be wrong if run more
@@ -154,8 +158,8 @@ void requantizeOutputProcessingGConvAvx512(
           row_offset_v =
               _mm512_castps_si512(_mm512_moveldup_ps(_mm512_permutexvar_ps(
                   permute_mask_v_g8,
-                  _mm512_castps256_ps512(
-                      _mm256_loadu_ps(reinterpret_cast<const float*>(
+                  _mm512_castps256_ps512(_mm256_loadu_ps(
+                      reinterpret_cast<const float*>(
                           r.row_offsets + (i - block.row_start) * 8))))));
 
         }
@@ -172,8 +176,8 @@ void requantizeOutputProcessingGConvAvx512(
           // groups 0,1,2,3
           row_offset_v = _mm512_permutexvar_epi32(
               permute_mask_v_g4,
-              _mm512_broadcast_i32x4(
-                  _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+              _mm512_broadcast_i32x4(_mm_loadu_si128(
+                  reinterpret_cast<const __m128i*>(
                       r.row_offsets + (i - block.row_start) * 4))));
         } else if constexpr (C_PER_G == 8) {
           row_offset_v =
@@ -197,14 +201,14 @@ void requantizeOutputProcessingGConvAvx512(
             B_zero_point_v =
                 _mm512_castps_si512(_mm512_moveldup_ps(_mm512_permutexvar_ps(
                     permute_mask_v_g8,
-                    _mm512_castps256_ps512(
-                        _mm256_loadu_ps(reinterpret_cast<const float*>(
+                    _mm512_castps256_ps512(_mm256_loadu_ps(
+                        reinterpret_cast<const float*>(
                             r.B_zero_point + quant_param_idx))))));
           } else if constexpr (C_PER_G == 4) {
             B_zero_point_v = _mm512_permutexvar_epi32(
                 permute_mask_v_g4,
-                _mm512_broadcast_i32x4(
-                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                _mm512_broadcast_i32x4(_mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(
                         r.B_zero_point + quant_param_idx))));
           } else {
             B_zero_point_v = _mm512_set1_epi32(r.B_zero_point[quant_param_idx]);
@@ -381,6 +385,64 @@ void requantizeOutputProcessingGConvAvx512(
   } // i loop
 }
 
+template <bool scale_bias_last, bool quant_padding_float_type>
+void Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(
+    const std::uint8_t* input,
+    size_t input_rows,
+    int input_columns,
+    bfloat16* output) {
+#if (CPUINFO_ARCH_X86 || CPUINFO_ARCH_X86_64) && defined(FBGEMM_FBCODE)
+  constexpr int VLEN = 8;
+  using scale_bias_t =
+      std::conditional_t<quant_padding_float_type, float, float16>;
+  int output_columns = input_columns - 2 * sizeof(scale_bias_t);
+
+  for (size_t row = 0; row < input_rows; ++row) {
+    const std::uint8_t* input_row = input + row * input_columns;
+    const scale_bias_t* input_row_scale_bias = (scale_bias_last)
+        ? (reinterpret_cast<const scale_bias_t*>(input_row + output_columns))
+        : (reinterpret_cast<const scale_bias_t*>(input_row));
+    if constexpr (!scale_bias_last) {
+      input_row += 2 * sizeof(scale_bias_t);
+    }
+    bfloat16* output_row = output + row * output_columns;
+
+    float scale = NAN, bias = NAN;
+    if constexpr (std::is_same_v<scale_bias_t, float>) {
+      scale = input_row_scale_bias[0];
+      bias = input_row_scale_bias[1];
+    } else {
+      scale = cpu_half2float(input_row_scale_bias[0]);
+      bias = cpu_half2float(input_row_scale_bias[1]);
+    }
+    __m256 scale_v = _mm256_set1_ps(scale);
+    __m256 bias_v = _mm256_set1_ps(bias);
+
+    int col = 0;
+    for (col = 0; col < output_columns / VLEN * VLEN; col += VLEN) {
+      __m256 in_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+          _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input_row + col))));
+#ifdef __FMA__
+      __m256 dequantzed_v = _mm256_fmadd_ps(in_v, scale_v, bias_v);
+#else
+      __m256 dequantzed_v = _mm256_add_ps(_mm256_mul_ps(in_v, scale_v), bias_v);
+#endif
+      _mm_storeu_si128(
+          reinterpret_cast<__m128i*>(output_row + col),
+          (__m128i)(_mm256_cvtneps_pbh(dequantzed_v)));
+    }
+
+    for (; col < output_columns; ++col) {
+      float output_value = input_row[col] * scale + bias;
+      output_row[col] = cpu_float2bfloat16(output_value);
+    }
+  } // for each row
+#else
+  throw std::runtime_error(
+      "Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512 not implemented for non x86");
+#endif
+}
+
 #define INSTANTIATE_REQUANTIZE_BIAS_TYPE(              \
     A_SYM, B_SYM, Q_GRAN, BIAS, RELU, BIAS_TYPE)       \
   template void requantizeOutputProcessingGConvAvx512< \
@@ -391,7 +453,7 @@ void requantizeOutputProcessingGConvAvx512(
       RELU,                                            \
       2,                                               \
       BIAS_TYPE>(                                      \
-      uint8_t * out,                                   \
+      uint8_t* out,                                    \
       const int32_t* inp,                              \
       const block_type_t& block,                       \
       int ld_out,                                      \
@@ -405,7 +467,7 @@ void requantizeOutputProcessingGConvAvx512(
       RELU,                                            \
       4,                                               \
       BIAS_TYPE>(                                      \
-      uint8_t * out,                                   \
+      uint8_t* out,                                    \
       const int32_t* inp,                              \
       const block_type_t& block,                       \
       int ld_out,                                      \
@@ -419,7 +481,7 @@ void requantizeOutputProcessingGConvAvx512(
       RELU,                                            \
       8,                                               \
       BIAS_TYPE>(                                      \
-      uint8_t * out,                                   \
+      uint8_t* out,                                    \
       const int32_t* inp,                              \
       const block_type_t& block,                       \
       int ld_out,                                      \
@@ -433,7 +495,7 @@ void requantizeOutputProcessingGConvAvx512(
       RELU,                                            \
       16,                                              \
       BIAS_TYPE>(                                      \
-      uint8_t * out,                                   \
+      uint8_t* out,                                    \
       const int32_t* inp,                              \
       const block_type_t& block,                       \
       int ld_out,                                      \
@@ -468,4 +530,23 @@ INSTANTIATE_BIAS(false)
 #undef INSTANTIATE_B_SYM
 #undef INSTANTIATE_Q_GRANS
 #undef INSTANTIATE_BIAS
+
+#define INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512( \
+    scale_bias_last, quant_padding_float_type)                        \
+  template void Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512<     \
+      scale_bias_last,                                                \
+      quant_padding_float_type>(                                      \
+      const std::uint8_t* input,                                      \
+      size_t input_rows,                                              \
+      int input_columns,                                              \
+      bfloat16* output);
+
+// clang-format off
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(true, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(true, false)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(false, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToBfloat16Avx512(false, false)
+// clang-format on
+#undef INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2
+
 } // namespace fbgemm

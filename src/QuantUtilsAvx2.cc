@@ -94,8 +94,9 @@ void QuantizeAvx2(
   // the main loop and remainder loop have the same behavior
   int64_t rem = len - i;
   if (rem > 0) {
-    __m256i mask_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_masks[rem]));
+    __m256i mask_v = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_masks[rem]));
     // __m128i store_mask_v = _mm_load_si128(
     // reinterpret_cast<const __m128i*>(internal::sse_epi8_masks[rem]));
     __m256 src_v = _mm256_maskload_ps(src + i, mask_v);
@@ -223,8 +224,9 @@ void NO_SANITIZE("address") FusedQuantizeDequantizeAvx2(
   // the main loop and remainder loop have the same behavior
   int rem = len - i;
   if (rem > 0) {
-    __m256i mask_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_masks[rem]));
+    __m256i mask_v = _mm256_load_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_masks[rem]));
 
     __m256 src_v = _mm256_maskload_ps(src + i, mask_v);
     __m256 transformed_v;
@@ -527,17 +529,21 @@ void requantizeOutputProcessingAvx2(
     int64_t j = block.col_start;
     for (; j < block.col_start + (block.col_size / (VLEN * 4) * (VLEN * 4));
          j += (VLEN * 4)) {
-      __m256i x_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start)));
-      __m256i y_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start) +
-          1 * VLEN));
-      __m256i z_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start) +
-          2 * VLEN));
-      __m256i w_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start) +
-          3 * VLEN));
+      __m256i x_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start)));
+      __m256i y_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start) +
+              1 * VLEN));
+      __m256i z_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start) +
+              2 * VLEN));
+      __m256i w_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start) +
+              3 * VLEN));
 
       if constexpr (!A_SYMMETRIC) {
         __m256i col_off_v;
@@ -549,8 +555,9 @@ void requantizeOutputProcessingAvx2(
         } else {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + i * block.col_size)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + i * block.col_size)));
         }
 
         x_v = _mm256_sub_epi32(x_v, col_off_v);
@@ -563,8 +570,9 @@ void requantizeOutputProcessingAvx2(
         } else {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + VLEN + i * block.col_size)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + VLEN + i * block.col_size)));
         }
 
         y_v = _mm256_sub_epi32(y_v, col_off_v);
@@ -572,13 +580,15 @@ void requantizeOutputProcessingAvx2(
         if constexpr (DIRECT == false) {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + 2 * VLEN)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + 2 * VLEN)));
         } else {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + 2 * VLEN + i * block.col_size)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + 2 * VLEN + i * block.col_size)));
         }
 
         z_v = _mm256_sub_epi32(z_v, col_off_v);
@@ -586,13 +596,15 @@ void requantizeOutputProcessingAvx2(
         if constexpr (DIRECT == false) {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + 3 * VLEN)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + 3 * VLEN)));
         } else {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + 3 * VLEN + i * block.col_size)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + 3 * VLEN + i * block.col_size)));
         }
 
         w_v = _mm256_sub_epi32(w_v, col_off_v);
@@ -616,15 +628,17 @@ void requantizeOutputProcessingAvx2(
         if constexpr (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
           row_offset_v = _mm256_mullo_epi32(
               _mm256_set1_epi32(r.row_offsets[i - block.row_start]),
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.B_zero_point + j + 2 * VLEN)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.B_zero_point + j + 2 * VLEN)));
         }
         z_v = _mm256_sub_epi32(z_v, row_offset_v);
         if constexpr (Q_GRAN == QuantizationGranularity::OUT_CHANNEL) {
           row_offset_v = _mm256_mullo_epi32(
               _mm256_set1_epi32(r.row_offsets[i - block.row_start]),
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.B_zero_point + j + 3 * VLEN)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.B_zero_point + j + 3 * VLEN)));
         }
         w_v = _mm256_sub_epi32(w_v, row_offset_v);
       }
@@ -793,8 +807,9 @@ void requantizeOutputProcessingAvx2(
     } // j loop vectorized and unrolled 4x
 
     for (; j < block.col_start + (block.col_size / VLEN * VLEN); j += VLEN) {
-      __m256i x_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start)));
+      __m256i x_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start)));
 
       if constexpr (!A_SYMMETRIC) {
         __m256i col_off_v;
@@ -806,8 +821,9 @@ void requantizeOutputProcessingAvx2(
         } else {
           col_off_v = _mm256_mullo_epi32(
               A_zero_point_v,
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                  r.col_offsets + j + i * block.col_size)));
+              _mm256_loadu_si256(
+                  reinterpret_cast<const __m256i*>(
+                      r.col_offsets + j + i * block.col_size)));
         }
         x_v = _mm256_sub_epi32(x_v, col_off_v);
       }
@@ -887,8 +903,9 @@ void requantizeOutputProcessingAvx2(
 
     const int64_t remainder = block.col_start + block.col_size - j;
     if (remainder > 0) {
-      __m256i mask_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(
-          internal::avx2_ps_or_epi32_masks[remainder]));
+      __m256i mask_v = _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(
+              internal::avx2_ps_or_epi32_masks[remainder]));
 
       __m256i x_v = _mm256_maskload_epi32(
           inp + (i - block.row_start) * ld_in + (j - block.col_start), mask_v);
@@ -1047,8 +1064,9 @@ void requantizeForFloatAvx2(
 
     int64_t j = block.col_start;
     for (; j < block.col_start + (block.col_size / VLEN * VLEN); j += VLEN) {
-      __m256i x_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start)));
+      __m256i x_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start)));
 
       if constexpr (!A_SYMMETRIC) {
         __m256i col_off_v = _mm256_mullo_epi32(
@@ -1090,8 +1108,9 @@ void requantizeForFloatAvx2(
 
     const int64_t remainder = block.col_start + block.col_size - j;
     if (remainder > 0) {
-      __m256i mask_v = _mm256_load_si256(reinterpret_cast<const __m256i*>(
-          internal::avx2_ps_or_epi32_masks[remainder]));
+      __m256i mask_v = _mm256_load_si256(
+          reinterpret_cast<const __m256i*>(
+              internal::avx2_ps_or_epi32_masks[remainder]));
 
       __m256i x_v = _mm256_maskload_epi32(
           inp + (i - block.row_start) * ld_in + (j - block.col_start), mask_v);
@@ -1195,8 +1214,9 @@ void requantizeOutputProcessingGConvAvx2(
   for (int64_t i = block.row_start; i < block.row_start + block.row_size; ++i) {
     int64_t j = block.col_start;
     for (; j < block.col_start + (block.col_size / VLEN * VLEN); j += VLEN) {
-      __m256i x_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-          inp + (i - block.row_start) * ld_in + (j - block.col_start)));
+      __m256i x_v = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(
+              inp + (i - block.row_start) * ld_in + (j - block.col_start)));
 
       if constexpr (!A_SYMMETRIC) {
         __m256i col_off_v = _mm256_mullo_epi32(
@@ -1216,8 +1236,8 @@ void requantizeOutputProcessingGConvAvx2(
           // Load row_offsets for 4 groups and broadcast by 2 times.
           row_offset_v =
               _mm256_castps_si256(_mm256_moveldup_ps(_mm256_permutevar8x32_ps(
-                  _mm256_castps128_ps256(
-                      _mm_loadu_ps(reinterpret_cast<const float*>(
+                  _mm256_castps128_ps256(_mm_loadu_ps(
+                      reinterpret_cast<const float*>(
                           r.row_offsets + (i - block.row_start) * 4))),
                   permute_mask_v)));
 
@@ -1255,8 +1275,8 @@ void requantizeOutputProcessingGConvAvx2(
           if constexpr (C_PER_G == 2) {
             B_zero_point_v =
                 _mm256_castps_si256(_mm256_moveldup_ps(_mm256_permutevar8x32_ps(
-                    _mm256_castps128_ps256(
-                        _mm_loadu_ps(reinterpret_cast<const float*>(
+                    _mm256_castps128_ps256(_mm_loadu_ps(
+                        reinterpret_cast<const float*>(
                             r.B_zero_point + quant_param_idx))),
                     permute_mask_v)));
           } else if constexpr (C_PER_G == 4) {
@@ -1425,7 +1445,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       BIAS_TYPE,                                           \
       false>(                                              \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1439,7 +1459,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       BIAS_TYPE,                                           \
       true>(                                               \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1453,7 +1473,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       2,                                                   \
       BIAS_TYPE>(                                          \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1467,7 +1487,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       4,                                                   \
       BIAS_TYPE>(                                          \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1481,7 +1501,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       8,                                                   \
       BIAS_TYPE>(                                          \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1495,7 +1515,7 @@ void requantizeOutputProcessingGConvAvx2(
       RELU,                                                \
       16,                                                  \
       BIAS_TYPE>(                                          \
-      uint8_t * out,                                       \
+      uint8_t* out,                                        \
       const int32_t* inp,                                  \
       const block_type_t& block,                           \
       int ld_out,                                          \
@@ -1975,10 +1995,11 @@ void FusedNBitRowwiseQuantizedSBHalfToFloatOrHalfAvx2(
     int remainder_32bit_granularity =
         (output_columns + NUM_ELEM_PER_32BIT - 1) / NUM_ELEM_PER_32BIT %
         NUM_OF_32BIT_PER_VLOAD;
-    vmask_load = _mm_lddqu_si128(reinterpret_cast<const __m128i*>(
-        internal::avx2_ps_or_epi32_combined_mask + NUM_OF_32BIT_PER_VLOAD +
-        (NUM_OF_32BIT_PER_VLOAD - remainder_32bit_granularity) %
-            NUM_OF_32BIT_PER_VLOAD));
+    vmask_load = _mm_lddqu_si128(
+        reinterpret_cast<const __m128i*>(
+            internal::avx2_ps_or_epi32_combined_mask + NUM_OF_32BIT_PER_VLOAD +
+            (NUM_OF_32BIT_PER_VLOAD - remainder_32bit_granularity) %
+                NUM_OF_32BIT_PER_VLOAD));
     remainder = output_columns % (4 * VLEN);
     int remainder_ratio = 1;
     if constexpr (std::is_same<OutputType, float16>()) {
@@ -2000,24 +2021,30 @@ void FusedNBitRowwiseQuantizedSBHalfToFloatOrHalfAvx2(
       // {-1, ..., -1}, {-1, ..., -1}, {-1, ..., -1}, {-1, -1, -1, 0}
       remainder_ratio = 2;
     }
-    vmask_store0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_combined_mask +
-        (VLEN - std::min(remainder, VLEN) / remainder_ratio % (VLEN + 1))));
-    vmask_store1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_combined_mask +
-        (VLEN -
-         std::max(0, std::min(remainder - VLEN, VLEN) / remainder_ratio) %
-             (VLEN + 1))));
-    vmask_store2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_combined_mask +
-        (VLEN -
-         std::max(0, std::min(remainder - 2 * VLEN, VLEN) / remainder_ratio) %
-             (VLEN + 1))));
-    vmask_store3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-        internal::avx2_ps_or_epi32_combined_mask +
-        (VLEN -
-         std::max(0, std::min(remainder - 3 * VLEN, VLEN) / remainder_ratio) %
-             (VLEN + 1))));
+    vmask_store0 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_combined_mask +
+            (VLEN - std::min(remainder, VLEN) / remainder_ratio % (VLEN + 1))));
+    vmask_store1 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_combined_mask +
+            (VLEN -
+             std::max(0, std::min(remainder - VLEN, VLEN) / remainder_ratio) %
+                 (VLEN + 1))));
+    vmask_store2 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_combined_mask +
+            (VLEN -
+             std::max(
+                 0, std::min(remainder - 2 * VLEN, VLEN) / remainder_ratio) %
+                 (VLEN + 1))));
+    vmask_store3 = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(
+            internal::avx2_ps_or_epi32_combined_mask +
+            (VLEN -
+             std::max(
+                 0, std::min(remainder - 3 * VLEN, VLEN) / remainder_ratio) %
+                 (VLEN + 1))));
   }
 
   for (size_t row = 0; row < input_rows; ++row) {
@@ -2038,15 +2065,15 @@ void FusedNBitRowwiseQuantizedSBHalfToFloatOrHalfAvx2(
         __m256i vinq;
         // unpack to 8-bit integers
         if constexpr (BIT_RATE == 4) {
-          vinq = _mm256_cvtepu8_epi16(
-              _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+          vinq = _mm256_cvtepu8_epi16(_mm_loadu_si128(
+              reinterpret_cast<const __m128i*>(
                   input_row + col / NUM_ELEM_PER_BYTE)));
           vinq = _mm256_and_si256(
               _mm256_or_si256(vinq, _mm256_slli_epi32(vinq, 4)),
               _mm256_set1_epi16(0x0f0f));
         } else {
-          vinq = _mm256_cvtepu8_epi32(
-              _mm_loadl_epi64(reinterpret_cast<const __m128i*>(
+          vinq = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+              reinterpret_cast<const __m128i*>(
                   input_row + col / NUM_ELEM_PER_BYTE)));
           vinq = _mm256_and_si256(
               _mm256_or_si256(
@@ -2177,23 +2204,40 @@ void FusedNBitRowwiseQuantizedSBHalfToFloatOrHalfAvx2(
   } // for each row
 }
 
-template <typename OutputType>
+template <
+    typename OutputType,
+    bool scale_bias_last,
+    bool quant_padding_float_type>
 void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(
     const std::uint8_t* input,
     size_t input_rows,
     int input_columns,
     OutputType* output) {
   constexpr int VLEN = 8;
-  int output_columns = input_columns - 2 * sizeof(float);
+  using scale_bias_t =
+      std::conditional_t<quant_padding_float_type, float, float16>;
+  int output_columns = input_columns - 2 * sizeof(scale_bias_t);
 
   for (size_t row = 0; row < input_rows; ++row) {
     const std::uint8_t* input_row = input + row * input_columns;
-    const float* input_row_scale_bias =
-        reinterpret_cast<const float*>(input_row + output_columns);
+    const scale_bias_t* input_row_scale_bias = (scale_bias_last)
+        ? (reinterpret_cast<const scale_bias_t*>(input_row + output_columns))
+        : (reinterpret_cast<const scale_bias_t*>(input_row));
+    if constexpr (!scale_bias_last) {
+      input_row += 2 * sizeof(scale_bias_t);
+    }
     OutputType* output_row = output + row * output_columns;
 
-    __m256 scale_v = _mm256_set1_ps(input_row_scale_bias[0]);
-    __m256 bias_v = _mm256_set1_ps(input_row_scale_bias[1]);
+    float scale = NAN, bias = NAN;
+    if constexpr (std::is_same_v<scale_bias_t, float>) {
+      scale = input_row_scale_bias[0];
+      bias = input_row_scale_bias[1];
+    } else {
+      scale = cpu_half2float(input_row_scale_bias[0]);
+      bias = cpu_half2float(input_row_scale_bias[1]);
+    }
+    __m256 scale_v = _mm256_set1_ps(scale);
+    __m256 bias_v = _mm256_set1_ps(bias);
 
     int col = 0;
     for (col = 0; col < output_columns / VLEN * VLEN; col += VLEN) {
@@ -2216,8 +2260,7 @@ void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(
     }
 
     for (; col < output_columns; ++col) {
-      float output_value =
-          input_row[col] * input_row_scale_bias[0] + input_row_scale_bias[1];
+      float output_value = input_row[col] * scale + bias;
       if constexpr (std::is_same_v<OutputType, float>) {
         output_row[col] = output_value;
       } else {
@@ -2258,17 +2301,35 @@ INSTANTIATE_QuantizationAvx2FunctionsNBits(float16, 8)
       size_t input_rows,                                                 \
       int input_columns,                                                 \
       std::uint8_t* output,                                              \
-      const type* rowwise_min_max);                                      \
-  template void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2<type>( \
-      const std::uint8_t* input,                                         \
-      size_t input_rows,                                                 \
-      int input_columns,                                                 \
-      type* output);
+      const type* rowwise_min_max);
 
     // clang-format off
 INSTANTIATE_QuantizationAvx2Functions8Bits(float)
 INSTANTIATE_QuantizationAvx2Functions8Bits(float16)
 // clang-format on
 #undef INSTANTIATE_QuantizationAvx2Functions8Bits
+
+#define INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2( \
+    type, scale_bias_last, quant_padding_float_type)                   \
+  template void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2<     \
+      type,                                                            \
+      scale_bias_last,                                                 \
+      quant_padding_float_type>(                                       \
+      const std::uint8_t* input,                                       \
+      size_t input_rows,                                               \
+      int input_columns,                                               \
+      type* output);
+
+    // clang-format off
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float, true, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float, true, false)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float, false, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float, false, false)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float16, true, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float16, true, false)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float16, false, true)
+INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2(float16, false, false)
+// clang-format on
+#undef INSTANTIATE_Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfAvx2
 
 } // namespace fbgemm

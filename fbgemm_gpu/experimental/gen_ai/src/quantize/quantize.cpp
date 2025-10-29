@@ -68,6 +68,13 @@ at::Tensor f8f8bf16_tensorwise(
     double scale,
     bool use_fast_accum = true);
 at::Tensor f8f8bf16_lite(at::Tensor XQ, at::Tensor WQ, at::Tensor scale);
+at::Tensor f8f8bf16_conv(
+    at::Tensor activation,
+    at::Tensor filter,
+    at::Tensor scale,
+    std::vector<int64_t> padding,
+    std::vector<int64_t> stride,
+    std::vector<int64_t> dilation);
 std::vector<at::Tensor> bf16bf16bf16_grouped(
     at::TensorList X,
     at::TensorList W);
@@ -76,8 +83,12 @@ at::Tensor bf16bf16bf16_grouped_dynamic(
     at::Tensor X,
     at::Tensor W,
     at::Tensor zero_start_index_M);
-at::Tensor
-bf16bf16bf16_grouped_stacked(at::Tensor X, at::Tensor W, at::Tensor M_sizes);
+at::Tensor bf16bf16bf16_grouped_stacked(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor M_sizes,
+    std::optional<at::Tensor> out = std::nullopt,
+    std::optional<int64_t> num_sms = std::nullopt);
 at::Tensor f8f8bf16_rowwise(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -306,12 +317,14 @@ TORCH_LIBRARY_IMPL(fbgemm, CUDA, m) {
   m.impl("f4f4bf16", f4f4bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
+  m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16_fast_gemv", bf16_fast_gemv);
   m.impl("bf16fp8bf16_fast_gemv", bf16fp8bf16_fast_gemv);
   m.impl("fp8fp8bf16_fast_gemv", fp8fp8bf16_fast_gemv);
   m.impl("f8f8bf16_lite", f8f8bf16_lite);
+  m.impl("f8f8bf16_conv", f8f8bf16_conv);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
   m.impl("bf16i4bf16_shuffled", bf16i4bf16_shuffled);
@@ -361,6 +374,7 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
   m.impl("f4f4bf16", f4f4bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
+  m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16_fast_gemv", bf16_fast_gemv);
@@ -608,6 +622,44 @@ at::Tensor f8f8bf16_lite_meta(at::Tensor X, at::Tensor W, at::Tensor scale) {
   return Y;
 }
 
+at::Tensor f8f8bf16_conv_meta(
+    at::Tensor activation,
+    at::Tensor filter,
+    at::Tensor /* scale */,
+    std::vector<int64_t> padding,
+    std::vector<int64_t> stride,
+    std::vector<int64_t> dilation) {
+  TORCH_CHECK(activation.dim() == 5, "Activation must be 5D tensor (NDHWC)");
+  TORCH_CHECK(filter.dim() == 5, "Filter must be 5D tensor (KTRSC)");
+
+  const at::SymInt n = activation.sym_size(0);
+  const at::SymInt d = activation.sym_size(1);
+  const at::SymInt h = activation.sym_size(2);
+  const at::SymInt w = activation.sym_size(3);
+  const at::SymInt k = filter.sym_size(0);
+  const at::SymInt t = filter.sym_size(1);
+  const at::SymInt r = filter.sym_size(2);
+  const at::SymInt s = filter.sym_size(3);
+
+  int pad_d = padding[0];
+  int pad_h = padding[1];
+  int pad_w = padding[2];
+  int stride_d = stride[0];
+  int stride_h = stride[1];
+  int stride_w = stride[2];
+  int dilation_d = dilation[0];
+  int dilation_h = dilation[1];
+  int dilation_w = dilation[2];
+
+  at::SymInt z = 1 + (d + 2 * pad_d - ((t - 1) * dilation_d + 1)) / stride_d;
+  at::SymInt p = 1 + (h + 2 * pad_h - ((r - 1) * dilation_h + 1)) / stride_h;
+  at::SymInt q = 1 + (w + 2 * pad_w - ((s - 1) * dilation_w + 1)) / stride_w;
+
+  auto Y = at::empty_symint(
+      {n, z, p, q, k}, activation.options().dtype(at::kBFloat16));
+  return Y;
+}
+
 at::Tensor f8i4bf16_rowwise_meta(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // INT4
@@ -781,12 +833,19 @@ at::Tensor bf16bf16bf16_grouped_dynamic_meta(
 at::Tensor bf16bf16bf16_grouped_stacked_meta(
     at::Tensor X,
     at::Tensor W,
-    at::Tensor /* M_sizes */) {
+    at::Tensor /* M_sizes */,
+    std::optional<at::Tensor> out,
+    std::optional<int64_t> /* num_sms */) {
   const at::SymInt total_M = X.sym_size(0);
   const at::SymInt N = W.sym_size(1);
-  at::Tensor Y =
-      at::empty_symint({total_M, N}, X.options().dtype(at::kBFloat16));
-  return Y;
+
+  if (out.has_value()) {
+    return out.value();
+  } else {
+    at::Tensor output =
+        at::empty_symint({total_M, N}, X.options().dtype(at::kBFloat16));
+    return output;
+  }
 }
 
 at::Tensor f8f8bf16_rowwise_grouped_stacked_meta(
@@ -830,6 +889,7 @@ TORCH_LIBRARY_IMPL(fbgemm, Meta, m) {
   m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched_meta);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched_meta);
   m.impl("f8f8bf16_lite", f8f8bf16_lite_meta);
+  m.impl("f8f8bf16_conv", f8f8bf16_conv_meta);
   m.impl("scaled_fp4_quant", scaled_fp4_quant_meta);
   m.impl("preshuffle_i4", preshuffle_i4_meta);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled_meta);

@@ -16,6 +16,11 @@ import fbgemm_gpu.experimental.gen_ai  # noqa: F401
 
 import torch
 import triton  # noqa: F401
+from fbgemm_gpu.experimental.gemm.triton_gemm.fp4_quantize import (
+    get_nvfp4_global_scales_naive,
+    quantize_nvfp4_naive,
+    triton_quantize_mx4_unpack,
+)
 
 if torch.cuda.is_available():
     from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
@@ -64,6 +69,21 @@ def evaluate_platform_supports_mxfp8():
     return False
 
 
+def evaluate_platform_supports_nvfp4():
+    if torch.cuda.is_available():
+        if torch.version.cuda:
+            return evaluate_cuda_platform_version(10) and torch.version.cuda >= "12.8"
+    return False
+
+
+def evaluate_platform_supports_mxfp4():
+    if torch.cuda.is_available():
+        if torch.version.cuda:
+            return evaluate_cuda_platform_version(10) and torch.version.cuda >= "12.8"
+        # TODO add AMD here later
+    return False
+
+
 def evaluate_cuda_platform_version(major: int):
     if torch.version.cuda:
         return torch.cuda.get_device_capability() >= (major, 0)
@@ -71,6 +91,10 @@ def evaluate_cuda_platform_version(major: int):
 
 
 SM90_OR_LATER = evaluate_cuda_platform_version(9)
+
+SUPPORTS_NVFP4 = evaluate_platform_supports_nvfp4()
+
+SUPPORTS_MXFP4 = evaluate_platform_supports_mxfp4()
 
 SUPPORTS_FP8 = evaluate_platform_supports_fp8()
 
@@ -1965,6 +1989,61 @@ class FP8Tests(unittest.TestCase):
         zq_ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(zq, zq_ref, atol=9.0e-2, rtol=9.0e-2)
 
+    @unittest.skipIf(
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10,
+        "Skip when SM100 (Blackwell) is not available",
+    )
+    def test_f8f8bf16_conv(self) -> None:
+        # Setup: Create simple 3D convolution test data
+        n, d, h, w, c = 1, 4, 8, 8, 16
+        k, t, r, s = 16, 3, 3, 3
+        fp8_max = E4M3_MAX_POS
+
+        # Create random activation (NDHWC) and filter (KTRSC)
+        activation = (
+            torch.randn(n, d, h, w, c, dtype=torch.bfloat16, device=self.device) * 0.1
+        )
+        filter_tensor = (
+            torch.randn(k, t, r, s, c, dtype=torch.bfloat16, device=self.device) * 0.01
+        )
+
+        # Quantize to FP8
+        act_max = torch.max(torch.abs(activation.to(torch.float)))
+        flt_max = torch.max(torch.abs(filter_tensor.to(torch.float)))
+        act_scale = act_max / fp8_max
+        flt_scale = flt_max / fp8_max
+
+        activation_q = (activation * fp8_max / act_max).to(fp8_e4m3)
+        filter_q = (filter_tensor * fp8_max / flt_max).to(fp8_e4m3)
+
+        # Execute: Run convolution with padding=1, stride=1, dilation=1
+        padding = [1, 1, 1]
+        stride = [1, 1, 1]
+        dilation = [1, 1, 1]
+
+        output = torch.ops.fbgemm.f8f8bf16_conv(
+            activation_q, filter_q, act_scale * flt_scale, padding, stride, dilation
+        )
+
+        # Assert: Check output shape is correct
+        # Output dimensions: z = 1 + (d + 2*pad_d - ((t-1)*dil_d + 1)) / stride_d
+        expected_z = (
+            1 + (d + 2 * padding[0] - ((t - 1) * dilation[0] + 1)) // stride[0]
+        )  # = 4
+        expected_p = (
+            1 + (h + 2 * padding[1] - ((r - 1) * dilation[1] + 1)) // stride[1]
+        )  # = 8
+        expected_q = (
+            1 + (w + 2 * padding[2] - ((s - 1) * dilation[2] + 1)) // stride[2]
+        )  # = 8
+
+        self.assertEqual(output.shape, (n, expected_z, expected_p, expected_q, k))
+        self.assertEqual(output.dtype, torch.bfloat16)
+
+        # Basic sanity check: output should not be all zeros
+        self.assertFalse(torch.all(output == 0))
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Skip when GPU is not available")
 @unittest.skipIf(not SM90_OR_LATER, "Skip when not SM90+")
@@ -2145,13 +2224,12 @@ class FastGemvTests(unittest.TestCase):
     not torch.cuda.is_available() or torch.version.hip,
     "Skip when cuda is not available or HIP is enabled",
 )
+@unittest.skipIf(not SUPPORTS_NVFP4, "Skip if NVFP4 is not supported")
 class NVFP4Tests(unittest.TestCase):
-    @unittest.skipIf(
-        (not torch.version.cuda)
-        or torch.version.hip is not None
-        or str(torch.version.cuda) <= "12.8",
-        "Skip if no cuda is present or HIP is enabled",
-    )
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
     @settings(deadline=None)
     @given(
         B_T=st.sampled_from([2048, 4096]),
@@ -2172,7 +2250,7 @@ class NVFP4Tests(unittest.TestCase):
             torch.randn(
                 size=(B_T, D),
                 dtype=torch.bfloat16,
-                device=torch.accelerator.current_accelerator(),
+                device=self.device,
             )
             * 0.1
         )
@@ -2180,7 +2258,7 @@ class NVFP4Tests(unittest.TestCase):
             torch.randn(
                 size=(HD_L, D),
                 dtype=torch.bfloat16,
-                device=torch.accelerator.current_accelerator(),
+                device=self.device,
             )
             * 0.01
         )
@@ -2197,6 +2275,226 @@ class NVFP4Tests(unittest.TestCase):
         y_ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(fake_quant_y, y_ref, atol=0.1, rtol=0.1)
 
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([1, 4, 16]),
+        M=st.sampled_from([250, 500, 3500]),
+        N=st.sampled_from([256, 1024, 6144]),
+        K=st.sampled_from([2048, 3584]),
+    )
+    def test_grouped_gemm_2d_3d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+
+        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
+            XS, WS
+        )
+        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
+        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
+        global_scale = torch.stack(global_scales, dim=0)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_nvfp4 = torch.ops.fbgemm.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets, None, global_scale
+        )
+        self.assertTrue(out_nvfp4.isfinite().all(), "output contains non-finite values")
+
+        torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
+
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([1, 4, 16]),
+        M=st.sampled_from([250, 500, 3500]),
+        N=st.sampled_from([256, 1024, 6144]),
+        K=st.sampled_from([2048, 3584]),
+    )
+    def test_grouped_gemm_2d_2d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
+
+        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
+            XS, WS
+        )
+        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
+        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
+
+        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
+        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
+        global_scale = torch.stack(global_scales, dim=0)
+
+        X = torch.cat(XS, dim=1)
+        W = torch.cat(WS, dim=1)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_nvfp4 = torch.ops.fbgemm.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets, None, global_scale
+        )
+        self.assertTrue(out_nvfp4.isfinite().all(), "output contains non-finite values")
+
+        torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.version.hip,
+    "Skip when cuda is not available or HIP is enabled",
+)
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+class MXFP4Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @given(
+        G=st.sampled_from([1, 4, 16]),
+        M=st.sampled_from([250, 500, 3500]),
+        N=st.sampled_from([256, 1024, 6144]),
+        K=st.sampled_from([2048, 3584]),
+    )
+    def test_grouped_gemm_2d_3d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+
+        wqs = []
+        xqs = []
+        w_scales = []
+        x_scales = []
+
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_mxfp4 = torch.ops.fbgemm.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([1, 4, 16]),
+        M=st.sampled_from([250, 500, 3500]),
+        N=st.sampled_from([256, 1024, 6144]),
+        K=st.sampled_from([2048, 3584]),
+    )
+    def test_grouped_gemm_2d_2d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
+
+        wqs = []
+        xqs = []
+        w_scales = []
+        x_scales = []
+
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
+        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=1)
+        W = torch.cat(WS, dim=1)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_mxfp4 = torch.ops.fbgemm.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
 
 @unittest.skipIf(
     not torch.cuda.is_available()
@@ -2208,9 +2506,23 @@ class BF16Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
+    def generate_random_splits(G: int, M: int) -> torch.Tensor:
+        m_cumsums = torch.sort(
+            torch.randint(
+                0,
+                M,
+                (G + 1,),
+                dtype=torch.int32,
+                device=torch.accelerator.current_accelerator(),
+            )
+        ).values
+        m_cumsums[0], m_cumsums[-1] = 0, M
+        m_sizes = m_cumsums[1:] - m_cumsums[:-1]
+        return m_sizes
+
     @unittest.skipIf(
         not torch.version.cuda,
-        "Skip on AMD: test_bf16_grouped_gemmw_wgrad not yet suported.",
+        "Skip on AMD: test_grouped_gemm_wgrad not yet suported.",
     )
     @settings(deadline=None)
     @given(
@@ -2220,7 +2532,7 @@ class BF16Tests(unittest.TestCase):
         K=st.sampled_from([128, 1024]),
         output_accum=st.booleans(),
     )
-    def test_bf16_grouped_gemmw_wgrad(
+    def test_grouped_gemm_wgrad(
         self,
         G: int,
         M: int,
@@ -2237,21 +2549,7 @@ class BF16Tests(unittest.TestCase):
             (M, K), dtype=torch.bfloat16, device=torch.accelerator.current_accelerator()
         )
 
-        def generate_random_splits(G: int, M: int) -> torch.Tensor:
-            m_cumsums = torch.sort(
-                torch.randint(
-                    0,
-                    M,
-                    (G + 1,),
-                    dtype=torch.int32,
-                    device=torch.accelerator.current_accelerator(),
-                )
-            ).values
-            m_cumsums[0], m_cumsums[-1] = 0, M
-            m_sizes = m_cumsums[1:] - m_cumsums[:-1]
-            return m_sizes
-
-        m_sizes = generate_random_splits(G, M)
+        m_sizes = BF16Tests.generate_random_splits(G, M)
 
         # Test
         if output_accum:
@@ -2263,12 +2561,18 @@ class BF16Tests(unittest.TestCase):
         else:
             wgrad_accum = None
 
+        sm_margin = 0
+        num_sms = (
+            torch.cuda.get_device_properties("cuda").multi_processor_count - sm_margin
+        )
+
         test_wgrad = torch.ops.fbgemm.bf16bf16bf16_grouped_wgrad(
             dy_bf16,
             x_bf16,
             m_sizes.to(torch.int64),
             output=wgrad_accum.clone() if output_accum else None,
             output_accum=output_accum,
+            num_sms=num_sms,
         )
 
         if output_accum:
@@ -2318,6 +2622,151 @@ class BF16Tests(unittest.TestCase):
                     atol=1e-4,
                     rtol=1e-2,
                 )
+
+    @unittest.skipIf(
+        not torch.version.cuda,
+        "Skip on AMD: test_grouped_gemm_dgrad not yet suported.",
+    )
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([2, 16]),
+        M=st.sampled_from([257, 2049]),
+        N=st.sampled_from([256, 2048]),
+        K=st.sampled_from([128, 1024]),
+    )
+    def test_grouped_gemm_dgrad(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        torch.manual_seed(hash((G, M, N, K)))
+
+        # Inputs
+        dy_bf16 = torch.randn(
+            (M, N), dtype=torch.bfloat16, device=torch.accelerator.current_accelerator()
+        )
+        w_bf16 = torch.randn(
+            (G, N, K),
+            dtype=torch.bfloat16,
+            device=torch.accelerator.current_accelerator(),
+        )
+        m_sizes = BF16Tests.generate_random_splits(G, M)
+
+        sm_margin = 0
+        num_sms = (
+            torch.cuda.get_device_properties("cuda").multi_processor_count - sm_margin
+        )
+
+        y_bf16 = torch.ops.fbgemm.bf16bf16bf16_grouped_grad(
+            dy_bf16,
+            w_bf16.permute(0, 2, 1),
+            m_sizes.to(torch.int64),
+            num_sms=num_sms,
+        )
+
+        Y_preallocated = torch.empty(
+            (M * K),
+            dtype=torch.bfloat16,
+            device=torch.accelerator.current_accelerator(),
+        )
+        y_bf16_preallocated = torch.ops.fbgemm.bf16bf16bf16_grouped_grad(
+            dy_bf16,
+            w_bf16.permute(0, 2, 1),
+            m_sizes.to(torch.int64),
+            Y_preallocated,
+            num_sms=num_sms,
+        )
+
+        # Reference
+        dy_fp32 = dy_bf16.to(torch.float32)
+        w_fp32 = w_bf16.to(torch.float32)
+
+        ref_y_fp32 = torch.empty(
+            (M, K), dtype=torch.float32, device=torch.accelerator.current_accelerator()
+        )
+        m_start = 0
+        for g, m_size in enumerate(m_sizes.tolist()):
+            ref_y_fp32[m_start : m_start + m_size, :] = dy_fp32[
+                m_start : m_start + m_size, :
+            ] @ w_fp32[g, :, :].view(N, K)
+            m_start += m_size
+        ref_y_bf16 = ref_y_fp32.to(torch.bfloat16)
+
+        torch.testing.assert_close(y_bf16, ref_y_bf16, atol=1e-3, rtol=1.6e-2)
+        torch.testing.assert_close(
+            y_bf16_preallocated, ref_y_bf16, atol=1e-3, rtol=1.6e-2
+        )
+
+    @unittest.skipIf(
+        not torch.version.cuda,
+        "Skip on AMD: test_grouped_gemm_fprop not yet suported.",
+    )
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([2, 16]),
+        M=st.sampled_from([257, 2049]),
+        N=st.sampled_from([256, 2048]),
+        K=st.sampled_from([128, 1024]),
+    )
+    def test_grouped_gemm_fprop(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        torch.manual_seed(hash((G, M, N, K)))
+
+        # Inputs
+        x_bf16 = torch.randn(
+            (M, K), dtype=torch.bfloat16, device=torch.accelerator.current_accelerator()
+        )
+        w_bf16 = torch.randn(
+            (G, N, K),
+            dtype=torch.bfloat16,
+            device=torch.accelerator.current_accelerator(),
+        )
+        m_sizes = BF16Tests.generate_random_splits(G, M)
+
+        sm_margin = 0
+        num_sms = (
+            torch.cuda.get_device_properties("cuda").multi_processor_count - sm_margin
+        )
+
+        y_bf16 = torch.ops.fbgemm.bf16bf16bf16_grouped_stacked(
+            x_bf16, w_bf16, m_sizes.to(torch.int64), num_sms=num_sms
+        )
+
+        Y_preallocated = torch.empty(
+            (M * N),
+            dtype=torch.bfloat16,
+            device=torch.accelerator.current_accelerator(),
+        )
+        y_bf16_Y_preallocated = torch.ops.fbgemm.bf16bf16bf16_grouped_stacked(
+            x_bf16, w_bf16, m_sizes.to(torch.int64), Y_preallocated, num_sms=num_sms
+        )
+
+        # Reference
+        x_fp32 = x_bf16.to(torch.float32)
+        w_fp32 = w_bf16.to(torch.float32)
+
+        ref_y_fp32 = torch.empty(
+            (M, N), dtype=torch.float32, device=torch.accelerator.current_accelerator()
+        )
+        m_start = 0
+        for g, m_size in enumerate(m_sizes.tolist()):
+            ref_y_fp32[m_start : m_start + m_size, :] = (
+                x_fp32[m_start : m_start + m_size, :] @ w_fp32[g, :, :].view(N, K).T
+            )
+            m_start += m_size
+        ref_y_bf16 = ref_y_fp32.to(torch.bfloat16)
+
+        torch.testing.assert_close(y_bf16, ref_y_bf16, atol=1e-3, rtol=1.6e-2)
+        torch.testing.assert_close(
+            y_bf16_Y_preallocated, ref_y_bf16, atol=1e-3, rtol=1.6e-2
+        )
 
 
 if __name__ == "__main__":

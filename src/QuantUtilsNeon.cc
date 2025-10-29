@@ -6,13 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "fbgemm/Utils.h"
+#if defined(__aarch64__)
 
-#if HAVE_SVE
+#include "fbgemm/Utils.h"
 
 #define FBGEMM_EXPORTS
 #include <arm_neon.h> // @manual
+#if HAVE_SVE
 #include <arm_sve.h> // @manual
+#endif
 
 #include <arm_neon_sve_bridge.h> // @manual
 #include <algorithm> //for std::min/std::max
@@ -30,6 +32,50 @@ namespace fbgemm {
 using namespace std;
 ////////////////////////////////////////////////////////////////////////////////
 // Utility functions
+
+void FindMinMax(const float* m, float* min, float* max, int64_t len) {
+  if (__builtin_expect(len <= 0, 0)) {
+    *min = 0.0f;
+    *max = 0.0f;
+    return;
+  }
+
+  float first = *m;
+
+  float32x4_t temp_min_0 = vdupq_n_f32(first);
+  float32x4_t temp_min_1 = vdupq_n_f32(first);
+  float32x4_t temp_max_0 = vdupq_n_f32(first);
+  float32x4_t temp_max_1 = vdupq_n_f32(first);
+  uint64_t i = 0;
+  uint64_t count = static_cast<uint64_t>(len);
+  uint64_t loopBound = count - (count % 8);
+
+  for (; i < loopBound; i += 8) {
+    float32x4_t v0 = vld1q_f32(m + i);
+    float32x4_t v1 = vld1q_f32(m + i + 4);
+    temp_min_0 = vminq_f32(temp_min_0, v0);
+    temp_min_1 = vminq_f32(temp_min_1, v1);
+    temp_max_0 = vmaxq_f32(temp_max_0, v0);
+    temp_max_1 = vmaxq_f32(temp_max_1, v1);
+  }
+
+  temp_min_0 = vminq_f32(temp_min_0, temp_min_1);
+  temp_max_0 = vmaxq_f32(temp_max_0, temp_max_1);
+
+  float tmp_min_s = vminvq_f32(temp_min_0);
+  float tmp_max_s = vmaxvq_f32(temp_max_0);
+
+  for (; i < count; i++) {
+    float tmp = *m;
+    tmp_min_s = std::min(tmp_min_s, tmp);
+    tmp_max_s = std::max(tmp_max_s, tmp);
+  }
+
+  *min = tmp_min_s;
+  *max = tmp_max_s;
+}
+
+#if HAVE_SVE
 
 template <typename OutputType>
 void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfNeon(
@@ -59,7 +105,8 @@ void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfNeon(
     svfloat32_t bias_v = svdup_n_f32(bias);
 
     float32x4x2_t* output_row_v = reinterpret_cast<float32x4x2_t*>(output_row);
-    float16x8_t* output_row_v_half = reinterpret_cast<float16x8_t*>(output_row);
+    float16x4x2_t* output_row_v_half =
+        reinterpret_cast<float16x4x2_t*>(output_row);
 
     size_t colIndex = 0;
     for (size_t colMax = output_columns / 8;
@@ -81,37 +128,41 @@ void Fused8BitRowwiseQuantizedSBFloatToFloatOrHalfNeon(
         output_row_v[colIndex].val[0] = svget_neonq(in_v_0_f);
         output_row_v[colIndex].val[1] = svget_neonq(in_v_1_f);
       } else {
+        float16x4_t dequantzed_v_half_low = vcvt_f16_f32(svget_neonq(in_v_0_f));
+        float16x4_t dequantzed_v_half_high =
+            vcvt_f16_f32(svget_neonq(in_v_1_f));
+        output_row_v_half[colIndex].val[0] = dequantzed_v_half_low;
+        output_row_v_half[colIndex].val[1] = dequantzed_v_half_high;
+      }
+    }
+
+    if (output_columns_mod != 0) {
+      svuint32_t in_v_0 = svld1ub_u32(
+          lastPredA,
+          reinterpret_cast<const uint8_t*>(input_row_v_0 + colIndex));
+      svuint32_t in_v_1 = svld1ub_u32(
+          lastPredB,
+          reinterpret_cast<const uint8_t*>(input_row_v_1 + colIndex));
+      svfloat32_t in_v_0_f = svcvt_f32_u32_x(lastPredA, in_v_0);
+      svfloat32_t in_v_1_f = svcvt_f32_u32_x(lastPredB, in_v_1);
+
+      in_v_0_f = svmad_f32_m(lastPredA, in_v_0_f, scale_v, bias_v);
+      in_v_1_f = svmad_f32_m(lastPredB, in_v_1_f, scale_v, bias_v);
+
+      if constexpr (std::is_same<OutputType, float>()) {
+        svst1_f32(lastPredA, (float32_t*)&(output_row_v[colIndex]), in_v_0_f);
+        svst1_f32(
+            lastPredB, (float32_t*)&(output_row_v[colIndex].val[1]), in_v_1_f);
+      } else {
         float16x4_t dequantzed_v_half_low_low =
             vcvt_f16_f32(svget_neonq(in_v_0_f));
         float16x8_t dequantzed_v_half_low =
             vcvt_high_f16_f32(dequantzed_v_half_low_low, svget_neonq(in_v_1_f));
-        output_row_v_half[colIndex] = dequantzed_v_half_low;
+        svst1_f16(
+            lastPredC,
+            (float16_t*)&(output_row_v_half[colIndex]),
+            svset_neonq_f16(svundef_f16(), dequantzed_v_half_low));
       }
-    }
-
-    svuint32_t in_v_0 = svld1ub_u32(
-        lastPredA, reinterpret_cast<const uint8_t*>(input_row_v_0 + colIndex));
-    svuint32_t in_v_1 = svld1ub_u32(
-        lastPredB, reinterpret_cast<const uint8_t*>(input_row_v_1 + colIndex));
-    svfloat32_t in_v_0_f = svcvt_f32_u32_x(lastPredA, in_v_0);
-    svfloat32_t in_v_1_f = svcvt_f32_u32_x(lastPredB, in_v_1);
-
-    in_v_0_f = svmad_f32_m(lastPredA, in_v_0_f, scale_v, bias_v);
-    in_v_1_f = svmad_f32_m(lastPredB, in_v_1_f, scale_v, bias_v);
-
-    if constexpr (std::is_same<OutputType, float>()) {
-      svst1_f32(lastPredA, (float32_t*)&(output_row_v[colIndex]), in_v_0_f);
-      svst1_f32(
-          lastPredB, (float32_t*)&(output_row_v[colIndex].val[1]), in_v_1_f);
-    } else {
-      float16x4_t dequantzed_v_half_low_low =
-          vcvt_f16_f32(svget_neonq(in_v_0_f));
-      float16x8_t dequantzed_v_half_low =
-          vcvt_high_f16_f32(dequantzed_v_half_low_low, svget_neonq(in_v_1_f));
-      svst1_f16(
-          lastPredC,
-          (float16_t*)&(output_row_v_half[colIndex]),
-          svset_neonq_f16(svundef_f16(), dequantzed_v_half_low));
     }
 
     input_row_v_0 = reinterpret_cast<const uint64_t*>(
@@ -135,6 +186,8 @@ INSTANTIATE_QuantizationNeonFunctions8Bits(float)
 INSTANTIATE_QuantizationNeonFunctions8Bits(float16)
 // clang-format on
 #undef INSTANTIATE_QuantizationNeonFunctions8Bits
+
+#endif // HAVE_SVE
 
 } // namespace fbgemm
 

@@ -42,12 +42,19 @@ void _to_dense_representation(
     const int64_t num_lengths,
     const SegmentValueType* const segment_value_data,
     const SegmentLengthType* const segment_lengths_data,
-    SegmentValueType* const dense_segment_value_data) {
+    SegmentValueType* const dense_segment_value_data,
+    const int64_t num_segment_value) {
   int k = 0;
   for (const auto i : c10::irange(num_lengths)) {
     if (segment_lengths_data[i] == 1) {
       // Add 1 to distinguish between 0 inserted by densification vs. original
       // value.
+      TORCH_CHECK(
+          k < num_segment_value,
+          "k should be less than num_segment_value ",
+          num_segment_value,
+          " but found k = ",
+          k);
       dense_segment_value_data[i] = segment_value_data[k] + 1;
     } else {
       dense_segment_value_data[i] = 0;
@@ -943,7 +950,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> permute_1D_sparse_data_cpu(
         FBGEMM_DISPATCH_ALL_TYPES(
             indices.scalar_type(), "permute_1D_indices_weights_kernel_2", [&] {
               using indices_t = scalar_t;
-              FBGEMM_DISPATCH_FLOAT_ONLY(
+              FBGEMM_DISPATCH_FLOAT_AND_DOUBLE(
                   weights.has_value() ? weights.value().scalar_type()
                                       : at::ScalarType::Float,
                   "permute_1D_indices_weights_kernel_3",
@@ -1386,9 +1393,9 @@ void _block_bucketize_sparse_features_2d_weights_cpu_kernel(
     const std::optional<Tensor>& total_num_blocks,
     const int64_t my_size,
     const int64_t weights_dim,
-    Tensor new_lengths,
-    Tensor new_indices,
-    Tensor new_weights,
+    const Tensor& new_lengths,
+    const Tensor& new_indices,
+    const Tensor& new_weights,
     std::optional<Tensor> new_pos,
     const std::optional<Tensor>& unbucketize_permute,
     const std::optional<Tensor>& batch_size_per_feature,
@@ -1417,8 +1424,8 @@ void _block_bucketize_sparse_features_2d_weights_cpu_kernel(
   const index_t* const block_sizes_data = block_sizes.data_ptr<index_t>();
   offset_t* batch_sizes_data = nullptr;
   const auto variable_batch_size = batch_size_per_feature.has_value();
-  const auto variable_bucket_sizes = block_bucketize_pos.has_value() &&
-      block_bucketize_pos.value().size() != 0;
+  const auto variable_bucket_sizes =
+      block_bucketize_pos.has_value() && !block_bucketize_pos.value().empty();
   using uindex_t = std::make_unsigned_t<index_t>;
   using uoffset_t = std::make_unsigned_t<offset_t>;
   std::vector<int64_t> lower_bounds(indices.numel(), 0);
@@ -2504,7 +2511,8 @@ std::tuple<Tensor, Tensor> histogram_binning_calibration_by_feature_cpu(
                   segment_lengths.numel(),
                   segment_value.data_ptr<segment_value_t>(),
                   segment_lengths.data_ptr<segment_length_t>(),
-                  dense_segment_value.data_ptr<segment_value_t>());
+                  dense_segment_value.data_ptr<segment_value_t>(),
+                  segment_value.numel());
             });
       });
 
@@ -2613,6 +2621,16 @@ std::tuple<Tensor, Tensor> generic_histogram_binning_calibration_by_feature_cpu(
   // dense_segment_value is used as a temporary storage.
   Tensor dense_segment_value =
       at::empty({logit.numel()}, segment_value.options());
+
+  // _to_dense_representation will access dense_segment_value[i] where i <=
+  // num_length, so num_length should be within the range of dense_segment_value
+  TORCH_CHECK(
+      segment_lengths.numel() <= dense_segment_value.numel(),
+      "segment_lengths numel (num_length) should be less than dense_segment_value numel of ",
+      dense_segment_value.numel(),
+      " but found num_length = ",
+      segment_lengths.numel());
+
   AT_DISPATCH_INDEX_TYPES(
       segment_value.scalar_type(), "to_dense_representation_cpu_wrapper", [&] {
         using segment_value_t = index_t;
@@ -2623,7 +2641,8 @@ std::tuple<Tensor, Tensor> generic_histogram_binning_calibration_by_feature_cpu(
                   segment_lengths.numel(),
                   segment_value.data_ptr<segment_value_t>(),
                   segment_lengths.data_ptr<segment_length_t>(),
-                  dense_segment_value.data_ptr<segment_value_t>());
+                  dense_segment_value.data_ptr<segment_value_t>(),
+                  segment_value.numel());
             });
       });
 
@@ -2971,7 +2990,7 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> permute_sparse_features_cpu(
   permuted_indices = at::empty(permuted_lengths_sum, indices.options());
   AT_DISPATCH_INDEX_TYPES(
       input_offsets.scalar_type(), "permute_data_kernel_1", ([&] {
-        FBGEMM_DISPATCH_FLOAT_ONLY(
+        FBGEMM_DISPATCH_FLOAT_AND_DOUBLE(
             weights.has_value() ? weights.value().scalar_type()
                                 : at::ScalarType::Float,
             "permute_data_kernel_2",
@@ -3215,8 +3234,9 @@ Tensor pack_segments_forward_cpu(
       t_in.dtype() == at::ScalarType::Float ||
           t_in.dtype() == at::ScalarType::Double ||
           t_in.dtype() == at::ScalarType::Half ||
-          t_in.dtype() == at::ScalarType::BFloat16,
-      "t_in must be of type float, double, half, or bfloat16");
+          t_in.dtype() == at::ScalarType::BFloat16 ||
+          t_in.dtype() == at::ScalarType::Int,
+      "t_in must be of type float, double, half, bfloat16, or int");
   TORCH_CHECK_GT(max_length, 0);
 
   const auto t_in_cont = t_in.expect_contiguous();
