@@ -78,6 +78,8 @@ if(HIP_FOUND)
   list(APPEND HIP_CXX_FLAGS -mf16c)
   list(APPEND HIP_CXX_FLAGS -mfma)
   list(APPEND HIP_CXX_FLAGS -std=c++20)
+  list(APPEND HIP_CXX_FLAGS -g)
+  list(APPEND HIP_CXX_FLAGS -ggdb)
 
   set(HIP_HCC_FLAGS ${HIP_CXX_FLAGS})
   # Ask hcc to generate device code during compilation so we can use
