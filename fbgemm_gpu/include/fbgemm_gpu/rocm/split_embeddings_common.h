@@ -55,6 +55,33 @@ __device__ int32x4_t amdgcn_make_buffer_resource(const T* addr) {
   return buffer_resource.content;
 }
 
+template <typename T>
+__device__ int32x4_t amdgcn_make_buffer_resource_with_stride(
+    const T* addr,
+    int32_t stride_in_elements,
+    int32_t num_records) {
+  
+  int32x4_t descriptor;
+  uint64_t addr_u64 = reinterpret_cast<uint64_t>(const_cast<T*>(addr));
+  
+  // Word 0: Base address [31:0]
+  descriptor[0] = static_cast<int32_t>(addr_u64 & 0xFFFFFFFF);
+  
+  // Word 1: Address[47:32] | Stride[61:48]
+  uint32_t addr_high = (addr_u64 >> 32) & 0xFFFF;
+  uint32_t stride_bytes = stride_in_elements * sizeof(T);
+  descriptor[1] = addr_high | ((stride_bytes & 0x3FFF) << 16);
+  
+  // Word 2: Num_records in bytes
+  descriptor[2] = num_records * sizeof(T);
+  
+  // Word 3: Config
+  descriptor[3] = AMDGCN_BUFFER_RES_3;
+  
+  return descriptor;
+}
+
+
 // buffer load fp32
 __device__ half llvm_amdgcn_raw_buffer_load_fp16(
     int32x4_t srsrc,
@@ -109,31 +136,39 @@ struct load_row_per_warp {
       int lane_id) {}
 };
 
+// Load: float with optional 160 optimization
 template <int32_t embedding_dim, typename index_t>
 struct load_row_per_warp<float, embedding_dim, index_t> {
   static constexpr int dword_per_row =
       (embedding_dim + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+  
   static __device__ void run(
       float* emb_data,
       index_t row_index,
       const float* p_emb_table,
       int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * embedding_dim);
+    
+    if constexpr (embedding_dim == 160) {
+      // Try buffer resource optimization (may not work, kept for testing)
+      int32x4_t emb_res = amdgcn_make_buffer_resource_with_stride(
+          p_emb_table + row_index * 192, 192, 160);
 #pragma unroll
-    for (int i = 0; i < dword_per_row; i++) {
-      if constexpr (embedding_dim == 160) {
-        emb_data[i] = ((lane_id + i * THREADS_PER_ROW) < 160)
-            ? llvm_amdgcn_raw_buffer_load_fp32(
-                emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0)
-            : 0.f;
-      } else {
+      for (int i = 0; i < dword_per_row; i++) {
+        emb_data[i] = llvm_amdgcn_raw_buffer_load_fp32(
+            emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0);
+      }
+    } else {
+      int32x4_t emb_res =
+          amdgcn_make_buffer_resource(p_emb_table + row_index * embedding_dim);
+#pragma unroll
+      for (int i = 0; i < dword_per_row; i++) {
         emb_data[i] = llvm_amdgcn_raw_buffer_load_fp32(
             emb_res, (lane_id + i * THREADS_PER_ROW) * sizeof(float), 0, 0);
       }
     }
   }
 };
+
 
 template <typename index_t>
 struct load_row_per_warp<half, 64, index_t> {
@@ -161,15 +196,18 @@ template <typename index_t>
 struct load_row_per_warp<half, 160, index_t> {
   static __device__ void
   run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 192);
+    // Try buffer resource optimization
+    int32x4_t emb_res = amdgcn_make_buffer_resource_with_stride(
+        p_emb_table + row_index * 192, 192, 160);
+    
     *reinterpret_cast<half2*>(emb_data) = llvm_amdgcn_raw_buffer_load_fp16x2(
         emb_res, lane_id * sizeof(half2), 0, 0);
-    emb_data[2] = (lane_id < 32) 
-        ? llvm_amdgcn_raw_buffer_load_fp16(emb_res, (lane_id + 128) * sizeof(half), 0, 0)
-        : __float2half(0.0);
+    
+    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp16(
+        emb_res, (lane_id + 128) * sizeof(half), 0, 0);
   }
 };
+
 
 template <typename index_t>
 struct load_row_per_warp<half, 192, index_t> {
@@ -291,9 +329,11 @@ struct store_row_per_warp {
       (embedding_dim + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
   static __device__ void run(output_t* acc, output_t* p_output, int lane_id) {
     if constexpr (embedding_dim == 160) {
+#pragma unroll
       for (int i = 0; i < dword_per_row; i++) {
-        if ((lane_id + i * THREADS_PER_ROW) % 192 < 160) {
-          p_output[lane_id + i * THREADS_PER_ROW] = acc[i];
+        int offset = lane_id + i * THREADS_PER_ROW;
+        if (offset < 160) {
+          p_output[offset] = acc[i];
         }
       }
     } else {
@@ -350,6 +390,7 @@ struct store_row_per_warp<half, 128, float> {
 template <>
 struct store_row_per_warp<half, 160, float> {
   static __device__ void run(float* acc, float* p_output, int lane_id) {
+    // Keep branch for safety
     int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
     llvm_amdgcn_raw_buffer_store_fp32x2(
         *reinterpret_cast<floatx2_t*>(acc),
@@ -357,7 +398,7 @@ struct store_row_per_warp<half, 160, float> {
         lane_id * sizeof(floatx2_t),
         0,
         0);
-    if ((lane_id + 128) % 192 < 160) {
+    if ((lane_id + 128) < 160) {
       llvm_amdgcn_raw_buffer_store_fp32(
           acc[2], out_res, (lane_id + 128) * sizeof(float), 0, 0);
     }
