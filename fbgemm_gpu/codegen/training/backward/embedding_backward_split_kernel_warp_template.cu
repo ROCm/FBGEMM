@@ -480,7 +480,7 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
         } else {
             s_{{ tensor }} = &{{ tensor }}_uvm[s_{{ tensor }}_offset];
         }
-        {{ args.split_tensor_types[tensor] }} s_{{tensor}}_val = is_valid? s_{{tensor}}[s_t_0] : 0;
+        {{ args.split_tensor_types[tensor] }} s_{{tensor}}_val = is_valid? s_{{tensor}}[s_idx] : 0;
 
         {%- endfor %}
 
