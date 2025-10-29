@@ -1388,6 +1388,7 @@ Tensor {{ embedding_cuda_op }}(
                     {%- endif %}
                     {%- if is_optimized_hip_kernel_supported_mode %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
                     if (use_hip_kernel && mixed_D) {
                         backward_warp_per_row_kernel =
                         {{ hip_mixed_d_warp_kernel }}
