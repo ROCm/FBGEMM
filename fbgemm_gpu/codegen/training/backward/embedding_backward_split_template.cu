@@ -1254,7 +1254,7 @@ Tensor {{ embedding_cuda_op }}(
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
                     {%- endif %}
 
-                    printf("%s:%d %d\n", __FILE__, __LINE__, num_cta_per_row_groups);
+                    //  printf("%s:%d %d\n", __FILE__, __LINE__, num_cta_per_row_groups);
                     // Compute shared memory size for cta_per_row
                     constexpr auto kCacheAccBytes = sizeof(at::acc_type<cache_t, true>);
                     const size_t cta_per_row_smem_bytes = compute_num_groups_and_dynamic_smem_bytes(
@@ -1388,7 +1388,7 @@ Tensor {{ embedding_cuda_op }}(
                     {%- endif %}
                     {%- if is_optimized_hip_kernel_supported_mode %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
-                    printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
+                    // printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
                     if (use_hip_kernel && mixed_D) {
                         backward_warp_per_row_kernel =
                         {{ hip_mixed_d_warp_kernel }}
@@ -1417,7 +1417,7 @@ Tensor {{ embedding_cuda_op }}(
                                 false>;
 
                             blockSize = dim3(32, num_warp_per_row_groups);
-                            printf("%s:%d warp kernel %d\n", __FILE__, __LINE__, num_warp_per_row_groups);
+                            // printf("%s:%d warp kernel %d\n", __FILE__, __LINE__, num_warp_per_row_groups);
                         }
                     }
                     {%- else %}
