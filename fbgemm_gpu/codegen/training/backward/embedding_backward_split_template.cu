@@ -1229,7 +1229,7 @@ Tensor {{ embedding_cuda_op }}(
                              32,
                              false>;
 
-                        auto cta_blockSize = dim3(32, num_cta_per_row_groups);
+                        cta_blockSize = dim3(32, num_cta_per_row_groups);
                     }
                     {%- else %}
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
