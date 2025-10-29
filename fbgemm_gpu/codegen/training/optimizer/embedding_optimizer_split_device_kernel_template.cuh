@@ -11,6 +11,14 @@
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
 
+{%- set is_optimized_hip_kernel_supported_mode = is_rocm and
+                                                 optimizer == "rowwise_adagrad" and
+                                                 not dense and
+                                                 not is_index_select and
+                                                 not is_gwd_kernel and
+                                                 not vbe and
+                                                 not ssd %}
+
 template<int32_t kThreadGroupSize, typename T>
 DEVICE_INLINE __device__ T subwarp_reduce_add(T value) {
     static_assert(kThreadGroupSize == 8 || kThreadGroupSize == 16 || kThreadGroupSize == 32 || kThreadGroupSize == 64, "Wavefront size must be 16/32/64");
@@ -202,6 +210,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {{ split_post_update }}
 }
 
+{%- if is_optimized_hip_kernel_supported_mode %}
 template <
     typename emb_t,
     typename cache_t,
@@ -242,6 +251,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     {%- for tensor in args.split_tensors %}
     const int32_t {{ tensor }}_placement,
     const int64_t {{ tensor }}_offset,
+    const int64_t {{ tensor }}_val,
     {%- endfor %}
     {{ args.split_ref_kernel_args | replace_pta_namespace() | join(",\n    ") }}
 ) {
@@ -303,7 +313,7 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
     [[maybe_unused]] constexpr auto enable_optimizer_offloading = false;
     {%- endif %}
 
-    {{ split_precomputation }}
+    {{ split_precomputation_preload }}
 
     {# /* Note: technically, global weight decay (gwd) compensation should be done before
     `split_precomputation`). But since decouple mode in `rowwise_adagrad` only computes correction,
@@ -358,5 +368,6 @@ DEVICE_INLINE void {{ mdesc }}_{{ optimizer }}_table_update_kernel(
 
     {{ split_post_update }}
 }
+{%- endif %}
 
 // clang-format on

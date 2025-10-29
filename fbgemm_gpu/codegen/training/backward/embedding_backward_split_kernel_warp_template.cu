@@ -438,7 +438,7 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
       ? smem.getPointer() + threadIdx.y * grad_sum_stride
       : nullptr;
 
-    constexpr int num_unroll = 32;
+    constexpr int num_unroll = kThreadGroupSize;
 
     auto num_run_id = min(sorted_linear_indices_run.size(0), sorted_linear_indices_num_runs[0]);
 
@@ -472,17 +472,17 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
         int32_t s_weights_placement = is_valid? weights_placements[s_t_0] : 0;
 
         {%- for tensor in args.split_tensors %}
-        {{ args.split_tensor_types[tensor] }}* __restrict__ {{ tensor }};
+        {{ args.split_tensor_types[tensor] }}* __restrict__ s_{{ tensor }};
         const auto s_{{ tensor }}_placement = {{ tensor }}_placements[s_t_0];
         const int64_t s_{{ tensor }}_offset = {{ tensor }}_offsets[s_t_0];
-        {%- endfor %}
+        if (static_cast<PlacementType>(s_{{ tensor }}_placement) == PlacementType::DEVICE) {
+            s_{{ tensor }} = &{{ tensor }}_dev[s_{{ tensor }}_offset];
+        } else {
+            s_{{ tensor }} = &{{ tensor }}_uvm[s_{{ tensor }}_offset];
+        }
+        {{ args.split_tensor_types[tensor] }} s_{{tensor}}_val = is_valid? s_{{tensor}}[s_t_0] : 0;
 
-        // at::acc_type<cache_t, true>* __restrict__ s_momentum1;
-        // if (static_cast<PlacementType>(s_momentum1_placement) == PlacementType::DEVICE) {
-        //     s_momentum1 = &momentum1_dev[s_momentum1_offset];
-        // } else {
-        //     s_momentum1 = &momentum1_uvm[s_momentum1_offset];
-        // }
+        {%- endfor %}
 
         for (auto i = 0; i < num_valid_id; ++i) {
             auto segment_start = SUBWARP_SHFL_SYNC(s_segment_start, i);
@@ -504,6 +504,7 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
             {%- for tensor in args.split_tensors %}
             const auto {{ tensor }}_placement = SUBWARP_SHFL_SYNC(s_{{ tensor }}_placement, i);
             const int64_t {{ tensor }}_offset = SUBWARP_SHFL_SYNC(s_{{ tensor }}_offset, i);
+            {{ args.split_tensor_types[tensor] }} {{tensor}}_val = SUBWARP_SHFL_SYNC(s_{{ tensor }}_val, i);
             {%- endfor %}
 
             // const int64_t momentum1_offset = SHFL_SYNC(s_momentum1_offset, i);
@@ -606,6 +607,7 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
                   {%- for tensor in args.split_tensors %}
                   {{ tensor }}_placement,
                   {{ tensor }}_offset,
+                  {{ tensor }}_val,
                   {%- endfor %}
                   {{ args.split_kernel_arg_names | join(", ") }}
             );
