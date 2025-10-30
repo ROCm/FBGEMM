@@ -1386,8 +1386,8 @@ Tensor {{ embedding_cuda_op }}(
                     {%- else %}
                         int32_t num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
                     {%- endif %}
-                    {%- if is_optimized_hip_kernel_supported_mode %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
+                    {%- if is_optimized_hip_kernel_supported_mode %}
                     // printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
                     if (use_hip_kernel && mixed_D) {
                         backward_warp_per_row_kernel =
@@ -1415,16 +1415,13 @@ Tensor {{ embedding_cuda_op }}(
                                 1,
                                 32,
                                 false>;
-
                             blockSize = dim3(32, num_warp_per_row_groups);
                             // printf("%s:%d warp kernel %d\n", __FILE__, __LINE__, num_warp_per_row_groups);
                         }
                     }
-                    {%- else %}
-                    // Compute shared memory size for warp_per_row
-                    auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
-
                     {%- endif %}
+                    // Compute shared memory size for warp_per_row
+
                     int32_t warp_per_row_smem_bytes = 0;
 
                     if constexpr (kUseVecBlocking) {
