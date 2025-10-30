@@ -53,7 +53,6 @@ using namespace fbgemm_gpu;
                                                  not dense and 
                                                  not is_index_select and
                                                  not is_gwd_kernel and 
-                                                 not vbe and
                                                  not nobag and 
                                                  not ssd %}
 
@@ -1389,7 +1388,11 @@ Tensor {{ embedding_cuda_op }}(
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
                     {%- if is_optimized_hip_kernel_supported_mode %}
                     // printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
+                    {%- if vbe %}
+                    if (use_hip_kernel) {
+                    {%- else %}
                     if (use_hip_kernel && mixed_D) {
+                    {%- endif %}
                         backward_warp_per_row_kernel =
                         {{ hip_mixed_d_warp_kernel }}
                             <emb_t,

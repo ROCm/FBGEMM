@@ -38,7 +38,6 @@
                                                  not is_index_select and
                                                  not is_gwd_kernel and
                                                  not nobag and 
-                                                 not vbe and
                                                  not ssd %}
 
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
@@ -444,7 +443,7 @@ hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc
     auto num_run_id = min(sorted_linear_indices_run.size(0), sorted_linear_indices_num_runs[0]);
 
     for (uint32_t out_run_id = start_run_id * num_unroll; out_run_id < num_run_id; out_run_id += gridDim.x * blockDim.y * num_unroll) {
-        auto stride = gridDim.x * blockDim.y;
+        // auto stride = gridDim.x * blockDim.y;
         auto num_valid_id = min(num_unroll, num_run_id - out_run_id);
         auto is_valid = threadIdx.x < num_valid_id;
 

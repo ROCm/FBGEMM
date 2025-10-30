@@ -16,7 +16,6 @@
                                                  not dense and
                                                  not is_index_select and
                                                  not is_gwd_kernel and
-                                                 not vbe and
                                                  not ssd %}
 
 template<int32_t kThreadGroupSize, typename T>
