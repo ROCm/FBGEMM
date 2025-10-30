@@ -803,13 +803,13 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
         self.dims: list[int] = dims
         assert T_ > 0
         # mixed D is not supported by no bag kernels
-        mixed_D = False
+        self.mixed_D = False
         D = self.dims[0]
         for d in self.dims:
             if d != D:
-                mixed_D = True
+                self.mixed_D = True
                 break
-        if mixed_D:
+        if self.mixed_D:
             assert (
                 self.pooling_mode != PoolingMode.NONE
             ), "Mixed dimension tables only supported for pooling tables."
@@ -845,7 +845,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                 cd == ComputeDevice.CUDA for cd in compute_devices
             ), "OptimType.NONE supports only ComputeDevice.CUDA"
             assert (
-                not mixed_D
+                not self.mixed_D
             ), "OptimType.NONE does not support mixed embedding dimension"
 
         if device is None:
@@ -2505,6 +2505,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                         row_counter,
                         iter_int,
                         self.max_counter.item(),
+                        mixed_D = self.mixed_D
                     ),
                 )
             elif self._used_rowwise_adagrad_with_global_weight_decay:
@@ -2523,6 +2524,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                         #  `Optional[Tensor]` but got `Union[Module, Tensor]`.
                         prev_iter_dev=self.prev_iter_dev,
                         gwd_lower_bound=self.gwd_lower_bound,
+                        mixed_D = self.mixed_D
                     ),
                 )
             else:
@@ -2532,6 +2534,7 @@ class SplitTableBatchedEmbeddingBagsCodegen(nn.Module):
                         common_args,
                         self.optimizer_args,
                         momentum1,
+                        mixed_D = self.mixed_D
                     ),
                 )
 
