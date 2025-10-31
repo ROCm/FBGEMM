@@ -1021,13 +1021,6 @@ Tensor {{ embedding_cuda_op }}(
             )
     %}
 
-    {%- set hip_mixed_d_cta_kernel = "hip_mixed_d_split_embedding{}_backward_codegen_{}_{}{}_kernel_cta_per_row_1".format(
-            ndesc,
-            optimizer,
-            wdesc,
-            vdesc,
-            )
-    %}
     {%- endif %}
 
     AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "{{ embedding_cuda_op }}_2", [&] {
@@ -1253,7 +1246,6 @@ Tensor {{ embedding_cuda_op }}(
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
                     {%- endif %}
 
-                    //  printf("%s:%d %d\n", __FILE__, __LINE__, num_cta_per_row_groups);
                     // Compute shared memory size for cta_per_row
                     constexpr auto kCacheAccBytes = sizeof(at::acc_type<cache_t, true>);
                     const size_t cta_per_row_smem_bytes = compute_num_groups_and_dynamic_smem_bytes(
@@ -1387,7 +1379,6 @@ Tensor {{ embedding_cuda_op }}(
                     {%- endif %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
                     {%- if enable_optimized_hip_mixed_D_kernel %}
-                    // printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
                     {%- if vbe %}
                     if (use_hip_kernel) {
                     {%- else %}
@@ -1419,7 +1410,6 @@ Tensor {{ embedding_cuda_op }}(
                                 32,
                                 false>;
                             blockSize = dim3(32, num_warp_per_row_groups);
-                            // printf("%s:%d warp kernel %d\n", __FILE__, __LINE__, num_warp_per_row_groups);
                         }
                     }
                     {%- endif %}
