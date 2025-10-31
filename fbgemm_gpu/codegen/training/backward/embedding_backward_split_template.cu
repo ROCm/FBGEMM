@@ -48,13 +48,13 @@ using namespace fbgemm_gpu;
     has_global_weight_decay_support,
     ssd) %}
 {%- set desc_suffix = get_desc_suffix(is_gwd_kernel) %}
-{%- set is_optimized_hip_kernel_supported_mode = is_rocm and 
-                                                 optimizer == "rowwise_adagrad" and 
-                                                 not dense and 
-                                                 not is_index_select and
-                                                 not is_gwd_kernel and 
-                                                 not nobag and 
-                                                 not ssd %}
+{%- set enable_optimized_hip_mixed_D_kernel = is_rocm and
+                                              not is_gwd_kernel and
+                                              not nobag and 
+                                              not is_index_select and
+                                              not ssd and
+                                              optimizer == "rowwise_adagrad" and
+                                              not dense %}
 
 template <
     typename emb_t,
@@ -308,7 +308,7 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
 );
 {%- endif %}
 
-{%- if is_optimized_hip_kernel_supported_mode %}
+{%- if enable_optimized_hip_mixed_D_kernel %}
 
 template <
     typename emb_t,
@@ -1012,7 +1012,7 @@ Tensor {{ embedding_cuda_op }}(
     %}
     {%- endif %}
 
-    {%- if is_optimized_hip_kernel_supported_mode %}
+    {%- if enable_optimized_hip_mixed_D_kernel %}
     {%- set hip_mixed_d_warp_kernel = "hip_mixed_d_split_embedding{}_backward_codegen_{}_{}{}_kernel_warp_per_row_1".format(
             ndesc,
             optimizer,
@@ -1180,7 +1180,7 @@ Tensor {{ embedding_cuda_op }}(
                     {use_deterministic_algorithms ? 0 : grad_accum_counter.numel(), max_D},
                     aligned_grad_output.options().dtype(std::is_same<cache_t, double>::value ? at::kDouble : at::kFloat));
 
-                {%- if is_optimized_hip_kernel_supported_mode %}
+                {%- if enable_optimized_hip_mixed_D_kernel %}
                 const static auto use_hip_kernel = fbgemm_gpu::config::is_feature_enabled(fbgemm_gpu::config::FeatureGateName::TBE_ROCM_HIP_BACKWARD_KERNEL);
                 {%- endif %}
                 
@@ -1231,7 +1231,7 @@ Tensor {{ embedding_cuda_op }}(
                         int32_t num_cta_per_row_groups = kMaxThreads / kWarpSize;
                         int32_t work_group_size = kMaxThreads;
                     {%- endif %}
-                    {%- if is_optimized_hip_kernel_supported_mode %}
+                    {%- if enable_optimized_hip_mixed_D_kernel %}
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
                     if (max_D <= 128) {
                         backward_cta_per_row_kernel =
@@ -1386,7 +1386,7 @@ Tensor {{ embedding_cuda_op }}(
                         int32_t num_warp_per_row_groups = kBackwardMaxThreads / kThreadGroupSize;
                     {%- endif %}
                     auto blockSize = dim3(kThreadGroupSize, num_warp_per_row_groups);
-                    {%- if is_optimized_hip_kernel_supported_mode %}
+                    {%- if enable_optimized_hip_mixed_D_kernel %}
                     // printf("%s:%d warp kernel %d %d %d\n", __FILE__, __LINE__, num_warp_per_row_groups, use_hip_kernel, mixed_D);
                     {%- if vbe %}
                     if (use_hip_kernel) {

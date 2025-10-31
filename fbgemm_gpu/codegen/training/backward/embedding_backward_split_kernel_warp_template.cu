@@ -32,13 +32,13 @@
 
 {%- set locs_or_addrs_tensor = "ssd_row_addrs" if ssd else "lxu_cache_locations" %}
 {%- set locs_or_addrs_type = "int64_t" if ssd else "int32_t" %}
-{%- set is_optimized_hip_kernel_supported_mode = is_rocm and
-                                                 optimizer == "rowwise_adagrad" and
-                                                 not dense and
-                                                 not is_index_select and
-                                                 not is_gwd_kernel and
-                                                 not nobag and 
-                                                 not ssd %}
+{%- set enable_optimized_hip_mixed_D_kernel = is_rocm and
+                                              not is_gwd_kernel and
+                                              not nobag and 
+                                              not is_index_select and
+                                              not ssd and
+                                              optimizer == "rowwise_adagrad" and
+                                              not dense %}
 
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
@@ -340,7 +340,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     }
 }
 
-{%- if is_optimized_hip_kernel_supported_mode %}
+{%- if enable_optimized_hip_mixed_D_kernel %}
 template <
     typename emb_t,
     typename grad_t,
@@ -757,7 +757,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
     {%- endif %}
 );
 
-{%- if is_optimized_hip_kernel_supported_mode %}
+{%- if enable_optimized_hip_mixed_D_kernel %}
 
 template __global__ __launch_bounds__(kBackwardMaxThreads) void
 hip_mixed_d_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vdesc }}_kernel_warp_per_row_1
