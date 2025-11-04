@@ -16,6 +16,8 @@
 #}
 
 {%- set wdesc =  "weighted" if weighted else "unweighted" %}
+{%- set vdesc = "_vbe" if vbe else "" %}
+{%- set desc_suffix = wdesc + vdesc %}
 #include "fbgemm_gpu/embedding_forward_template_helpers.cuh"
 
 using namespace fbgemm_gpu;
@@ -728,7 +730,7 @@ template <
     bool USE_LXU_CACHE
     >
 __launch_bounds__(kForwardMaxThreads, 2048 / kForwardMaxThreads)
-__global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
+__global__ void split_embedding_codegen_forward_{{ desc_suffix }}_v2_kernel(
     const emb_t* __restrict__ const dev_weights,
     const emb_t* __restrict__ const uvm_weights,
     const cache_t* __restrict__ const lxu_cache_weights,
@@ -737,7 +739,15 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     const uint32_t T,
     const bool mean_pooling,
     const uint32_t max_D_cache,
+    {%- if vbe %}
+    const int64_t* __restrict__ const row_output_offsets,
+    const int32_t* __restrict__ const b_t_map,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    const int32_t max_D_warp_num,
+    {%- else %}
     const FixedDivisor fd_num_warps_per_table,
+    {%- endif %}
     const index_t* __restrict__ const indices,
     {%- if weighted %}
     const float* __restrict__ const index_weights,
@@ -767,7 +777,19 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     const auto global_warp_id = blockIdx.x * blockDim.y + threadIdx.y;
     int32_t t;
     int32_t table_warp_id;
+    {%- if vbe %}
+    int32_t b;
+    const auto b_t = global_warp_id / max_D_warp_num;
+    const auto cur_emb_dim_id = global_warp_id % max_D_warp_num;
+    // bounds check b_t < total_B
+    const auto info = reinterpret_cast<const uint32_t*>(&b_t_map[b_t])[0];
+    reinterpret_cast<uint32_t*>(&t)[0] = info >> info_B_num_bits;
+    reinterpret_cast<uint32_t*>(&b)[0] = info & info_B_mask;
+    table_warp_id = b * max_D_warp_num + cur_emb_dim_id;
+
+    {%- else %}
     fd_num_warps_per_table.DivMod(global_warp_id, &t, &table_warp_id);
+    {%- endif %}
 
     if (t >= T) {
       return;
@@ -776,21 +798,43 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     const auto total_L = offsets[(t + 1) * B] - offsets[t * B];
     const auto is_zero_total_L = total_L == 0;
 
+    {%- if vbe %}
+    output_t* output_ = &output[0][row_output_offsets[b_t]];
+    {%- endif %}
+    
     // Short circuit for all zeros
     if (is_zero_total_L) {
       const uint32_t D_start = D_offsets[t] / VEC_WIDTH;
       const uint32_t load_D = (D_offsets[t + 1] / VEC_WIDTH) - D_start;
       const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, kWarpSize);
+
+      {%- if vbe %}
+      if (cur_emb_dim_id >= num_warps_per_row) {
+      {%- else %}
       if (table_warp_id >= num_warps_per_row * B) {
+      {%- endif %}
         return;
       }
+
+      {%- if vbe %}
+      const uint32_t load_d = cur_emb_dim_id * kWarpSize;
+      {%- else %}
       const uint32_t load_d = (table_warp_id % num_warps_per_row) * kWarpSize;
+      {%- endif %}
+
       if (load_d + threadIdx.x < load_D) {
+        {%- if not vbe %}
         const uint32_t b = table_warp_id / num_warps_per_row;
+        {%- endif %}
         const uint32_t total_load_D = D_offsets[T] / VEC_WIDTH;
 
+        {%- if vbe %}
+        output_vec_t* output_ptr = reinterpret_cast<output_vec_t*>(output_) +
+            load_d + threadIdx.x;
+        {%- else %}
         output_vec_t* output_ptr = reinterpret_cast<output_vec_t*>(output) +
             D_start + b * total_load_D + load_d + threadIdx.x;
+        {%- endif %}
 
         // Write zeros to output
         Vec4StepT<1, emb_t> accumulator;
@@ -808,9 +852,10 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     // max(num_warps_per_row) = 8 (for D = 1024)
     // NUM_OFFSETS_PER_WARP = 32
     // Return if table_warp_id > ceil(B / 32) * 8
-    if (is_small_L && table_warp_id >= num_warps_for_small_L * 8) {
-      return;
-    }
+    // todo: check if this is correct for vbe
+    // if (is_small_L && table_warp_id >= num_warps_for_small_L * 8) {
+    //   return;
+    // }
 
     uint32_t load_D = 0;
     uint32_t D_start;
@@ -824,14 +869,23 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
 
     const uint32_t num_warps_per_row = DIV_ROUND_UP(load_D, kWarpSize);
 
-    if (table_warp_id >= num_warps_per_row * (is_small_L ? num_warps_for_small_L : B)) {
-      return;
-    }
+    // todo: check if this is correct for vbe
+    // if (table_warp_id >= num_warps_per_row * (is_small_L ? num_warps_for_small_L : B)) {
+    //   return;
+    // }
 
     // Compute d (same for all Ls)
+    {%- if vbe %}
+    const uint32_t load_d = cur_emb_dim_id * kWarpSize;
+    {%- else %}
     const uint32_t load_d = (table_warp_id % num_warps_per_row) * kWarpSize;
+    {%- endif %}
     // Compute sample ID
+    {%- if vbe %}
+    b = b * (is_small_L ? NUM_OFFSETS_PER_WARP : 1);
+    {%- else %}
     const uint32_t b = table_warp_id / num_warps_per_row * (is_small_L ? NUM_OFFSETS_PER_WARP : 1);
+    {%- endif %}
     uint32_t L = 0;
     uint32_t row_start;
     bool use_lxu_cache = USE_LXU_CACHE;
@@ -855,7 +909,11 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
         *reinterpret_cast<const emb_vec_t**>(&smem[params_offset + SAVED_PARAMS::P_weights]) =
           reinterpret_cast<const emb_vec_t*>(weight) + load_d;
         *reinterpret_cast<output_vec_t**>(&smem[params_offset + SAVED_PARAMS::P_outputs]) =
+        {%- if vbe %}
+        reinterpret_cast<output_vec_t*>(output_) + load_d;
+        {%- else %}
           reinterpret_cast<output_vec_t*>(output) + D_start + b * total_load_D + load_d;
+        {%- endif %}
         {%- if weighted %}
         *reinterpret_cast<const float**>(&smem[params_offset + SAVED_PARAMS::P_index_weights]) =
           index_weights + row_start;
@@ -923,8 +981,13 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     if (L <= 1) {
       total_load_D = shfl_sync(total_load_D, 0);
       D_start = shfl_sync(D_start, 0);
+      {%- if vbe %}
+      output_vec_t* output_ptr = reinterpret_cast<output_vec_t*>(output_) +
+          load_d + threadIdx.x;
+      {%- else %}
       output_vec_t* output_ptr = reinterpret_cast<output_vec_t*>(output) +
           D_start + b * total_load_D + load_d + threadIdx.x;
+      {%- endif %}
       if (L == 0) {
         if (load_d + threadIdx.x < load_D) {
           // Write zeros to output
@@ -1011,7 +1074,7 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
 {%- for use_cache in ['true', 'false'] %}
 
 template __launch_bounds__(kForwardMaxThreads, 2048 / kForwardMaxThreads)
-__global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel
+__global__ void split_embedding_codegen_forward_{{ desc_suffix }}_v2_kernel
 <
     {{ emb_type }},
     {{ cache_type }},

@@ -112,7 +112,15 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     const uint32_t T,
     const bool mean_pooling,
     const uint32_t max_D_cache,
+    {%- if vbe %}
+    const int64_t* __restrict__ const row_output_offsets,
+    const int32_t* __restrict__ const b_t_map,
+    const int32_t info_B_num_bits,
+    const uint32_t info_B_mask,
+    const int32_t max_D_warp_num,
+    {%- else %}
     const FixedDivisor fd_num_warps_per_table,
+    {%- endif %}
     const index_t* __restrict__ const indices,
     {%- if weighted %}
     const float* __restrict__ const index_weights,
@@ -707,7 +715,7 @@ batch_index_select_dim0_codegen_forward_cuda(
             const auto grid = min(
               div_round_up(total_B, kForwardMaxThreads / kThreadGroupSize),
               utils::cuda::get_max_thread_blocks(at::cuda::getCurrentCUDAStream()));
-
+            {%- if dense %}
             FBGEMM_LAUNCH_KERNEL(
               ({{ mdesc }}_embedding_codegen_forward_{{ desc_suffix }}_kernel
                 <emb_t,
@@ -761,7 +769,53 @@ batch_index_select_dim0_codegen_forward_cuda(
               {%- endif %} // if not dense
               PTA_B(output, output_t, 2, 64)
             );
+            {%- else %}
 
+            // Allocate num warps per table based on max_D
+            const int num_warps_per_table = B * div_round_up(max_D, kWarpSize * 4);
+            const uint32_t num_warps_per_threadblock = kForwardMaxThreads / kWarpSize;
+
+            const auto kernel_func =
+              (use_lxu_cache ? split_embedding_codegen_forward_{{ wdesc }}_v2_kernel<
+                                  emb_t, cache_t, output_t, index_t, true>
+                              : split_embedding_codegen_forward_{{ wdesc }}_v2_kernel<
+                                  emb_t, cache_t, output_t, index_t, false>);
+
+            FBGEMM_LAUNCH_KERNEL(
+              kernel_func,
+              div_round_up(total_B * div_round_up(max_D, kWarpSize * 4), num_warps_per_threadblock),
+              dim3(kWarpSize, num_warps_per_threadblock),
+              0,
+              at::cuda::getCurrentCUDAStream(),
+              dev_weights.data_ptr<emb_t>(),
+              uvm_weights.data_ptr<emb_t>(),
+              lxu_cache_weights.data_ptr<cache_t>(),
+              weights_placements.data_ptr<int32_t>(),
+              B,
+              T,
+              static_cast<PoolingMode>(pooling_mode) == PoolingMode::MEAN,
+              use_lxu_cache ? lxu_cache_weights.size(1) : 0,
+              {%- if vbe %}
+              vbe_row_output_offsets.data_ptr<int64_t>(),
+              vbe_b_t_map.data_ptr<int32_t>(),
+              info_B_num_bits,
+              info_B_mask,
+              div_round_up(max_D, kWarpSize * 4),
+              {%- else %}
+              FixedDivisor(num_warps_per_table),
+              {%- endif %}
+              indices.data_ptr<index_t>(),
+              {%- if weighted %}
+              // TODO: update indice_weights type
+              indice_weights.data_ptr<float>(),
+              {%- endif %}
+              offsets.data_ptr<index_t>(),
+              reinterpret_cast<uint32_t*>(D_offsets.data_ptr<int32_t>()),
+              weights_offsets.data_ptr<int64_t>(),
+              {{ locs_or_addrs_tensor }}.data_ptr<int32_t>(),
+              output.data_ptr<output_t>()
+            );
+            {%- endif %}
             {%- if vbe %}
             output = output.reshape({-1});
             {%- endif %}
