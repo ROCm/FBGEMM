@@ -1224,20 +1224,20 @@ Tensor {{ embedding_cuda_op }}(
                              kUseVecBlocking>;
                     
                     {% if is_rocm %}
-                        int32_t total_L = indices.numel();
-                        int32_t num_cta_per_row_groups;
-                        int32_t work_group_size;
-                        if (total_L/total_B > 1){
-                            num_cta_per_row_groups = (kMaxThreads/4) / kWarpSize;
-                            work_group_size = (kMaxThreads/4);
-                        }
-                        else{
-                            num_cta_per_row_groups = kMaxThreads / kWarpSize;
-                            work_group_size = kMaxThreads;
-                        }
+                    int32_t total_L = indices.numel();
+                    int32_t num_cta_per_row_groups;
+                    int32_t work_group_size;
+                    if (total_L/total_B > 1) {
+                        num_cta_per_row_groups = (kMaxThreads/4) / kWarpSize;
+                        work_group_size = (kMaxThreads/4);
+                    }
+                    else {
+                        num_cta_per_row_groups = kMaxThreads / kWarpSize;
+                        work_group_size = kMaxThreads;
+                    }
                     {%- else %}
-                        int32_t num_cta_per_row_groups = kMaxThreads / kWarpSize;
-                        int32_t work_group_size = kMaxThreads;
+                    int32_t num_cta_per_row_groups = kMaxThreads / kWarpSize;
+                    const int32_t work_group_size = kMaxThreads;
                     {%- endif %}
                     {%- if enable_optimized_hip_mixed_D_kernel  %}
                     auto cta_blockSize = dim3(kThreadGroupSize, num_cta_per_row_groups);
