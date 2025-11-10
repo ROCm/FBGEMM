@@ -42,6 +42,90 @@ template <
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
 __global__
+__launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel_v2(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* unique_ptrs,
+    const int64_t* inverse_ptrs,
+    const int64_t* count_ptrs,
+    const int64_t* group_boundaries_ptr,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const int64_t num_warps_per_row,
+    const int64_t num_work_rows, // number of rows to work on per member
+    const int64_t num_segments,
+    const int64_t group_size) {
+  constexpr int kNumCols = 96;
+  const auto global_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+  const auto global_segment_id = global_warp_id / num_warps_per_row;
+  if (global_segment_id >= num_segments) {
+    return;
+  }
+
+  const auto col_offset = threadIdx.x + (global_warp_id % num_warps_per_row) * EMULATED_WARP_SIZE;
+  // const auto segment_id = 
+
+  int64_t group_id = 0;
+  // int64_t segment_offset = 0;
+  for (int i = 0; i < group_size; ++i) {
+    if (global_segment_id < group_boundaries_ptr[i]) {
+      group_id = i;
+      break;
+    }
+  }
+
+  const auto segment_offset = (group_id == 0) ? 0 : group_boundaries_ptr[group_id - 1];
+  const auto segment_id = global_segment_id - segment_offset;
+  
+  const scalar_t* input = reinterpret_cast<const scalar_t*>(input_ptrs[group_id]);
+  scalar_t* output = reinterpret_cast<scalar_t*>(output_ptrs[group_id]);
+
+  const auto unique_ptr = reinterpret_cast<const index_t*>(unique_ptrs[group_id]);
+  const auto output_row_idx = unique_ptr[segment_id];
+  // const auto col_offset = threadIdx.x + 
+  scalar_t accumulator = *(output + output_row_idx * kNumCols + col_offset);
+
+  const int64_t segment_length = reinterpret_cast<int64_t*>(count_ptrs[group_id])[segment_id];
+  const int64_t* inverse_ptr = reinterpret_cast<int64_t*>(inverse_ptrs[group_id]);
+  
+  constexpr int kUnrollFactor = 4;
+// #pragma unroll kUnrollFactor
+  auto segment = 0;
+  for (; segment + kUnrollFactor - 1 < segment_length; segment += kUnrollFactor) {
+    const auto inverse_idx0 = inverse_ptr[segment];
+    const auto inverse_idx1 = inverse_ptr[segment + 1];
+    const auto inverse_idx2 = inverse_ptr[segment + 2];
+    const auto inverse_idx3 = inverse_ptr[segment + 3];
+
+    accumulator += input[inverse_idx0 * kNumCols + col_offset];
+    accumulator += input[inverse_idx1 * kNumCols + col_offset];
+    accumulator += input[inverse_idx2 * kNumCols + col_offset];
+    accumulator += input[inverse_idx3 * kNumCols + col_offset];
+    // const auto input_idx = 
+    // accumulator += 
+  }
+
+  for(; segment < segment_length; ++segment) {
+    const auto inverse_idx = inverse_ptr[segment];
+
+    accumulator += input[inverse_idx * kNumCols + col_offset];    
+  }
+
+  output[output_row_idx * kNumCols + col_offset] = accumulator;
+}
+
+
+
+template <
+    typename index_t,
+    typename scalar_t,
+    bool USE_INDEX_SELECT,
+    bool USE_VAR_COLS,
+    int UNROLL_FACTOR,
+    int COLS_PER_WARP,
+    int LOG_COLS_PER_WARP>
+__global__
 __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
@@ -111,6 +195,12 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* unique_ptrs,
+    const int64_t* inverse_ptrs,
+    const int64_t* counts_ptrs,
+    const int64_t* group_boundaries_ptr,
+    const int64_t num_segments,
+    const int64_t num_cols,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const c10::ScalarType& input_scalar_type,
@@ -127,14 +217,53 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
 
   at::cuda::OptionalCUDAGuard device_guard(device);
 
+  const bool is_v2_kernel = !use_index_select && !use_var_cols;
+
   // Partition work based on num_work_rows
-  uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
-  uint32_t max_grid_size =
-      at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
-  uint32_t grid_size = std::min(
-      cuda_calc_xblock_count(total_num_warps, num_warps_per_threadblock),
-      max_grid_size);
-  dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
+  const uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
+  uint32_t max_grid_size = 0;
+  uint32_t grid_size = 0;
+  auto block_size = dim3(0, 0, 1);
+  int64_t num_warps_per_row = 0;
+  if (is_v2_kernel) {
+    num_warps_per_row = (num_cols + EMULATED_WARP_SIZE - 1) / EMULATED_WARP_SIZE;
+    grid_size = (num_segments * num_warps_per_row + num_warps_per_threadblock - 1) / num_warps_per_threadblock;
+    block_size = dim3(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
+  } else {
+    max_grid_size =
+        at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
+    grid_size = std::min(
+        cuda_calc_xblock_count(total_num_warps, num_warps_per_threadblock),
+        max_grid_size);
+    block_size = dim3(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
+  }
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD_V2(USE_INDEX_SELECT, USE_VAR_COLS) \
+  FBGEMM_LAUNCH_KERNEL(                                                  \
+      (group_index_select_or_add_2d_kernel_v2<                           \
+          index_t,                                                       \
+          scalar_t,                                                      \
+          USE_INDEX_SELECT,                                              \
+          USE_VAR_COLS,                                                  \
+          GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
+          GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
+          GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
+      grid_size,                                                         \
+      block_size,                                                        \
+      0,                                                                 \
+      at::cuda::getCurrentCUDAStream(),                                  \
+      input_ptrs,                                                        \
+      output_ptrs,                                                       \
+      indices_ptrs,                                                      \
+      unique_ptrs, \
+      inverse_ptrs, \
+      counts_ptrs, \
+      group_boundaries_ptr, \
+      warp_offsets_group,                                                \
+      num_cols_group,                                                    \
+      num_warps_per_row, \
+      num_work_rows,                                                     \
+      num_segments, \
+      group_size)
 
 #define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS) \
   FBGEMM_LAUNCH_KERNEL(                                                  \
@@ -172,7 +301,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                 if (use_var_cols) {
                   INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true);
                 } else {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false);
+                  INVOKE_GROUP_INDEX_SELECT_OR_ADD_V2(false, false);
                 }
               }
             });

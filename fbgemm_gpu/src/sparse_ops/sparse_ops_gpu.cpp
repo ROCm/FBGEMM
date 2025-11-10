@@ -21,6 +21,12 @@
 #include <cstdint>
 #include <stdexcept> // for logic_error
 
+#include <torch/torch.h>
+#include <fstream>
+#include <iostream>
+
+// #define HIP_SAVE_OUTPUT
+
 using Tensor = at::Tensor;
 
 namespace fbgemm_gpu {
@@ -367,6 +373,12 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       input_ptrs,
       output_ptrs,
       indices_ptrs,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      0,
+      0,
       warp_offsets_group,
       num_cols_group,
       first_input.scalar_type(),
@@ -447,6 +459,15 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   Tensor args_tensor = at::empty(
       {group_size * 3},
       at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+
+  Tensor group_boundaries_tensor = at::empty(
+      {group_size},
+      at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+
+  Tensor exp_tensor = at::empty({group_size * 3}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+  int64_t* unique_ptrs = exp_tensor.data_ptr<int64_t>();
+  int64_t* inverse_ptrs = exp_tensor.data_ptr<int64_t>() + group_size;
+  int64_t* count_ptrs = exp_tensor.data_ptr<int64_t>() + 2 * group_size;
   // Ensure that args_tensor is contiguous
   TORCH_CHECK(args_tensor.is_contiguous());
   int64_t* grad_output_ptrs = args_tensor.data_ptr<int64_t>();
@@ -465,7 +486,14 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   for (const auto i : c10::irange(group_size)) {
     const auto& grad = grad_output_group[i];
     TENSORS_ON_SAME_CUDA_GPU_IF_NOT_OPTIONAL(grad, first_indices);
-
+#ifdef HIP_SAVE_OUTPUT
+    auto pickled_bytes = torch::pickle_save(grad);
+    std::ofstream fout(std::string("input") + std::to_string(i) + std::string(".pt"), std::ios::out | std::ios::binary);
+    fout.write(pickled_bytes.data(), pickled_bytes.size());
+    fout.close();
+#endif
+    // std::cout << "group: " << i << std::endl;
+    // std::cout << grad.sizes() << std::endl;
     // Store grad contigs to keep them alive during the kernel computation
     grad_output_contigs.push_back(grad.expect_contiguous());
 
@@ -510,27 +538,96 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   index_contigs.reserve(group_size);
   for (const auto i : c10::irange(group_size)) {
     const auto& indices = indices_group[i];
+#ifdef HIP_SAVE_OUTPUT
+    auto pickled_bytes = torch::pickle_save(indices);
+    std::ofstream fout(std::string("indices") + std::to_string(i) + std::string(".pt"), std::ios::out | std::ios::binary);
+    fout.write(pickled_bytes.data(), pickled_bytes.size());
+    fout.close();
+#endif
     index_contigs.push_back(indices.expect_contiguous());
     indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
   }
 
+  // std::cout << "total_num_warps: " << total_num_warps << std::endl;
+
   // Transfer grad output pointers to GPU
   args_tensor = args_tensor.to(first_indices.device(), /*non_blocking=*/true);
+
+  group_boundaries_tensor = group_boundaries_tensor.to(first_indices.device(), /*non_blocking=*/true);
+
+  // auto sorted_stuff = torch::arange(indices_group[0].numel(),
+  //                                   at::TensorOptions()
+  //                                       .dtype(first_indices.scalar_type())
+  //                                       .device(fwd_input.device()));
+
+// ============
+
+  std::vector<c10::MaybeOwned<at::Tensor>> unique_contigs;
+  std::vector<c10::MaybeOwned<at::Tensor>> inverse_contigs;
+  std::vector<c10::MaybeOwned<at::Tensor>> counts_contigs;
+  unique_contigs.reserve(group_size);
+  inverse_contigs.reserve(group_size);
+  counts_contigs.reserve(group_size);
+  int64_t num_segments = 0;
+  for (const auto i : c10::irange(group_size)) {
+    const auto& indices = indices_group[i];
+    auto [unique, inverse, counts] = at::_unique2(indices, /*sorted=*/false, /*return_inverse=*/true, /*return_counts=*/true);
+        
+    // Debug: Check device and sizes
+    // std::cout << "Group " << i << ": unique device=" << unique.device() << ", size=" << unique.sizes() << std::endl;
+    // std::cout << "Group " << i << ": inverse device=" << inverse.device() << ", size=" << inverse.sizes() << std::endl;
+    // std::cout << "Group " << i << ": counts device=" << counts.device() << ", size=" << counts.sizes() << std::endl;
+    
+    unique_contigs.emplace_back(unique.expect_contiguous());
+    inverse_contigs.emplace_back(inverse.expect_contiguous());
+    counts_contigs.emplace_back(counts.expect_contiguous());
+    // std::cout << unique << std::endl;
+
+    unique_ptrs[i] = reinterpret_cast<int64_t>(unique_contigs[i]->data_ptr());
+    inverse_ptrs[i] = reinterpret_cast<int64_t>(inverse_contigs[i]->data_ptr());
+    count_ptrs[i] = reinterpret_cast<int64_t>(counts_contigs[i]->data_ptr());
+
+    // Debug: Print pointer values
+    // std::cout << "Group " << i << ": unique_ptr=0x" << std::hex << unique_ptrs[i] << std::dec << std::endl;
+    // std::cout << "Group " << i << ": inverse_ptr=0x" << std::hex << inverse_ptrs[i] << std::dec << std::endl;
+    // std::cout << "Group " << i << ": count_ptr=0x" << std::hex << count_ptrs[i] << std::dec << std::endl;
+
+    num_segments += unique.size(0);
+    group_boundaries_tensor[i] = num_segments;
+  }
+  exp_tensor = exp_tensor.to(first_indices.device(), /*non_blocking=*/true);
+  const int64_t num_cols = 96;
+  // std::cout << num_segments << std::endl;
+  // std::cout << ind << std::endl;
+  // std::cout << tmp << std::endl;
+
+// =============
 
   group_index_select_or_add_cuda(
       args_tensor.data_ptr<int64_t>(),
       args_tensor.data_ptr<int64_t>() + group_size,
-      args_tensor.data_ptr<int64_t>() + 2 * group_size,
+      args_tensor.data_ptr<int64_t>() + 2 * group_size, 
+      exp_tensor.data_ptr<int64_t>(),
+      exp_tensor.data_ptr<int64_t>() + group_size,
+      exp_tensor.data_ptr<int64_t>() + 2 * group_size,
+      group_boundaries_tensor.data_ptr<int64_t>(),
+      num_segments,
+      num_cols,
       warp_offsets_group,
-      num_cols_group,
-      fwd_input.scalar_type(),
-      first_indices.scalar_type(),
-      fwd_input.device().index(),
-      num_input_rows,
-      total_num_warps,
-      group_size,
-      /*use_index_select=*/false,
-      use_var_cols);
+      num_cols_group, fwd_input.scalar_type(), first_indices.scalar_type(),
+      fwd_input.device().index(), num_input_rows, total_num_warps, group_size,
+      /*use_index_select=*/false, use_var_cols);
+
+#ifdef HIP_SAVE_OUTPUT
+  cudaDeviceSynchronize();
+
+  for (const auto i : c10::irange(group_size)) {
+    auto pickled_bytes = torch::pickle_save(output_group[i]);
+    std::ofstream fout(std::string("output") + std::to_string(i) + std::string(".pt"), std::ios::out | std::ios::binary);
+    fout.write(pickled_bytes.data(), pickled_bytes.size());
+    fout.close();
+  }
+#endif
 
   return outputs;
 }
