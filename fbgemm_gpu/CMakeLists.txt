@@ -180,12 +180,12 @@ macro(RUN_GEN_SCRIPT SCRIPT)
 endmacro()
 
 foreach(script
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_backward_split.py"
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_embedding_optimizer.py"
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_quantized.py"
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_split.py"
-    "${CMAKE_CODEGEN_DIR}/genscript/generate_index_select.py")
-    RUN_GEN_SCRIPT(${script})
+   "${CMAKE_CODEGEN_DIR}/genscript/generate_backward_split.py"
+   "${CMAKE_CODEGEN_DIR}/genscript/generate_embedding_optimizer.py"
+   "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_quantized.py"
+   "${CMAKE_CODEGEN_DIR}/genscript/generate_forward_split.py"
+   "${CMAKE_CODEGEN_DIR}/genscript/generate_index_select.py")
+   RUN_GEN_SCRIPT(${script})
 endforeach()
 
 
