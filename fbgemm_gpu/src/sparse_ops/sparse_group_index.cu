@@ -43,7 +43,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t num_work_rows, // number of rows to work on per member
     const int64_t group_size) {
   const auto total_num_warps = warp_offsets_group[group_size];
+  
+  
   // USE_INDEX_SELECT is a template argument; the compiler prunes the unused branch.
+  #ifdef USE_ROCM
   if (USE_INDEX_SELECT) {
     for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
          warp_id < total_num_warps;
@@ -63,10 +66,42 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         num_cols = num_cols_group[member_id];
         warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
         member_warp_id = warp_id - warp_offsets_group[member_id];
-      } else {
+      }
+#else
+  int32_t num_cols = 0;
+  int32_t warps_per_row = 0;
+
+  if constexpr (!USE_VAR_COLS) {
+    num_cols = num_cols_group[0];
+    warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+  }
+
+  for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+        warp_id < total_num_warps;
+        warp_id += gridDim.x * blockDim.y) {
+    int32_t member_id = 0;
+    int32_t member_warp_id = 0;
+    if constexpr (USE_VAR_COLS) {
+      __shared__ int member_ids[kMaxThreads / EMULATED_WARP_SIZE];
+      if (threadIdx.x == 0) {
+        binary_search_range(
+            &member_ids[threadIdx.y],
+            warp_offsets_group + 1,
+            warp_id,
+            group_size);
+      }
+      syncwarp();
+      member_id = member_ids[threadIdx.y];
+      num_cols = num_cols_group[member_id];
+      warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+      member_warp_id = warp_id - warp_offsets_group[member_id];
+#endif
+      else {
         // All columns are the same
+        #ifdef USE_ROCM
         num_cols = num_cols_group[0];
         warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+        #endif
         member_id = warp_id / (warps_per_row * num_work_rows);
         member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
       }
@@ -83,10 +118,15 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       const index_t idx = indices[row];
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
+        #ifndef USE_ROCM
+          if constexpr (USE_INDEX_SELECT) {
+        #endif
         output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+#ifdef USE_ROCM
       }
     }
   } else {
+
     // Cache a handful of scatter destinations per warp so we can merge
     // consecutive updates that hit the same index before touching global memory.
     constexpr int kCacheSlots = 2;
@@ -148,7 +188,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         num_cols = num_cols_group[member_id];
         warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
         member_warp_id = warp_id - warp_offsets_group[member_id];
+#endif
       } else {
+#ifdef USE_ROCM
         // All columns are the same
         num_cols = num_cols_group[0];
         warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
@@ -257,6 +299,13 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     flush_cache(active_output_base, active_num_cols, active_col_offset);
   }
 }
+#else
+    gpuAtomicAddNoReturn(
+            &output[idx * num_cols + i], input[row * num_cols + i]);
+    }
+  }
+#endif
+
 
 DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t* input_ptrs,
