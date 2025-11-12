@@ -239,7 +239,7 @@ class IndexSelectTest(unittest.TestCase):
             {"rtol": 1e-02, "atol": 1e-02} if dtype == torch.half else {},
         )
 
-        @given(
+    @given(
         num_inputs=st.integers(0, 100),
         max_input_rows=st.integers(2, 32),
         max_cols_factor=st.integers(2, 256),
