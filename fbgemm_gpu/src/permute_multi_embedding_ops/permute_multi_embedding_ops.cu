@@ -50,8 +50,57 @@ __global__ void permute_multi_embs_kernel(
     return;
   }
 
-  // parse permutes
-  int32_t in_tensor, out_tensor, in_offset, out_offset, length, next;
+  int32_t in_tensor = 0;
+  int32_t out_tensor = 0;
+  int32_t in_offset = 0;
+  int32_t out_offset = 0;
+  int32_t length = 0;
+  int32_t next = 0;
+  const scalar_t* __restrict__ input_ptr = nullptr;
+  scalar_t* __restrict__ output_ptr = nullptr;
+
+#ifdef USE_ROCM
+  // Hoist invariant metadata once per wavefront and broadcast via shfl.
+  uint64_t input_addr = 0;
+  uint64_t output_addr = 0;
+  if (worker_id == 0) {
+    int32_t* __restrict__ pp = permutes[permute_id].data();
+    if (reverse_permute) {
+      out_tensor = pp[PermuteParam::in_tensor];
+      in_tensor = pp[PermuteParam::out_tensor];
+      out_offset = pp[PermuteParam::in_offset];
+      in_offset = pp[PermuteParam::out_offset];
+    } else {
+      in_tensor = pp[PermuteParam::in_tensor];
+      out_tensor = pp[PermuteParam::out_tensor];
+      in_offset = pp[PermuteParam::in_offset];
+      out_offset = pp[PermuteParam::out_offset];
+    }
+    length = pp[PermuteParam::length];
+    next = pp[PermuteParam::next];
+    const int32_t in_length = in_lengths[in_tensor];
+    const int32_t out_length = out_lengths[out_tensor];
+    const scalar_t* base_input =
+        reinterpret_cast<const scalar_t*>(inputs[in_tensor]);
+    scalar_t* base_output =
+        reinterpret_cast<scalar_t*>(outputs[out_tensor]);
+    input_addr = reinterpret_cast<uint64_t>(
+        base_input +
+        static_cast<int64_t>(batch_id) * static_cast<int64_t>(in_length) +
+        in_offset);
+    output_addr = reinterpret_cast<uint64_t>(
+        base_output +
+        static_cast<int64_t>(batch_id) * static_cast<int64_t>(out_length) +
+        out_offset);
+  }
+
+  length = fbgemm_gpu::shfl_sync(length, 0);
+  next = fbgemm_gpu::shfl_sync(next, 0);
+  input_addr = fbgemm_gpu::shfl_sync(input_addr, 0);
+  output_addr = fbgemm_gpu::shfl_sync(output_addr, 0);
+  input_ptr = reinterpret_cast<const scalar_t*>(input_addr);
+  output_ptr = reinterpret_cast<scalar_t*>(output_addr);
+#else
   int32_t* __restrict__ pp = permutes[permute_id].data();
   if (reverse_permute) {
     out_tensor = pp[PermuteParam::in_tensor];
@@ -66,6 +115,7 @@ __global__ void permute_multi_embs_kernel(
   }
   length = pp[PermuteParam::length];
   next = pp[PermuteParam::next];
+#endif
 
   if (worker_id >= length) {
     return;
@@ -74,20 +124,20 @@ __global__ void permute_multi_embs_kernel(
     return;
   }
 
-  // locate the batch_id
+#ifndef USE_ROCM
+  // Locate the batch slice for the CUDA path.
   const auto in_length = in_lengths[in_tensor];
-  // Sometimes batch_id * length can go beyond 32-bit int (e.g., 3900 * 654060)
-  // so cast them to int64_t.
-  const scalar_t* __restrict__ input_ptr =
+  input_ptr =
       reinterpret_cast<const scalar_t*>(inputs[in_tensor]) +
       static_cast<int64_t>(batch_id) * static_cast<int64_t>(in_length) +
       in_offset;
 
   const auto out_length = out_lengths[out_tensor];
-  scalar_t* __restrict__ output_ptr =
+  output_ptr =
       reinterpret_cast<scalar_t*>(outputs[out_tensor]) +
       static_cast<int64_t>(batch_id) * static_cast<int64_t>(out_length) +
       out_offset;
+#endif
 
   if (fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(output_ptr) &&
       fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(input_ptr)) {
@@ -297,8 +347,13 @@ std::vector<Tensor> permute_multi_embedding_function_gpu(
   // We are launching ( permute_size//warp_per_block, batch_size, ?)
   // blocks. The grid z dimension is also used by batch_size in case it's
   // greater than 65535.
-  const int32_t warp_per_block =
-      fbgemm_gpu::kMaxThreads / fbgemm_gpu::kWarpSize / 2;
+  # if defined(USE_ROCM)
+    const int32_t warp_per_block =
+        fbgemm_gpu::kMaxThreads / fbgemm_gpu::kWarpSize / 2;
+  # else
+    const int32_t warp_per_block =
+        fbgemm_gpu::kMaxThreads / fbgemm_gpu::kWarpSize;
+  # endif
   const int32_t max_grid_dim = 32768; // The CUDA maximum is 65535, not 1<<N.
   const dim3 block_dim(fbgemm_gpu::kWarpSize, warp_per_block);
   const dim3 grid_dim(
