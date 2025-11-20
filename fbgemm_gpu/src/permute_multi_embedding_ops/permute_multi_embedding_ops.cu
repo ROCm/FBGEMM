@@ -92,19 +92,47 @@ __global__ void permute_multi_embs_kernel(
   if (fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(output_ptr) &&
       fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(input_ptr)) {
     constexpr int32_t vec_size = 4;
+    const int32_t vec_stride = blockDim.x * vec_size;
     const int32_t loop_end = round_down(length, vec_size);
-    for (int32_t i = worker_id * vec_size; i < loop_end;
-         i += blockDim.x * vec_size) {
-      fbgemm_gpu::Vec4T<scalar_t>::copy(&input_ptr[i], &output_ptr[i]);
+#ifdef USE_ROCM
+    // Manually unrolled to better utilize CDNA wavefront bandwidth.
+    for (int32_t base = worker_id * vec_size; base < loop_end;
+         base += vec_stride * 2) {
+      fbgemm_gpu::Vec4T<scalar_t>::copy(
+          &input_ptr[base], &output_ptr[base]);
+      const int32_t second = base + vec_stride;
+      if (second < loop_end) {
+        fbgemm_gpu::Vec4T<scalar_t>::copy(
+            &input_ptr[second], &output_ptr[second]);
+      }
     }
+#else
+    for (int32_t base = worker_id * vec_size; base < loop_end;
+         base += vec_stride) {
+      fbgemm_gpu::Vec4T<scalar_t>::copy(
+          &input_ptr[base], &output_ptr[base]);
+    }
+#endif
     // Use elementwise access for the last incomplete vector.
     for (auto i = loop_end + worker_id; i < length; i += blockDim.x) {
       output_ptr[i] = input_ptr[i];
     }
   } else { // Fallback if not aligned.
+#ifdef USE_ROCM
+    // Manual scalar unroll mirrors the vector path for misaligned copies.
+    const int32_t scalar_stride = blockDim.x;
+    for (int32_t base = worker_id; base < length; base += scalar_stride * 2) {
+      output_ptr[base] = input_ptr[base];
+      const int32_t second = base + scalar_stride;
+      if (second < length) {
+        output_ptr[second] = input_ptr[second];
+      }
+    }
+#else
     for (auto i = worker_id; i < length; i += blockDim.x) {
       output_ptr[i] = input_ptr[i];
     }
+#endif
   }
 
   // for reverse_permute (backward) with next
@@ -270,7 +298,7 @@ std::vector<Tensor> permute_multi_embedding_function_gpu(
   // blocks. The grid z dimension is also used by batch_size in case it's
   // greater than 65535.
   const int32_t warp_per_block =
-      fbgemm_gpu::kMaxThreads / fbgemm_gpu::kWarpSize;
+      fbgemm_gpu::kMaxThreads / fbgemm_gpu::kWarpSize / 2;
   const int32_t max_grid_dim = 32768; // The CUDA maximum is 65535, not 1<<N.
   const dim3 block_dim(fbgemm_gpu::kWarpSize, warp_per_block);
   const dim3 grid_dim(
