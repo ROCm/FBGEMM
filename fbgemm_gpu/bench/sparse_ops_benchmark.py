@@ -10,7 +10,10 @@ import contextlib
 import functools
 import logging
 import math
+import os
 import random
+from contextlib import nullcontext
+from typing import Callable
 
 import click
 import fbgemm_gpu
@@ -234,105 +237,102 @@ def jagged_index_select_2d_bench(
 
 
 @cli.command()
-@click.option("--row-size", default=512)
-@click.option("--batch-size", default=4096)
-@click.option("--unique-batch-size", default=1024)
-@click.option("--input-precision", type=str, default="fp32")
-@click.option("--sort-indices", type=bool, default=True)
-@click.option("--num-groups", default=32)
+@click.option(
+    "--export-trace",
+    is_flag=True,
+    default=False,
+    help="Enable export of trace for profiling. Default is False.",
+)
+@click.option(
+    "--trace-url",
+    type=str,
+    default="group_index_select_2d_{phase}_trace_{ospid}.json",
+)
 def group_index_select_2d_bench(
-    row_size: int,
-    batch_size: int,
-    unique_batch_size: int,
-    input_precision: str,
-    sort_indices: bool,
-    num_groups: int,
+    export_trace: bool,
+    trace_url: str,
 ) -> None:
-    def gen_inverse_index(curr_size: int, final_size: int) -> np.array:
-        inverse_index = list(range(curr_size))
-        np_arr = np.array(inverse_index)
-        for _ in range(final_size - curr_size):
-            inverse_index.append(np.random.randint(0, curr_size))
-            np_arr = np.array(inverse_index)
-            np.random.shuffle(np_arr)
-        return np_arr
 
-    dtype = torch.float
-    if input_precision == "fp32":
-        dtype = torch.float
-    elif input_precision == "fp16":
-        dtype = torch.half
-    else:
-        raise RuntimeError(f"Does not support data type {input_precision}")
+    # Define dims and strides
+    input_dims = [
+        [27330, 96],
+        [288841, 96],
+        [4914, 96],
+        [224149, 96],
+        [246190, 96],
+        [228686, 96],
+        [28141, 96],
+        [233825, 96],
+        [196804, 96],
+        [3, 96],
+        [3, 96],
+        [25, 96],
+    ]
+    input_strides = [
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+        [96, 1],
+    ]
+    index_dim = 1019100
 
-    offset_indices_group = []
+    # Generate input_group and indices_group
+    input_group = []
     indices_group = []
-    for i in range(num_groups):
-        # pyre-fixme[16]: Module `cuda` has no attribute `IntTensor`.
-        indices = torch.cuda.IntTensor(gen_inverse_index(unique_batch_size, batch_size))
-        if sort_indices:
-            indices, _ = indices.sort()
-        indices_group.append(indices)
-        indices = torch.add(indices, batch_size * i)
-        offset_indices_group.append(indices)
+    for dim, stride in zip(input_dims, input_strides):
+        input = torch.rand(dim, dtype=torch.float, device="cuda").as_strided(
+            dim, stride
+        )
+        input.requires_grad = True
+        input_group.append(input)
 
-    offset_indices = torch.concat(offset_indices_group)
-
-    input = torch.rand(num_groups * batch_size, row_size, dtype=dtype, device="cuda")
-    input.requires_grad = True
-
-    num_bytes = 2 * batch_size * row_size * input.element_size() * num_groups
+        index = torch.randint(
+            low=0, high=dim[0], size=(index_dim,), dtype=torch.int, device="cuda"
+        )
+        indices_group.append(index)
 
     bench_kwargs = {"num_warmups": 10, "iters": 100}
 
-    # Benchmark forward
-    time_ref, output_ref = benchmark_torch_function(
-        # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
-        # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
-        torch.index_select,
-        (input, 0, offset_indices),
-        # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
-        # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
-        **bench_kwargs,
-    )
+    def _kineto_trace_handler(p: profile, phase: str) -> None:
+        p.export_chrome_trace(trace_url.format(phase=phase, ospid=os.getpid()))
 
-    input_group = input.split(batch_size, 0)
-    time, output_group = benchmark_torch_function(
-        torch.ops.fbgemm.group_index_select_dim0,
-        (input_group, indices_group),
-        # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
-        # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
-        **bench_kwargs,
-    )
-    logging.info(
-        f"forward: PyTorch batch {time_ref:.5f} sec ({num_bytes / time_ref / 1e9:.5f} GB/s), "
-        f"fbgemm group {time:5f} sec ({num_bytes / time / 1e9:.5f} GB/s)"
-    )
+    # pyre-ignore[3]
+    def context_factory(on_trace_ready: Callable[[profile], None]):
+        return profile(on_trace_ready=on_trace_ready) if export_trace else nullcontext()
+
+    # Benchmark forward
+    with context_factory(lambda p: _kineto_trace_handler(p, "fwd")):
+        time, output_group = benchmark_torch_function(
+            torch.ops.fbgemm.group_index_select_dim0,
+            (input_group, indices_group),
+            # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
+            # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
+            **bench_kwargs,
+        )
+    logging.info(f"Forward group_index_select_dim0: {time:5f} sec ")
 
     # Benchmark backward
-    grad = torch.rand_like(output_ref)
-    time_ref, _ = benchmark_torch_function(
-        functools.partial(output_ref.backward, retain_graph=True),
-        (grad,),
-        # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
-        # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
-        **bench_kwargs,
-    )
-
     # pyre-fixme[6]: For 1st argument expected `Union[List[Tensor],
     #  typing.Tuple[Tensor, ...]]` but got `Tensor`.
-    cat_output = torch.cat(output_group)
-    time, _ = benchmark_torch_function(
-        functools.partial(cat_output.backward, retain_graph=True),
-        (grad,),
-        # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
-        # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
-        **bench_kwargs,
-    )
-    logging.info(
-        f"backward: PyTorch batch {time_ref:.5f} sec ({num_bytes / time_ref / 1e9:.5f} GB/s), "
-        f"fbgemm group {time:.5f} sec ({num_bytes / time / 1e9:.5f} GB/s)"
-    )
+    cat_output = torch.cat(output_group, dim=1)
+    grad = torch.rand_like(cat_output)
+    with context_factory(lambda p: _kineto_trace_handler(p, "bwd")):
+        time, _ = benchmark_torch_function(
+            functools.partial(cat_output.backward, retain_graph=True),
+            (grad,),
+            # pyre-fixme[6]: For 3rd argument expected `bool` but got `int`.
+            # pyre-fixme[6]: For 3rd argument expected `str` but got `int`.
+            **bench_kwargs,
+        )
+    logging.info(f"Backward group_index_select_dim0:{time:.5f} sec")
 
 
 @cli.command()
