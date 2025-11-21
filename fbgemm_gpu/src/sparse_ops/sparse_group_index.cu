@@ -7,6 +7,7 @@
  */
 
 #include "common.cuh"
+#include <vector>
 
 using Tensor = at::Tensor;
 
@@ -48,9 +49,9 @@ constexpr size_t group_index_select_shared_mem_size() {
   return total_bytes <= kGroupIndexLdsSharedMemBudgetBytes ? total_bytes : 0;
 }
 
-template <bool UseIndexSelect, typename index_t, typename scalar_t, int COLS_PER_WARP>
+template <bool UseIndexSelect, bool UseLdsCache, typename index_t, typename scalar_t, int COLS_PER_WARP>
 constexpr size_t get_group_index_shared_mem_bytes() {
-  if constexpr (UseIndexSelect) {
+  if constexpr (UseIndexSelect || !UseLdsCache) {
     return 0;
   } else {
     return group_index_select_shared_mem_size<
@@ -65,6 +66,7 @@ template <
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
+    bool USE_LDS_CACHE,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -122,6 +124,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   } else {
     constexpr int kCacheSlots = 2;
     constexpr bool kLdsCacheEnabled =
+        USE_LDS_CACHE &&
         group_index_select_shared_mem_size<
             index_t,
             scalar_t,
@@ -369,8 +372,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
           static_cast<int32_t>(((member_warp_id % warps_per_row)
                                 << LOG_COLS_PER_WARP) +
                                (threadIdx.x * UNROLL_FACTOR));
+      // Only enable LDS aggregation when a single warp fully covers the row
+      // so we actually amortize the atomic traffic over duplicate indices.
       const bool member_uses_lds =
-          kLdsCacheEnabled && (num_cols <= kGroupIndexLdsColsThreshold);
+          kLdsCacheEnabled && (num_cols <= kGroupIndexLdsColsThreshold) &&
+          (warps_per_row == 1);
       const bool member_changed = member_id != active_member_id;
       const bool num_cols_changed =
           member_changed ? false : (num_cols != active_num_cols);
@@ -601,6 +607,34 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
 
   at::cuda::OptionalCUDAGuard device_guard(device);
 
+#ifdef USE_ROCM
+  bool enable_lds_cache = false;
+  if (!use_index_select && group_size > 0) {
+    std::vector<int32_t> num_cols_host(group_size);
+    auto memcpy_status = cudaMemcpy(
+        num_cols_host.data(),
+        num_cols_group,
+        sizeof(int32_t) * group_size,
+        cudaMemcpyDeviceToHost);
+    TORCH_CHECK(
+        memcpy_status == cudaSuccess,
+        "Failed to copy num_cols_group for LDS heuristic");
+    const int cols_per_warp = get_group_index_select_cols_per_warp();
+    for (int i = 0; i < group_size; ++i) {
+      const int num_cols = num_cols_host[i];
+      const int warps_per_row =
+          (num_cols + cols_per_warp - 1) / cols_per_warp;
+      if (num_cols <= kGroupIndexLdsColsThreshold && warps_per_row == 1) {
+        enable_lds_cache = true;
+        break;
+      }
+    }
+  }
+  const bool enable_lds_cache_flag = enable_lds_cache;
+#else
+  constexpr bool enable_lds_cache_flag = false;
+#endif
+
   uint32_t num_warps_per_threadblock = kMaxThreads / kGroupIndexWarpSize;
   uint32_t max_grid_size =
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
@@ -609,11 +643,12 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(kGroupIndexWarpSize, num_warps_per_threadblock, 1);
 
-#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG) \
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, USE_LDS_CACHE_FLAG) \
   do { \
     constexpr size_t shared_mem_bytes = \
         get_group_index_shared_mem_bytes< \
             USE_INDEX_SELECT_FLAG, \
+            USE_LDS_CACHE_FLAG, \
             index_t, \
             scalar_t, \
             GROUP_INDEX_SELECT_COLS_PER_WARP>(); \
@@ -623,6 +658,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
             scalar_t, \
             USE_INDEX_SELECT_FLAG, \
             USE_VAR_COLS_FLAG, \
+            USE_LDS_CACHE_FLAG, \
             GROUP_INDEX_SELECT_UNROLL_FACTOR, \
             GROUP_INDEX_SELECT_COLS_PER_WARP, \
             GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>), \
@@ -637,6 +673,15 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
         num_cols_group, \
         num_work_rows, \
         group_size); \
+  } while (0)
+
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG) \
+  do { \
+    if (enable_lds_cache_flag) { \
+      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, true); \
+    } else { \
+      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, false); \
+    } \
   } while (0)
 
   AT_DISPATCH_INDEX_TYPES(
@@ -660,6 +705,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       });
 
 #undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
+#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS
 }
 
 } // namespace fbgemm_gpu
