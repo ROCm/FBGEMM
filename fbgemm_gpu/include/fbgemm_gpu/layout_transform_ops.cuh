@@ -71,6 +71,75 @@ __global__ void permute_pooled_embs_kernel(
     const int64_t B,
     const int64_t T,
     const int64_t dim_sum) {
+#ifdef USE_ROCM
+  const int32_t warps_per_block = blockDim.x / warpSize;
+  const int32_t lane_id = threadIdx.x % warpSize;
+  const int32_t warp_id = threadIdx.x / warpSize;
+  const int32_t t = blockIdx.x * warps_per_block + warp_id;
+  const int32_t b = blockIdx.y + gridDim.y * blockIdx.z;
+  if (b >= B || t >= T) {
+    return;
+  }
+
+  int64_t cur_dim = 0;
+  uint64_t input_addr = 0;
+  uint64_t output_addr = 0;
+  if (lane_id == 0) {
+    const int64_t permute_idx = permute_list[t];
+    const int64_t input_dim_start = offset_dim_list[permute_idx];
+    const int64_t input_dim_end = offset_dim_list[permute_idx + 1];
+    cur_dim = input_dim_end - input_dim_start;
+    const int64_t sgo_offset = inv_offset_dim_list[t];
+    const int64_t sgo_stride =
+        max(inv_offset_dim_list[T], offset_dim_list[T]);
+    input_addr = reinterpret_cast<uint64_t>(
+        go + b * dim_sum + input_dim_start);
+    output_addr = reinterpret_cast<uint64_t>(
+        sgo + b * sgo_stride + sgo_offset);
+  }
+
+  // Broadcast once per wavefront to reduce redundant metadata loads.
+  cur_dim = fbgemm_gpu::shfl_sync(cur_dim, 0);
+  input_addr = fbgemm_gpu::shfl_sync(input_addr, 0);
+  output_addr = fbgemm_gpu::shfl_sync(output_addr, 0);
+  if (cur_dim <= 0 || lane_id >= cur_dim) {
+    return;
+  }
+
+  const scalar_t* __restrict__ go_ptr =
+      reinterpret_cast<const scalar_t*>(input_addr);
+  scalar_t* __restrict__ sgo_ptr =
+      reinterpret_cast<scalar_t*>(output_addr);
+  if (fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(sgo_ptr) &&
+      fbgemm_gpu::is_aligned<fbgemm_gpu::Vec4T<scalar_t>>(go_ptr)) {
+    constexpr int32_t vec_size = 4;
+    const int32_t vec_stride = warpSize * vec_size;
+    const int32_t loop_end = cur_dim / vec_size * vec_size;
+    for (int32_t base = lane_id * vec_size; base < loop_end;
+         base += vec_stride * 2) {
+      fbgemm_gpu::Vec4T<scalar_t>::copy(
+          &go_ptr[base], &sgo_ptr[base]);
+      const int32_t second = base + vec_stride;
+      if (second < loop_end) {
+        fbgemm_gpu::Vec4T<scalar_t>::copy(
+            &go_ptr[second], &sgo_ptr[second]);
+      }
+    }
+    for (int32_t i = loop_end + lane_id; i < cur_dim; i += warpSize) {
+      sgo_ptr[i] = go_ptr[i];
+    }
+  } else {
+    const int32_t scalar_stride = warpSize;
+    for (int32_t base = lane_id; base < cur_dim;
+         base += scalar_stride * 2) {
+      sgo_ptr[base] = go_ptr[base];
+      const int32_t second = base + scalar_stride;
+      if (second < cur_dim) {
+        sgo_ptr[second] = go_ptr[second];
+      }
+    }
+  }
+#else
   const int32_t t =
       blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   const int32_t b = blockIdx.y + gridDim.y * blockIdx.z;
@@ -114,4 +183,5 @@ __global__ void permute_pooled_embs_kernel(
       sgo[sgo_offset + i] = go[input_dim_start + i];
     }
   }
+#endif
 }
