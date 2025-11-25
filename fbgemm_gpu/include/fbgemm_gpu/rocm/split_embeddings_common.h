@@ -148,54 +148,65 @@ struct load_row_per_warp {
       }
 };
 
-template <int32_t embedding_dim, typename index_t>
-  struct load_row_per_warp<half, embedding_dim, index_t>
+template <typename emb_t, int32_t embedding_dim, typename index_t>
+  requires(std::is_same_v<emb_t, half> || std::is_same_v<emb_t, float>)
+  struct load_row_per_warp<emb_t, embedding_dim, index_t>
   {
     static __device__ void run(
-        half *emb_data,
+        emb_t *emb_data,
         index_t row_index,
-        const half *p_emb_table,
+        const emb_t *p_emb_table,
         int lane_id)
     {
       int32x4_t emb_res =
-          amdgcn_make_buffer_resource(p_emb_table + row_index * embedding_dim, sizeof(half) * embedding_dim);
+          amdgcn_make_buffer_resource(p_emb_table + row_index * embedding_dim, sizeof(emb_t) * embedding_dim);
 
       int offset = 0;
       int reg_idx = 0;
 
-      int dim_remaining = embedding_dim;
+      if constexpr (std::is_same_v<emb_t, half>) {
+        // For half: vector load 128 elements per iteration (64 threads * 2 halfs)
+        constexpr int num_vector_ops = embedding_dim / 128;
+                        
+        #pragma unroll
+        for(int i = 0; i < num_vector_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(half2);
 
-      // vector load as many elements as possible
-      constexpr int num_vector_ops = embedding_dim / 128;
-						
-      #pragma unroll
-      for(int i = 0; i < num_vector_ops; i++)
-      {
-        int voffset = (offset + lane_id) * sizeof(half2);
+          half2 val = llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, voffset);
+          // Unpack into register array
+          emb_data[reg_idx] = val.x;
+          emb_data[reg_idx + 1] = val.y;
 
-        half2 val = llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, voffset);
-        // Unpack into register array
-        emb_data[reg_idx] = val.x;
-        emb_data[reg_idx + 1] = val.y;
+          offset += 128;
+          reg_idx += 2;
+        }
 
-        offset += 128;
-        reg_idx += 2;
-        dim_remaining -= 128;
-      }
+        // load remaining elements (scalar loads)
+        constexpr int tail_start = num_vector_ops * 128;
+        constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
 
-      // load remaining elements (scalar loads)
-      constexpr int tail_start = num_vector_ops * 128;
-      constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+        #pragma unroll
+        for(int i = 0; i < num_scalar_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(half);
 
-      #pragma unroll
-      for(int i = 0; i < num_scalar_ops; i++)
-      {
-        int voffset = (offset + lane_id) * sizeof(half);
-
-        emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp16(emb_res, voffset);
-        offset += 64;
-        reg_idx += 1;
-        dim_remaining -= 64;
+          emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp16(emb_res, voffset);
+          offset += 64;
+          reg_idx += 1;
+        }
+      } else if constexpr (std::is_same_v<emb_t, float>) {
+        // For float: load 64 elements per iteration (64 threads * 1 float)
+        constexpr int num_ops = (embedding_dim + 63) / 64;
+                        
+        #pragma unroll
+        for(int i = 0; i < num_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(float);
+          emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp32(emb_res, voffset);
+          offset += 64;
+          reg_idx += 1;
+        }
       }
     }
   };
@@ -483,49 +494,60 @@ struct store_row_per_warp<half, 320> {
   }
 };
 
-template <int32_t embedding_dim>
-struct store_row_per_warp<half, embedding_dim> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
+template <typename emb_t, int32_t embedding_dim>
+  requires(std::is_same_v<emb_t, half> || std::is_same_v<emb_t, float>)
+struct store_row_per_warp<emb_t, embedding_dim> {
+  static __device__ void run(const emb_t* acc, emb_t* p_output, int lane_id) {
     int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, sizeof(half) * embedding_dim);
+        amdgcn_make_buffer_resource(p_output, sizeof(emb_t) * embedding_dim);
 
     int offset = 0;
     int reg_idx = 0;
 
-    int dim_remaining = embedding_dim;
+    if constexpr (std::is_same_v<emb_t, half>) {
+      // For half: vector store 128 elements per iteration (64 threads * 2 halfs)
+      constexpr int num_vector_ops = embedding_dim / 128;
 
-    // vector store as many elements as possible
-    constexpr int num_vector_ops = embedding_dim / 128;
+      #pragma unroll
+      for(int i = 0; i < num_vector_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half2);
 
-    #pragma unroll
-    for(int i = 0; i < num_vector_ops; i++)
-    {
-      int voffset = (offset + lane_id) * sizeof(half2);
+        // Pack two half values into half2 for vectorized store
+        half2 val;
+        val.x = acc[reg_idx];
+        val.y = acc[reg_idx + 1];
+        llvm_amdgcn_raw_buffer_store_fp16x2(val, out_res, voffset);
 
-      // Pack two half values into half2 for vectorized store
-      half2 val;
-      val.x = acc[reg_idx];
-      val.y = acc[reg_idx + 1];
-      llvm_amdgcn_raw_buffer_store_fp16x2(val, out_res, voffset);
+        offset += 128;
+        reg_idx += 2;
+      }
 
-      offset += 128;
-      reg_idx += 2;
-      dim_remaining -= 128;
-    }
+      // store remaining elements (scalar stores)
+      constexpr int tail_start = num_vector_ops * 128;
+      constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
 
-    // store remaining elements (scalar stores)
-    constexpr int tail_start = num_vector_ops * 128;
-    constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+      #pragma unroll
+      for(int i = 0; i < num_scalar_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half);
 
-    #pragma unroll
-    for(int i = 0; i < num_scalar_ops; i++)
-    {
-      int voffset = (offset + lane_id) * sizeof(half);
+        llvm_amdgcn_raw_buffer_store_fp16(acc[reg_idx], out_res, voffset);
+        offset += 64;
+        reg_idx += 1;
+      }
+    } else if constexpr (std::is_same_v<emb_t, float>) {
+      // For float: store 64 elements per iteration (64 threads * 1 float)
+      constexpr int num_ops = (embedding_dim + 63) / 64;
 
-      llvm_amdgcn_raw_buffer_store_fp16(acc[reg_idx], out_res, voffset);
-      offset += 64;
-      reg_idx += 1;
-      dim_remaining -= 64;
+      #pragma unroll
+      for(int i = 0; i < num_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(float);
+        llvm_amdgcn_raw_buffer_store_fp32(acc[reg_idx], out_res, voffset);
+        offset += 64;
+        reg_idx += 1;
+      }
     }
   }
 };
