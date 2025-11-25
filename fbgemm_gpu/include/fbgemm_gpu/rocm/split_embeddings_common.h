@@ -148,6 +148,58 @@ struct load_row_per_warp {
       }
 };
 
+template <int32_t embedding_dim, typename index_t>
+  struct load_row_per_warp<half, embedding_dim, index_t>
+  {
+    static __device__ void run(
+        half *emb_data,
+        index_t row_index,
+        const half *p_emb_table,
+        int lane_id)
+    {
+      int32x4_t emb_res =
+          amdgcn_make_buffer_resource(p_emb_table + row_index * embedding_dim, sizeof(half) * embedding_dim);
+
+      int offset = 0;
+      int reg_idx = 0;
+
+      int dim_remaining = embedding_dim;
+
+      // vector load as many elements as possible
+      constexpr int num_vector_ops = embedding_dim / 128;
+						
+      #pragma unroll
+      for(int i = 0; i < num_vector_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half2);
+
+        half2 val = llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, voffset);
+        // Unpack into register array
+        emb_data[reg_idx] = val.x;
+        emb_data[reg_idx + 1] = val.y;
+
+        offset += 128;
+        reg_idx += 2;
+        dim_remaining -= 128;
+      }
+
+      // load remaining elements (scalar loads)
+      constexpr int tail_start = num_vector_ops * 128;
+      constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+
+      #pragma unroll
+      for(int i = 0; i < num_scalar_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half);
+
+        emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp16(emb_res, voffset);
+        offset += 64;
+        reg_idx += 1;
+        dim_remaining -= 64;
+      }
+    }
+  };
+
 template <typename index_t>
 struct load_row_per_warp<half, 64, index_t> {
   static __device__ void
@@ -428,6 +480,53 @@ struct store_row_per_warp<half, 320> {
     llvm_amdgcn_raw_buffer_store_fp16x2(*reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
     llvm_amdgcn_raw_buffer_store_fp16x2(*reinterpret_cast<const half2*>(acc + 2), out_res, (lane_id + 64) * sizeof(half2));
     llvm_amdgcn_raw_buffer_store_fp16(acc[4], out_res, (lane_id + 256) * sizeof(half));
+  }
+};
+
+template <int32_t embedding_dim>
+struct store_row_per_warp<half, embedding_dim> {
+  static __device__ void run(const half* acc, half* p_output, int lane_id) {
+    int32x4_t out_res =
+        amdgcn_make_buffer_resource(p_output, sizeof(half) * embedding_dim);
+
+    int offset = 0;
+    int reg_idx = 0;
+
+    int dim_remaining = embedding_dim;
+
+    // vector store as many elements as possible
+    constexpr int num_vector_ops = embedding_dim / 128;
+
+    #pragma unroll
+    for(int i = 0; i < num_vector_ops; i++)
+    {
+      int voffset = (offset + lane_id) * sizeof(half2);
+
+      // Pack two half values into half2 for vectorized store
+      half2 val;
+      val.x = acc[reg_idx];
+      val.y = acc[reg_idx + 1];
+      llvm_amdgcn_raw_buffer_store_fp16x2(val, out_res, voffset);
+
+      offset += 128;
+      reg_idx += 2;
+      dim_remaining -= 128;
+    }
+
+    // store remaining elements (scalar stores)
+    constexpr int tail_start = num_vector_ops * 128;
+    constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+
+    #pragma unroll
+    for(int i = 0; i < num_scalar_ops; i++)
+    {
+      int voffset = (offset + lane_id) * sizeof(half);
+
+      llvm_amdgcn_raw_buffer_store_fp16(acc[reg_idx], out_res, voffset);
+      offset += 64;
+      reg_idx += 1;
+      dim_remaining -= 64;
+    }
   }
 };
 
