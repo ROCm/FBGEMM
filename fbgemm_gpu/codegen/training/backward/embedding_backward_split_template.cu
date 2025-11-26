@@ -1257,7 +1257,7 @@ Tensor {{ embedding_cuda_op }}(
                     if (use_hip_kernel && !mixed_D && !cached && supported_weights_type && supported_grad_type && same_precision && rocm::is_supported_cdna())
                     {
                         constexpr int segments_per_workgroup = 4;
-                        {%- for kDimSize in [64, 128, 160, 192, 256, 320] %}
+                        {%- for kDimSize in [64, 96, 128, 160, 192, 256, 320] %}
                         {%- for kWeightDecayMode in [0, 1, 2] %}
                         if (max_D == {{ kDimSize }} && weight_decay_mode == {{ kWeightDecayMode }})
                         {
