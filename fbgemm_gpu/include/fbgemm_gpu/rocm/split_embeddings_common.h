@@ -266,9 +266,9 @@ struct accumulate_row_per_warp {
   }
 };
 
-template <typename emb_t, int32_t embedding_dim>
+template <typename emb_t, int32_t embedding_dim, typename index_t>
 struct store_row_per_warp {
-  static __device__ void run(const emb_t* acc, emb_t* p_output, int lane_id, int runtime_dim) {
+  static __device__ void run(const emb_t* acc, index_t row_index, emb_t* p_output_table, int lane_id, int runtime_dim) {
     // Types are not supported, but we need an instance of run method to avoid run-time .so symbol
     // failure. Currently, the kernel dispatch for unsupported type is guarded on host function
     if constexpr (std::is_same_v<emb_t, c10::BFloat16> || std::is_same_v<emb_t, c10::Float8_e4m3fnuz>) {
@@ -279,12 +279,12 @@ struct store_row_per_warp {
   }
 };
 
-template <typename emb_t, int32_t embedding_dim>
+template <typename emb_t, int32_t embedding_dim, typename index_t>
   requires(std::is_same_v<emb_t, half> || std::is_same_v<emb_t, float>)
-struct store_row_per_warp<emb_t, embedding_dim> {
-  static __device__ void run(const emb_t* acc, emb_t* p_output, int lane_id, int runtime_dim) {
+struct store_row_per_warp<emb_t, embedding_dim, index_t> {
+  static __device__ void run(const emb_t* acc, index_t row_index, emb_t* p_output_table, int lane_id, int32_t runtime_dim) {
     int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, sizeof(emb_t) * runtime_dim);
+        amdgcn_make_buffer_resource(p_output_table + row_index * runtime_dim, sizeof(emb_t) * runtime_dim);
 
     int offset = 0;
     int reg_idx = 0;
@@ -341,15 +341,17 @@ struct store_row_per_warp<emb_t, embedding_dim> {
   }
 };
 
-template <int32_t embedding_dim>
-struct store_row_per_warp<c10::Half, embedding_dim> {
+template <int32_t embedding_dim, typename index_t>
+struct store_row_per_warp<c10::Half, embedding_dim, index_t> {
   static __device__ void run(
       const c10::Half* emb_data,
+      index_t row_index,
       c10::Half* p_emb_table,
       int lane_id,
       int32_t runtime_dim) {
-        store_row_per_warp<half, embedding_dim>::run(
+        store_row_per_warp<half, embedding_dim, index_t>::run(
           reinterpret_cast<const half*>(emb_data),
+          row_index,
           reinterpret_cast<half*>(p_emb_table),
           lane_id,
           runtime_dim
