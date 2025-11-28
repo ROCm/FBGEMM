@@ -1457,9 +1457,9 @@ Tensor {{ embedding_cuda_op }}(
                     if (use_hip_kernel && !mixed_D && supported_weights_type && supported_grad_type && rocm::is_supported_cdna())
                     {
                         constexpr int segments_per_workgroup = 4;
-                        {%- for kDimSize in [64, 96, 128, 160, 192, 256, 320] %}
+                        {%- for kBucketDim in range(64, 2049, 64) %}
                         {%- for kWeightDecayMode in [0, 1, 2] %}
-                        if (max_D == {{ kDimSize }} && weight_decay_mode == {{ kWeightDecayMode }})
+                        if (max_D <= {{ kBucketDim }} && max_D > {{ kBucketDim - 64 }} && weight_decay_mode == {{ kWeightDecayMode }})
                         {
                             warp_per_row_grid_size = div_round_up(sorted_linear_indices_num_runs[0].item<int32_t>(), segments_per_workgroup);
                             blockSize = dim3(256);
@@ -1474,7 +1474,7 @@ Tensor {{ embedding_cuda_op }}(
                                     kFixedMaxVecsPerThread,
                                     kThreadGroupSize,
                                     kUseVecBlocking,
-                                    {{ kDimSize }},
+                                    {{ kBucketDim }},
                                     {{ kWeightDecayMode }}>;
                         }
                         {%- endfor %}
