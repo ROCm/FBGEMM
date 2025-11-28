@@ -235,12 +235,14 @@ struct load_row_per_warp<c10::Half, embedding_dim, index_t> {
       c10::Half* emb_data,
       index_t row_index,
       const c10::Half* p_emb_table,
-      int lane_id) {
+      int lane_id,
+      int32_t runtime_dim) {
     load_row_per_warp<half, embedding_dim, index_t>::run(
         reinterpret_cast<half*>(emb_data),
         row_index,
         reinterpret_cast<const half*>(p_emb_table),
-        lane_id);
+        lane_id,
+        runtime_dim);
   }
 };
 
@@ -355,12 +357,16 @@ struct store_row_per_warp<emb_t, embedding_dim> {
 
 template <int32_t embedding_dim>
 struct store_row_per_warp<c10::Half, embedding_dim> {
-  static __device__ void
-  run(const c10::Half* emb_data, c10::Half* p_emb_table, int lane_id) {
+  static __device__ void run(
+      const c10::Half* emb_data,
+      c10::Half* p_emb_table,
+      int lane_id,
+      int32_t runtime_dim) {
     store_row_per_warp<half, embedding_dim>::run(
         reinterpret_cast<const half*>(emb_data),
         reinterpret_cast<half*>(p_emb_table),
-        lane_id);
+        lane_id,
+        runtime_dim);
   }
 };
 
