@@ -167,6 +167,7 @@ __device__ __forceinline__ void cp_async_fence() {
 
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
+  asm volatile("s_waitcnt vmcnt(0)\n");
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
@@ -176,6 +177,7 @@ __device__ __forceinline__ void cp_async_wait() {
 /// Blocks until all previous cp.async.commit_group operations have committed.
 template <>
 __device__ __forceinline__ void cp_async_wait<0>() {
+  asm volatile("s_waitcnt vmcnt(0)\n");
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_all;\n" ::);
