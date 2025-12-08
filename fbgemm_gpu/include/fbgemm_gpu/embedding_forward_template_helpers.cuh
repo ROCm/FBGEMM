@@ -182,6 +182,34 @@ __device__ __forceinline__ void cp_async_wait<0>() {
 #endif
 }
 
+template<typename T>
+__device__ __forceinline__ uint32_t cvta_to_shared(const T* ptr) {
+    // First get the address as a size_t to handle all pointer sizes
+    size_t addr = reinterpret_cast<size_t>(ptr);
+
+    // Extract the lower 32 bits which represent the shared memory offset
+    // This is safe because shared memory addresses are always within 32-bit range
+    return static_cast<uint32_t>(addr & 0xFFFFFFFF);
+}
+
+__device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr) {
+  const int BYTES = 16;
+  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
+  #ifdef USE_ROCM
+  asm volatile("s_mov_b32 m0, %0\n"
+               "global_load_lds_dwordx4 %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
+  // __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(glob_ptr), smem_ptr, BYTES, 0, 0);
+  #else
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+  #endif
+}
+
 /// Partial specialization
 template <int SizeInBytes>
 __device__ __forceinline__ void

@@ -200,15 +200,13 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
           bool final_valid = row_valid_v[inner_i];
           if constexpr (PackedMode) {
             // Store row data with uint4_loads_per_row offset
-            cp_async_zfill_cg<sizeof(uint4)>(
+            cp_async4(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx + uint4_loads_per_row * packed_bag_load_idx],
-                &row_v[inner_i][row_load_idx],
-                final_valid);
+                (final_valid == true) ? &row_v[inner_i][row_load_idx] : &row_v[inner_i][0]);
           } else {
-            cp_async_zfill_cg<sizeof(uint4)>(
+            cp_async4(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx],
-                &row_v[inner_i][row_load_idx],
-                final_valid);
+                (final_valid == true) ? &row_v[inner_i][row_load_idx] : &row_v[inner_i][0]);
           }
           {% if weighted %}
           if (row_load_idx == 0)  {
