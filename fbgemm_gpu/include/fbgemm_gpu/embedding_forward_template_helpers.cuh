@@ -194,6 +194,24 @@ __device__ __forceinline__ uint32_t cvta_to_shared(const T* ptr) {
     return static_cast<uint32_t>(addr & 0xFFFFFFFF);
 }
 
+__device__ inline void cp_async(__shared__ void* smem_ptr, const void* glob_ptr) {
+  const int BYTES = 16;
+  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
+  #ifdef USE_ROCM
+  asm volatile("s_mov_b32 m0, %0\n"
+               "global_load_lds_dword %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
+  // __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(glob_ptr), smem_ptr, BYTES, 0, 0);
+  #else
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+  #endif
+}
+
 __device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 16;
   uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));

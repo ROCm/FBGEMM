@@ -208,15 +208,21 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
                 &buffers[warp_idx][i][input_row_idx][row_load_idx],
                 (final_valid == true) ? &row_v[inner_i][row_load_idx] : &row_v[inner_i][0]);
           }
-          {% if weighted %}
+        }
+        {% if weighted %}
+        #pragma unroll
+        for (uint32_t inner_i = 0; inner_i < kRowUnroll; inner_i++) {
+          uint32_t i = outer_i + inner_i;
+          bool final_valid = row_valid_v[inner_i] && (idx_v[inner_i] != -1);
           if (row_load_idx == 0)  {
             // Use only one thread to load the index weight to prevent a race
             // condition when writing to the shared memory
-            buffers_indice_weights[warp_idx][i][input_row_idx][packed_bag_load_idx] =
-              final_valid ? indice_weights[indices_starts[i] + L_start + input_row_idx] : 0.0;
+            cp_async(
+                &buffers_indice_weights[warp_idx][i][input_row_idx][packed_bag_load_idx],
+                final_valid ? &indice_weights[indices_starts[i] + L_start + input_row_idx] : &indice_weights[indices_starts[i] + L_start]);
           }
-          {% endif %}
         }
+        {% endif %}
       }
       {%- endif %}
 
