@@ -6,73 +6,137 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "common.cuh"
+ #include "common.cuh"
 
-using Tensor = at::Tensor;
+ using Tensor = at::Tensor;
+ 
+ namespace fbgemm_gpu {
+ 
+ template <
+     typename scalar_t, // scalar data type, e.g. float or half
+     typename index_t, // index data type, e.g. int32 or int64
+     typename acc_t, // accumulator data type, e.g. float or half
+     int NUM_THREADS_PER_BLOCK,
+     int MAX_ENTRIES_PER_BLOCK, // total entries a block covers (threads * VEC)
+     int VEC>
+ 
+ // Index Select + Cumulative Sum Kernel
+ // Fused operations to avoid extra kernel launch overhead
+ // Index select calculates output lengths
+ // Cumsum calculates output offsets
+ __global__ void index_select_scalar_cumsum_kernel(
+     pta::PackedTensorAccessor32<scalar_t, 1, at::RestrictPtrTraits> output,
+     pta::PackedTensorAccessor32<acc_t, 1, at::RestrictPtrTraits> output_cumsum,
+     const pta::PackedTensorAccessor32<scalar_t, 1, at::RestrictPtrTraits> input,
+     const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
+         indices,
+     const int num_batches,
+     const int input_batch_size,
+     const int last_block_num_entries,
+     int* block_flags,
+     acc_t* block_sums) {
+   typedef cub::BlockScan<acc_t, NUM_THREADS_PER_BLOCK> BlockScan; // CUDA's cumsum within one block
+   __shared__ typename BlockScan::TempStorage bs_temp_storage; // temp storage needed for cumsum
+   __shared__ acc_t block_prefix; // previous block prefix, minimizes shared usage on ROCm
+ 
+   const int output_batch_size = indices.size(0); // how many users are selected
+   const int num_entries = num_batches * output_batch_size; // total entries
+   const bool multi_block = gridDim.x > 1;
+   const int block_entries = blockIdx.x == gridDim.x - 1
+       ? last_block_num_entries // entries this block should cover
+       : MAX_ENTRIES_PER_BLOCK; // full entries capacity (threads * VEC)
+   const int block_entry_start = blockIdx.x * MAX_ENTRIES_PER_BLOCK;
+   const int remaining_entries = num_entries - block_entry_start;
+   const int num_entries_per_block = remaining_entries > 0
+       ? (remaining_entries < block_entries ? remaining_entries : block_entries)
+       : 0;
+       // total number of entries = num_batches (how many keys) * output_batch_size (how many users per key)
+       // an entry is the length of a user's embedding vector, a scalar value
+       // each thread handles one scalar value
+       // e.g. if there are 10 keys and 100 users are selected per key, there are 1000 entries
+       // first 3 blocks handle 256 entries
+       // the last block will handle 232 entries
+       // the cumsum kernel now uses these entries to find the offset values
+ 
+   const int base_entry = block_entry_start + threadIdx.x * VEC;
+   acc_t local_data[VEC];
+ 
+ #pragma unroll
+   for (int i = 0; i < VEC; ++i) {
+     const int entry = base_entry + i;
+     if (entry < num_entries) {
+       const int bid = entry / output_batch_size; // the key this threads works on
+       const int idx_in_batch = entry - bid * output_batch_size; // avoid expensive modulo on AMD
+       local_data[i] =
+ #ifdef __HIP_PLATFORM_AMD__
+           __builtin_nontemporal_load( // avoid polluting caches on MI-series
+               &input[bid * input_batch_size + indices[idx_in_batch]]);
+ #else
+           input[bid * input_batch_size + indices[idx_in_batch]];
+ #endif
+       output[entry] = local_data[i]; // output lengths
+     } else {
+       local_data[i] = 0;
+     }
+   }
+ 
+   // Fast path: single block needs only intra-block scan, no flags/sums
+   if (!multi_block) {
+     if (num_entries_per_block > 0) {
+       BlockScan(bs_temp_storage).InclusiveSum(local_data, local_data);
+     }
+     if (base_entry < num_entries) {
+ #pragma unroll
+       for (int i = 0; i < VEC; ++i) {
+         const int entry = base_entry + i;
+         if (entry < num_entries) {
+           output_cumsum[entry] = local_data[i];
+         }
+       }
+     }
+     return;
+   }
+ 
+   // Cumsum kernel calculates the output offsets
+   if (num_entries_per_block > 0) {
+     inclusive_sum_scan_kernel<acc_t, VEC, NUM_THREADS_PER_BLOCK>(
+         local_data,
+         bs_temp_storage,
+         block_flags,
+         block_sums,
+         &block_prefix,
+         num_entries_per_block,
+         blockIdx.x,
+         multi_block,
+         1);
+   }
+ 
+   // Store data
+   if (base_entry < num_entries) {
+ #pragma unroll
+     for (int i = 0; i < VEC; ++i) {
+       const int entry = base_entry + i;
+       if (entry < num_entries) {
+         output_cumsum[entry] = local_data[i]; // output offsets
+       }
+     }
+   }
+ }
+ 
+ template <
+     typename scalar_t,
+     typename index_t,
+     typename offset_t,
+     typename weight_t,
+     bool has_weights>
 
-namespace fbgemm_gpu {
+// Total amount of user embeddings may not fit into GPU memory.
+// This kernel gathers a subset of users from a total amount of users.
+// Gathers raw user's embeddings from scattered memory locations and
+// writes them into contiguous memory locations.
+// The kernel takes one big jagged tensor containing all keys stacked 
+// together, and selects the same indices across all keys in a single operation.
 
-template <
-    typename scalar_t,
-    typename index_t,
-    typename acc_t,
-    int NUM_THREADS_PER_BLOCK,
-    int MAX_ENTRIES_PER_BLOCK>
-__global__ void index_select_scalar_cumsum_kernel(
-    pta::PackedTensorAccessor32<scalar_t, 1, at::RestrictPtrTraits> output,
-    pta::PackedTensorAccessor32<acc_t, 1, at::RestrictPtrTraits> output_cumsum,
-    const pta::PackedTensorAccessor32<scalar_t, 1, at::RestrictPtrTraits> input,
-    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
-        indices,
-    const int num_batches,
-    const int input_batch_size,
-    const int last_block_num_entries,
-    int* block_flags,
-    acc_t* block_sums) {
-  typedef cub::BlockScan<acc_t, NUM_THREADS_PER_BLOCK> BlockScan;
-  __shared__ typename BlockScan::TempStorage bs_temp_storage;
-  __shared__ acc_t smem[MAX_ENTRIES_PER_BLOCK];
-  const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int output_batch_size = indices.size(0);
-  const int bid = tid / output_batch_size;
-  const auto num_entries_per_block = blockIdx.x == gridDim.x - 1
-      ? last_block_num_entries
-      : MAX_ENTRIES_PER_BLOCK;
-
-  // Load data
-  acc_t local_data[1];
-  if (tid < num_batches * output_batch_size) {
-    *local_data =
-        input[bid * input_batch_size + indices[tid % output_batch_size]];
-    output[tid] = *local_data;
-  } else {
-    *local_data = 0;
-  }
-
-  // Cumsum
-  inclusive_sum_scan_kernel<acc_t, 1, NUM_THREADS_PER_BLOCK>(
-      local_data,
-      bs_temp_storage,
-      block_flags,
-      block_sums,
-      &smem[0],
-      num_entries_per_block,
-      blockIdx.x,
-      gridDim.x > 1,
-      1);
-
-  // Store data
-  if (tid < num_batches * output_batch_size) {
-    output_cumsum[tid] = *local_data;
-  }
-}
-
-template <
-    typename scalar_t,
-    typename index_t,
-    typename offset_t,
-    typename weight_t,
-    bool has_weights>
 __global__ void keyed_jagged_index_select_dim1_kernel(
     pta::PackedTensorAccessor64<scalar_t, 1, at::RestrictPtrTraits> output,
     pta::PackedTensorAccessor64<weight_t, 1, at::RestrictPtrTraits>
@@ -121,6 +185,7 @@ __global__ void keyed_jagged_index_select_dim1_kernel(
   }
 }
 
+// Computes gradients for backpropagation during training.
 template <typename scalar_t, typename index_t, typename offset_t>
 __global__ void keyed_jagged_index_add_dim1_kernel(
     pta::PackedTensorAccessor64<scalar_t, 1, at::RestrictPtrTraits> output,

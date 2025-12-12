@@ -69,19 +69,23 @@ __inline__ __device__ void inclusive_sum_scan_kernel(
     const int block_id,
     const bool is_multi_block,
     const int signal) {
+
   // Perform scan within a block
   cub::BlockScan<scalar_t, NUM_THREADS_PER_BLOCK>(temp_storage)
       .InclusiveSum(arr, arr);
 
   // Perform stream scan across blocks
   if (is_multi_block) {
+    const bool is_last_thread =
+        threadIdx.x == (num_entries_per_block - 1) / ITEMS_PER_THREAD;
+
     // The thread that holds the last entry in the block does synchronization
-    if (threadIdx.x == (num_entries_per_block - 1) / ITEMS_PER_THREAD) {
+    // Writes this block’s sum for others blocks
+    if (is_last_thread) {
       scalar_t block_prev_local = 0;
       if (block_id != 0) {
         // Spin wait for the previous block to write the sum value
-        while (atomicAdd(&block_flags[block_id - 1], 0) < signal)
-          ;
+        volatile int* flags = block_flags;
 
         // Get sum from the previous block
         *block_prev = block_prev_local = block_sums[block_id - 1];
@@ -91,12 +95,13 @@ __inline__ __device__ void inclusive_sum_scan_kernel(
       const int scope = (num_entries_per_block - 1) % ITEMS_PER_THREAD;
       block_sums[block_id] = block_prev_local + arr[scope];
       __threadfence();
-      // Set a flag to notify the next block
-      atomicAdd(&block_flags[block_id], 1);
+      // Set a flag to notify the next block (store signal directly to avoid RMW)
+      atomicExch(&block_flags[block_id], signal);
     }
 
     __syncthreads();
 
+    // Shifts this block’s scan by the sum from previous block
     if (block_id != 0) {
       scalar_t block_prev_local = *block_prev;
       for (int i = 0; i < ITEMS_PER_THREAD; i++) {
