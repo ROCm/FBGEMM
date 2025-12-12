@@ -15,18 +15,24 @@ namespace fbgemm_gpu {
 namespace {
 
 constexpr int kGroupIndexWarpSize = kWarpSize;
-constexpr int GROUP_INDEX_SELECT_UNROLL_FACTOR = 1;
+constexpr int GROUP_INDEX_SELECT_UNROLL_FACTOR = 2;
 constexpr int GROUP_INDEX_SELECT_COLS_PER_WARP =
     GROUP_INDEX_SELECT_UNROLL_FACTOR * kGroupIndexWarpSize;
 constexpr int GROUP_INDEX_SELECT_LOG_COLS_PER_WARP =
     log2_calc<GROUP_INDEX_SELECT_COLS_PER_WARP>::value;
+constexpr int kGroupIndexDirectMappedSlots = 32;
+constexpr int kGroupIndexDirectMappedRowLimit = 48;
+constexpr int kGroupIndexHashtableRowLimit = 192;
 
 #ifdef USE_ROCM
 
-constexpr int kGroupIndexLdsColsThreshold = 256;
+constexpr int kGroupIndexLdsColsThreshold = 384;
 constexpr int kGroupIndexLdsCacheSlots = 8;
 constexpr size_t kGroupIndexLdsSharedMemBudgetBytes = 64 * 1024;
 
+static_assert(
+    (kGroupIndexDirectMappedSlots & (kGroupIndexDirectMappedSlots - 1)) == 0,
+    "kGroupIndexDirectMappedSlots must be a power of two");
 static_assert(
     (kGroupIndexLdsCacheSlots & (kGroupIndexLdsCacheSlots - 1)) == 0,
     "kGroupIndexLdsCacheSlots must be a power of two");
@@ -39,26 +45,37 @@ struct alignas(16) GroupIndexLdsCacheEntry {
   scalar_t vals[COLS_PER_WARP];
 };
 
-template <typename index_t, typename scalar_t, int COLS_PER_WARP>
+template <
+    typename index_t,
+    typename scalar_t,
+    int COLS_PER_WARP,
+    bool UseDirectMapped>
 constexpr size_t group_index_select_shared_mem_size() {
+  constexpr int slot_count =
+      UseDirectMapped ? kGroupIndexDirectMappedSlots : kGroupIndexLdsCacheSlots;
   constexpr size_t entry_bytes =
       sizeof(GroupIndexLdsCacheEntry<index_t, scalar_t, COLS_PER_WARP>);
   constexpr size_t total_bytes =
-      entry_bytes * kGroupIndexLdsCacheSlots *
-      (kMaxThreads / kGroupIndexWarpSize);
+      entry_bytes * slot_count * (kMaxThreads / kGroupIndexWarpSize);
   return total_bytes <= kGroupIndexLdsSharedMemBudgetBytes ? total_bytes : 0;
 }
 
-template <bool UseIndexSelect, bool UseLdsCache, typename index_t, typename scalar_t, int COLS_PER_WARP>
+template <
+    bool UseIndexSelect,
+    bool UseLdsCache,
+    bool UseDirectMapped,
+    typename index_t,
+    typename scalar_t,
+    int COLS_PER_WARP>
 constexpr size_t get_group_index_shared_mem_bytes() {
   if constexpr (UseIndexSelect || !UseLdsCache) {
     return 0;
-  } else {
-    return group_index_select_shared_mem_size<
-        index_t,
-        scalar_t,
-        COLS_PER_WARP>();
   }
+  return group_index_select_shared_mem_size<
+      index_t,
+      scalar_t,
+      COLS_PER_WARP,
+      UseDirectMapped>();
 }
 
 template <
@@ -67,6 +84,7 @@ template <
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
     bool USE_LDS_CACHE,
+    bool USE_DIRECT_LDS,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -81,6 +99,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t group_size) {
   const auto total_num_warps = warp_offsets_group[group_size];
   extern __shared__ __align__(16) unsigned char group_index_shared_cache[];
+  __shared__ index_t warp_index_cache[kMaxThreads / kGroupIndexWarpSize];
   if (USE_INDEX_SELECT) {
     for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
          warp_id < total_num_warps;
@@ -115,7 +134,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       scalar_t* output =
           reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
       index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-      const index_t idx = indices[row];
+      if (threadIdx.x == 0) {
+        warp_index_cache[threadIdx.y] = indices[row];
+      }
+      syncwarp();
+      const index_t idx = warp_index_cache[threadIdx.y];
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
         output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
@@ -128,7 +151,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         group_index_select_shared_mem_size<
             index_t,
             scalar_t,
-            COLS_PER_WARP>() > 0;
+            COLS_PER_WARP,
+            USE_DIRECT_LDS>() > 0;
+    constexpr int kLdsSlotCount = USE_DIRECT_LDS
+        ? kGroupIndexDirectMappedSlots
+        : kGroupIndexLdsCacheSlots;
     using LdsCacheEntry =
         GroupIndexLdsCacheEntry<index_t, scalar_t, COLS_PER_WARP>;
     __shared__ int lds_slot_buffer[kMaxThreads / kGroupIndexWarpSize];
@@ -150,8 +177,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     bool active_uses_lds = false;
     LdsCacheEntry* warp_cache = nullptr;
     if constexpr (kLdsCacheEnabled) {
-      warp_cache = reinterpret_cast<LdsCacheEntry*>(group_index_shared_cache) +
-          threadIdx.y * kGroupIndexLdsCacheSlots;
+      warp_cache =
+          reinterpret_cast<LdsCacheEntry*>(group_index_shared_cache) +
+          threadIdx.y * kLdsSlotCount;
     }
     const int lane_base = threadIdx.x * UNROLL_FACTOR;
 
@@ -221,80 +249,98 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 
     auto flush_lds_cache = [&](scalar_t* out_base, int32_t num_cols) {
       if constexpr (!kLdsCacheEnabled) {
-        (void)out_base;
-        (void)num_cols;
         return;
-      } else {
-        for (int slot = 0; slot < kGroupIndexLdsCacheSlots; ++slot) {
-          flush_lds_entry(slot, out_base, num_cols);
-        }
+      }
+      for (int slot = 0; slot < kLdsSlotCount; ++slot) {
+        flush_lds_entry(slot, out_base, num_cols);
       }
     };
 
     auto reset_lds_cache = [&]() {
       if constexpr (!kLdsCacheEnabled) {
         return;
-      } else {
-        for (int slot = threadIdx.x; slot < kGroupIndexLdsCacheSlots;
-             slot += kGroupIndexWarpSize) {
-          warp_cache[slot].valid = 0;
-        }
-        syncwarp();
       }
+      for (int slot = threadIdx.x; slot < kLdsSlotCount;
+           slot += kGroupIndexWarpSize) {
+        warp_cache[slot].valid = 0;
+      }
+      syncwarp();
     };
 
     auto acquire_lds_slot = [&](index_t idx, int32_t col_offset) {
       if constexpr (!kLdsCacheEnabled) {
-        (void)idx;
-        (void)col_offset;
         return -1;
-      } else {
-        if (!warp_cache) {
-          return -1;
+      } else if constexpr (USE_DIRECT_LDS) {
+        const int slot =
+            static_cast<int>(idx) & (kGroupIndexDirectMappedSlots - 1);
+        LdsCacheEntry& entry = warp_cache[slot];
+        const bool conflict = entry.valid && entry.idx != idx;
+        if (conflict) {
+          flush_lds_entry(slot, active_output_base, active_num_cols);
         }
-        if (threadIdx.x == 0) {
-          uint32_t hash = static_cast<uint32_t>(idx) * 0x9e3779b1u ^
-              static_cast<uint32_t>(col_offset);
-          int candidate = hash & (kGroupIndexLdsCacheSlots - 1);
-          int match_slot = -1;
-          int empty_slot = -1;
-          for (int attempt = 0; attempt < kGroupIndexLdsCacheSlots; ++attempt) {
-            const int slot = (candidate + attempt) &
-                (kGroupIndexLdsCacheSlots - 1);
-            const auto& entry = warp_cache[slot];
-            if (entry.valid && entry.idx == idx &&
-                entry.col_offset == col_offset) {
-              match_slot = slot;
+        if (!entry.valid || conflict) {
+#pragma unroll
+          for (int j = 0; j < UNROLL_FACTOR; ++j) {
+            const int col = lane_base + j;
+            if (col >= COLS_PER_WARP) {
               break;
             }
-            if (!entry.valid && empty_slot == -1) {
-              empty_slot = slot;
-            }
-          }
-          int chosen_slot = match_slot >= 0 ? match_slot : empty_slot;
-          if (chosen_slot < 0) {
-            chosen_slot = candidate;
-            lds_flush_slot_buffer[threadIdx.y] = chosen_slot;
-          } else {
-            lds_flush_slot_buffer[threadIdx.y] = -1;
-          }
-          lds_slot_buffer[threadIdx.y] = chosen_slot;
-          lds_new_entry_buffer[threadIdx.y] = match_slot < 0;
-        }
-        syncwarp();
-        int slot = lds_slot_buffer[threadIdx.y];
-        const int flush_slot = lds_flush_slot_buffer[threadIdx.y];
-        if (flush_slot >= 0) {
-          flush_lds_entry(flush_slot, active_output_base, active_num_cols);
-          if (threadIdx.x == 0) {
-            warp_cache[flush_slot].valid = 0;
+            entry.vals[col] = static_cast<scalar_t>(0);
           }
           syncwarp();
-          slot = flush_slot;
-          lds_new_entry_buffer[threadIdx.y] = 1;
+          if (threadIdx.x == 0) {
+            entry.idx = idx;
+            entry.col_offset = col_offset;
+            entry.valid = 1;
+          }
+          syncwarp();
         }
-        const bool initialize_slot = lds_new_entry_buffer[threadIdx.y];
-        if (initialize_slot) {
+        return slot;
+      } else {
+        constexpr unsigned long long kFullMask = 0xffffffffffffffffull;
+        constexpr int kSlotMask = kGroupIndexLdsCacheSlots - 1;
+        uint32_t hash = 2166136261u;
+        hash ^= static_cast<uint32_t>(idx);
+        hash *= 16777619u;
+        hash ^= static_cast<uint32_t>(col_offset);
+        hash *= 16777619u;
+        const int candidate = hash & kSlotMask;
+        const bool lane_active = threadIdx.x < kGroupIndexLdsCacheSlots;
+        const int lane_slot = lane_active
+            ? ((candidate + threadIdx.x) & kSlotMask)
+            : candidate;
+        bool lane_match = false;
+        bool lane_empty = false;
+        if (lane_active) {
+          const LdsCacheEntry& probed = warp_cache[lane_slot];
+          lane_match = probed.valid && probed.idx == idx &&
+              probed.col_offset == col_offset;
+          lane_empty = !probed.valid;
+        }
+        const unsigned long long match_mask =
+            __ballot_sync(kFullMask, lane_match);
+        int slot_owner = 0;
+        int slot = candidate;
+        int initialize_flag = 0;
+        if (match_mask) {
+          slot_owner = __ffsll(match_mask) - 1;
+          slot = __shfl_sync(kFullMask, lane_slot, slot_owner);
+        } else {
+          const unsigned long long empty_mask =
+              __ballot_sync(kFullMask, lane_empty);
+          if (empty_mask) {
+            slot_owner = __ffsll(empty_mask) - 1;
+            slot = __shfl_sync(kFullMask, lane_slot, slot_owner);
+            initialize_flag = 1;
+          } else {
+            flush_lds_entry(slot, active_output_base, active_num_cols);
+            initialize_flag = 1;
+          }
+        }
+        slot = __shfl_sync(kFullMask, slot, slot_owner);
+        initialize_flag =
+            __shfl_sync(kFullMask, initialize_flag, slot_owner);
+        if (initialize_flag) {
           if (threadIdx.x == 0) {
             warp_cache[slot].idx = idx;
             warp_cache[slot].col_offset = col_offset;
@@ -375,8 +421,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // Only enable LDS aggregation when a single warp fully covers the row
       // so we actually amortize the atomic traffic over duplicate indices.
       const bool member_uses_lds =
-          kLdsCacheEnabled && (num_cols <= kGroupIndexLdsColsThreshold) &&
-          (warps_per_row == 1);
+          kLdsCacheEnabled &&
+          (num_work_rows <= (USE_DIRECT_LDS ? kGroupIndexDirectMappedRowLimit
+                                            : kGroupIndexHashtableRowLimit)) &&
+          (num_cols <= kGroupIndexLdsColsThreshold) && (warps_per_row == 1);
       const bool member_changed = member_id != active_member_id;
       const bool num_cols_changed =
           member_changed ? false : (num_cols != active_num_cols);
@@ -414,7 +462,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         continue;
       }
 
-      const index_t idx = active_indices[row];
+      if (threadIdx.x == 0) {
+        warp_index_cache[threadIdx.y] = active_indices[row];
+      }
+      syncwarp();
+      const index_t idx = warp_index_cache[threadIdx.y];
 
       scalar_t local_vals[UNROLL_FACTOR];
 #pragma unroll
@@ -502,8 +554,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 
 #else // !USE_ROCM
 
-template <bool UseIndexSelect, typename index_t, typename scalar_t, int COLS_PER_WARP>
+template <bool UseIndexSelect, bool UseDirectMapped, typename index_t, typename scalar_t, int COLS_PER_WARP>
 constexpr size_t get_group_index_shared_mem_bytes() {
+  (void)UseDirectMapped;
   return 0;
 }
 
@@ -512,6 +565,8 @@ template <
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
+    bool /*USE_LDS_CACHE*/,
+    bool /*USE_DIRECT_LDS*/,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -566,7 +621,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-    const index_t idx = indices[row];
+    if (threadIdx.x == 0) {
+      warp_index_cache[threadIdx.y] = indices[row];
+    }
+    syncwarp();
+    const index_t idx = warp_index_cache[threadIdx.y];
 #pragma unroll
     for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
       if constexpr (USE_INDEX_SELECT) {
@@ -586,6 +645,12 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 int get_group_index_select_cols_per_warp() {
   return GROUP_INDEX_SELECT_COLS_PER_WARP;
 }
+
+enum class GroupIndexLdsStrategy : uint8_t {
+  kDisabled = 0,
+  kDirectMapped,
+  kHashtable,
+};
 
 DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t* input_ptrs,
@@ -608,7 +673,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
   at::cuda::OptionalCUDAGuard device_guard(device);
 
 #ifdef USE_ROCM
-  bool enable_lds_cache = false;
+  GroupIndexLdsStrategy lds_strategy = GroupIndexLdsStrategy::kDisabled;
   if (!use_index_select && group_size > 0) {
     std::vector<int32_t> num_cols_host(group_size);
     auto memcpy_status = cudaMemcpy(
@@ -620,35 +685,51 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
         memcpy_status == cudaSuccess,
         "Failed to copy num_cols_group for LDS heuristic");
     const int cols_per_warp = get_group_index_select_cols_per_warp();
+    bool lds_candidate_found = false;
     for (int i = 0; i < group_size; ++i) {
       const int num_cols = num_cols_host[i];
       const int warps_per_row =
           (num_cols + cols_per_warp - 1) / cols_per_warp;
       if (num_cols <= kGroupIndexLdsColsThreshold && warps_per_row == 1) {
-        enable_lds_cache = true;
+        lds_candidate_found = true;
         break;
       }
     }
+    if (lds_candidate_found) {
+      if (num_work_rows <= kGroupIndexDirectMappedRowLimit) {
+        lds_strategy = GroupIndexLdsStrategy::kDirectMapped;
+      } else if (num_work_rows <= kGroupIndexHashtableRowLimit) {
+        lds_strategy = GroupIndexLdsStrategy::kHashtable;
+      }
+    }
   }
-  const bool enable_lds_cache_flag = enable_lds_cache;
-#else
-  constexpr bool enable_lds_cache_flag = false;
 #endif
 
   uint32_t num_warps_per_threadblock = kMaxThreads / kGroupIndexWarpSize;
-  uint32_t max_grid_size =
-      at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
-  uint32_t grid_size = std::min(
-      cuda_calc_xblock_count(total_num_warps, num_warps_per_threadblock),
-      max_grid_size);
   dim3 block_size(kGroupIndexWarpSize, num_warps_per_threadblock, 1);
+  const auto* device_prop = at::cuda::getCurrentDeviceProperties();
+  const int block_threads = block_size.x * block_size.y * block_size.z;
+  const int max_blocks_per_sm = std::max(
+      1,
+      device_prop->maxThreadsPerMultiProcessor / block_threads);
+  const uint32_t requested_grid =
+      cuda_calc_xblock_count(total_num_warps, num_warps_per_threadblock);
+  const int occupancy_multiplier = use_index_select ? 6 : 8;
+  const uint32_t occupancy_cap = std::max(
+      1,
+      max_blocks_per_sm * device_prop->multiProcessorCount *
+          occupancy_multiplier);
+  uint32_t grid_size = std::min(requested_grid, occupancy_cap);
+  grid_size =
+      std::max<uint32_t>(grid_size, device_prop->multiProcessorCount);
 
-#define INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, USE_LDS_CACHE_FLAG) \
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, USE_LDS_CACHE_FLAG, USE_DIRECT_LDS_FLAG) \
   do { \
     constexpr size_t shared_mem_bytes = \
         get_group_index_shared_mem_bytes< \
             USE_INDEX_SELECT_FLAG, \
             USE_LDS_CACHE_FLAG, \
+            USE_DIRECT_LDS_FLAG, \
             index_t, \
             scalar_t, \
             GROUP_INDEX_SELECT_COLS_PER_WARP>(); \
@@ -659,6 +740,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
             USE_INDEX_SELECT_FLAG, \
             USE_VAR_COLS_FLAG, \
             USE_LDS_CACHE_FLAG, \
+            USE_DIRECT_LDS_FLAG, \
             GROUP_INDEX_SELECT_UNROLL_FACTOR, \
             GROUP_INDEX_SELECT_COLS_PER_WARP, \
             GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>), \
@@ -677,10 +759,15 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
 
 #define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG) \
   do { \
-    if (enable_lds_cache_flag) { \
-      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, true); \
+    if (lds_strategy == GroupIndexLdsStrategy::kDirectMapped) { \
+      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY( \
+          USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, true, true); \
+    } else if (lds_strategy == GroupIndexLdsStrategy::kHashtable) { \
+      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY( \
+          USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, true, false); \
     } else { \
-      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS(USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, false); \
+      INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY( \
+          USE_INDEX_SELECT_FLAG, USE_VAR_COLS_FLAG, false, false); \
     } \
   } while (0)
 
@@ -705,7 +792,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       });
 
 #undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
-#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_LDS
+#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY
 }
 
 } // namespace fbgemm_gpu
