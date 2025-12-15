@@ -7,6 +7,8 @@
  */
 
  #include "common.cuh"
+ #include <roctracer/include/roctracer_ext.h>
+
 
  using Tensor = at::Tensor;
  
@@ -52,7 +54,7 @@
        : 0;
        // total number of entries = num_batches (how many keys) * output_batch_size (how many users per key)
        // an entry is the length of a user's embedding vector, a scalar value
-       // each thread handles one scalar value
+       // each thread handles one scalar value if VEC=1
        // e.g. if there are 10 keys and 100 users are selected per key, there are 1000 entries
        // first 3 blocks handle 256 entries
        // the last block will handle 232 entries
@@ -67,12 +69,13 @@
      if (entry < num_entries) {
        const int bid = entry / output_batch_size; // the key this threads works on
        const int idx_in_batch = entry - bid * output_batch_size; // avoid expensive modulo on AMD
+      const index_t sel_idx = indices[idx_in_batch]; // prefetch index into register
        local_data[i] =
  #ifdef __HIP_PLATFORM_AMD__
            __builtin_nontemporal_load( // avoid polluting caches on MI-series
-               &input[bid * input_batch_size + indices[idx_in_batch]]);
+              &input[bid * input_batch_size + sel_idx]);
  #else
-           input[bid * input_batch_size + indices[idx_in_batch]];
+          input[bid * input_batch_size + sel_idx];
  #endif
        output[entry] = local_data[i]; // output lengths
      } else {
@@ -120,8 +123,8 @@
          output_cumsum[entry] = local_data[i]; // output offsets
        }
      }
-   }
- }
+   }   
+  }
  
  template <
      typename scalar_t,
@@ -248,8 +251,17 @@ class KeyedJaggedIndexSelectDim1GPUOp
     const int num_batches = lengths.numel() / batch_size;
     const int num_output_lengths = num_batches * indices.numel();
     const int MAX_CUMSUM_ENTRIES_PER_BLOCK = 256;
-    auto grid_size = cuda_calc_xblock_count(
-        num_output_lengths, MAX_CUMSUM_ENTRIES_PER_BLOCK);
+    const int vec_candidates[] = {4, 2, 1};
+    int VEC = 1;
+    for (int v : vec_candidates) {
+      if (indices.numel() % v == 0) {
+        VEC = v;
+        break;
+      }
+    }
+    const int ENTRIES_PER_BLOCK = MAX_CUMSUM_ENTRIES_PER_BLOCK * VEC;
+    auto grid_size = (num_output_lengths + ENTRIES_PER_BLOCK - 1) /
+        ENTRIES_PER_BLOCK;
 
     Tensor output_offsets =
         at::empty({num_batches * indices.numel()}, offsets.options());
@@ -281,7 +293,8 @@ class KeyedJaggedIndexSelectDim1GPUOp
                               index_t,
                               offset_t,
                               MAX_CUMSUM_ENTRIES_PER_BLOCK,
-                              MAX_CUMSUM_ENTRIES_PER_BLOCK>),
+                              ENTRIES_PER_BLOCK,
+                              VEC>),
                           grid_size,
                           MAX_CUMSUM_ENTRIES_PER_BLOCK,
                           0,
@@ -292,8 +305,10 @@ class KeyedJaggedIndexSelectDim1GPUOp
                           PTA_B(indices, index_t, 1, 32),
                           num_batches,
                           batch_size,
-                          num_output_lengths -
-                              MAX_CUMSUM_ENTRIES_PER_BLOCK * (grid_size - 1),
+                          grid_size == 0
+                              ? 0
+                              : num_output_lengths -
+                          ENTRIES_PER_BLOCK * (grid_size - 1),
                           grid_size > 1 ? block_flags.data_ptr<int>() : nullptr,
                           grid_size > 1 ? block_sums.data_ptr<offset_t>()
                                         : nullptr);
