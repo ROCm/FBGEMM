@@ -42,6 +42,120 @@ template <
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
 __global__
+__launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel_small(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const int64_t num_work_rows, // number of rows to work on per member
+    const int64_t group_size) {
+  const auto total_num_warps = warp_offsets_group[group_size];
+  int32_t num_cols = 0;
+  int32_t warps_per_row = 0;
+
+  if constexpr (!USE_VAR_COLS) {
+    num_cols = num_cols_group[0];
+    warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+  }
+
+  for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+       warp_id < total_num_warps;
+       warp_id += gridDim.x * blockDim.y) {
+    int32_t member_id = 0;
+    int32_t member_warp_id = 0;
+    if constexpr (USE_VAR_COLS) {
+      __shared__ int member_ids[kMaxThreads / EMULATED_WARP_SIZE];
+      if (threadIdx.x == 0) {
+        binary_search_range(
+            &member_ids[threadIdx.y],
+            warp_offsets_group + 1,
+            warp_id,
+            group_size);
+      }
+      syncwarp();
+      member_id = member_ids[threadIdx.y];
+      num_cols = num_cols_group[member_id];
+      warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+      member_warp_id = warp_id - warp_offsets_group[member_id];
+    } else {
+      // All columns are the same
+      member_id = warp_id / (warps_per_row * num_work_rows);
+      member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+    }
+
+    if (num_cols < COLS_PER_WARP) {
+      // Optimized path for small embedding dimensions
+      // Each warp processes 'rows_per_warp' rows
+      int rows_per_warp = COLS_PER_WARP / num_cols;
+      int64_t start_row = member_warp_id * rows_per_warp;
+      
+      // Since we are processing multiple rows within the warp, we need to
+      // map each lane to a specific row, in addition to the column
+      int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
+      int col = (threadIdx.x * UNROLL_FACTOR) % num_cols;
+      int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
+
+      // local_row may be out of bounds for the last few lanes in the warp
+      // if [COLS_PER_WARP % num_cols != 0]
+      // TODO: check if current_row < num_work_rows is necessary
+      if (local_row < rows_per_warp && current_row < num_work_rows) {
+        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+        index_t idx = indices[current_row];
+
+        scalar_t* input_base = reinterpret_cast<scalar_t*>(input_ptrs[member_id]);
+        scalar_t* output_base = reinterpret_cast<scalar_t*>(output_ptrs[member_id]);
+
+#pragma unroll
+        for (int i = 0; i < UNROLL_FACTOR && col + i < num_cols; i++) {
+          if constexpr (USE_INDEX_SELECT) {
+            output_base[current_row * num_cols + col] = 
+                LDG(&input_base[idx * num_cols + col]);
+          } else {
+            gpuAtomicAddNoReturn(
+                &output_base[idx * num_cols + col], 
+                input_base[current_row * num_cols + col]);
+          }
+        }
+      }
+    } else {
+      // Large embedding dimensions use >= 1 warp per row
+      
+      const auto row = member_warp_id / warps_per_row;
+      const auto col_offset =
+          ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
+          (threadIdx.x * UNROLL_FACTOR);
+      
+      scalar_t* input =
+          reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
+      scalar_t* output =
+          reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
+
+      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+      const index_t idx = indices[row];
+
+#pragma unroll
+      for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
+        if constexpr (USE_INDEX_SELECT) {
+          output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+        } else {
+          gpuAtomicAddNoReturn(
+              &output[idx * num_cols + i], input[row * num_cols + i]);
+        }
+      }
+    }
+  }
+}
+
+template <
+    typename index_t,
+    typename scalar_t,
+    bool USE_INDEX_SELECT,
+    bool USE_VAR_COLS,
+    int UNROLL_FACTOR,
+    int COLS_PER_WARP,
+    int LOG_COLS_PER_WARP>
+__global__
 __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
@@ -219,6 +333,79 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       });
 
 #undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
+}
+
+DLL_PUBLIC void group_index_select_or_add_cuda_smallEmbD(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const c10::ScalarType& input_scalar_type,
+    const c10::ScalarType& indices_scalar_type,
+    const c10::DeviceIndex& device,
+    const int num_work_rows,
+    const int64_t total_num_warps,
+    const int group_size,
+    const bool use_index_select,
+    const bool use_var_cols) {
+  if (group_size == 0) {
+    return;
+  }
+
+  at::cuda::OptionalCUDAGuard device_guard(device);
+
+  // Partition work based on num_work_rows
+  uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
+  uint32_t max_grid_size =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount * 8;
+  uint32_t grid_size = std::min(
+      cuda_calc_xblock_count(total_num_warps, num_warps_per_threadblock),
+      max_grid_size);
+  dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
+
+  // Launcher Macro for Small Kernel
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(USE_INDEX_SELECT, USE_VAR_COLS) \
+  FBGEMM_LAUNCH_KERNEL(                                                  \
+      (group_index_select_or_add_2d_kernel_small<                        \
+          index_t,                                                       \
+          scalar_t,                                                      \
+          USE_INDEX_SELECT,                                              \
+          USE_VAR_COLS,                                                  \
+          GROUP_INDEX_SELECT_COLS_PER_WARP>),                            \
+      grid_size,                                                         \
+      block_size,                                                        \
+      0,                                                                 \
+      at::cuda::getCurrentCUDAStream(),                                  \
+      input_ptrs,                                                        \
+      output_ptrs,                                                       \
+      indices_ptrs,                                                      \
+      warp_offsets_group,                                                \
+      num_cols_group,                                                    \
+      num_work_rows,                                                     \
+      group_size)
+
+  AT_DISPATCH_INDEX_TYPES(
+      indices_scalar_type, "group_index_select_2d_small_wrapper_1", [&] {
+        FBGEMM_DISPATCH_FLOATING_TYPES(
+            input_scalar_type, "group_index_select_2d_small_wrapper_2", [&] {
+              if (use_index_select) {
+                if (use_var_cols) {
+                  INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(true, true);
+                } else {
+                  INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(true, false);
+                }
+              } else {
+                if (use_var_cols) {
+                  INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(false, true);
+                } else {
+                  INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(false, false);
+                }
+              }
+            });
+      });
+
+#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL
 }
 
 } // namespace fbgemm_gpu

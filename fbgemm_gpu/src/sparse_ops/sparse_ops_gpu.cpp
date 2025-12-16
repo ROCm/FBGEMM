@@ -232,28 +232,48 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   args_ptrs_offsets[NUM_ARGS] = offset;
 
   // Allocate memory for GroupIndexSelectArgs
-  at::Tensor args_tensor = at::empty(
+  at::Tensor args_tensor_small = at::empty(
       {static_cast<long>(args_ptrs_offsets[NUM_ARGS] * sizeof(int64_t))},
       at::TensorOptions().dtype(at::kByte).pinned_memory(true));
 
-  // Ensure that args_tensor is contiguous
-  TORCH_CHECK(args_tensor.is_contiguous());
+  at::Tensor args_tensor_large = at::empty(
+      {static_cast<long>(args_ptrs_offsets[NUM_ARGS] * sizeof(int64_t))},
+      at::TensorOptions().dtype(at::kByte).pinned_memory(true));
 
-  // Initialize raw pointers to point to Tensor args_tensor
-  int64_t* input_ptrs = nullptr;
-  int64_t* output_ptrs = nullptr;
-  int64_t* indices_ptrs = nullptr;
-  int64_t* warp_offsets_group = nullptr;
-  int32_t* num_cols_group = nullptr;
+  // Ensure that args_tensors are contiguous
+  TORCH_CHECK(args_tensor_small.is_contiguous());
+  TORCH_CHECK(args_tensor_large.is_contiguous());
+
+  // defining a struct that will maintain the arguments required by
+  // the GPU kernel
+  struct SplitArgs {
+    int64_t* input_ptrs = nullptr;
+    int64_t* output_ptrs = nullptr;
+    int64_t* indices_ptrs = nullptr;
+    int64_t* warp_offsets_group = nullptr;
+    int32_t* num_cols_group = nullptr;
+    int64_t total_warps = 0;
+    int64_t count = 0;
+  } small, large; // small and large structs to hold args for small and large
+     // tables respectively
 
   // Offset host pointers
   offset_args(
-      &input_ptrs,
-      &output_ptrs,
-      &indices_ptrs,
-      &warp_offsets_group,
-      &num_cols_group,
-      reinterpret_cast<int64_t*>(args_tensor.data_ptr()),
+      &small.input_ptrs,
+      &small.output_ptrs,
+      &small.indices_ptrs,
+      &small.warp_offsets_group,
+      &small.num_cols_group,
+      reinterpret_cast<int64_t*>(args_tensor_small.data_ptr()),
+      args_ptrs_offsets);
+
+  offset_args(
+      &large.input_ptrs,
+      &large.output_ptrs,
+      &large.indices_ptrs,
+      &large.warp_offsets_group,
+      &large.num_cols_group,
+      reinterpret_cast<int64_t*>(args_tensor_large.data_ptr()),
       args_ptrs_offsets);
 
   auto& first_input = input_group[0];
@@ -315,6 +335,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       warps_needed = warps_per_row * num_output_rows_;
     }
 
+    // TODO: maintain [use_var_cols] separately for small emb dims
     if (num_cols != num_cols_) {
       use_var_cols = true;
     }
@@ -332,83 +353,153 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     input_contigs.push_back(input.expect_contiguous());
     index_contigs.push_back(indices.expect_contiguous());
 
-    // Store args
-    input_ptrs[i] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
-    output_ptrs[i] = reinterpret_cast<int64_t>(output.data_ptr());
-    indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
-    warp_offsets_group[i] = warp_offset;
-    num_cols_group[i] = num_cols_;
-
-    warp_offset += warps_needed;
+    if (num_cols_ < cols_per_warp) {
+        // Optimization for Small Embedding: Pack multiple rows per warp
+        small.input_ptrs[small.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
+        small.output_ptrs[small.count] = reinterpret_cast<int64_t>(output.data_ptr());
+        small.indices_ptrs[small.count] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+        small.num_cols_group[small.count] = num_cols_;
+        small.warp_offsets_group[small.count] = small.total_warps;
+        small.total_warps += warps_needed;
+        small.count++;
+    } else {
+        // Standard Embedding: One or more warps per row
+        large.input_ptrs[large.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
+        large.output_ptrs[large.count] = reinterpret_cast<int64_t>(output.data_ptr());
+        large.indices_ptrs[large.count] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+        large.num_cols_group[large.count] = num_cols_;
+        large.warp_offsets_group[large.count] = large.total_warps;
+        large.total_warps += warps_needed;
+        large.count++;
+    }
   }
 
   // Store the last offset
-  warp_offsets_group[group_size] = warp_offset;
+  if (small.count > 0) {
+    small.warp_offsets_group[small.count] = small.total_warps;
+  }
+  if (large.count > 0) {
+    large.warp_offsets_group[large.count] = large.total_warps;
+  }
 
-  // Transfer args tensor to GPU
-  args_tensor = args_tensor.to(
-      first_input.device(),
-      /*non_blocking=*/true);
+  // Transfer args tensors to GPU
+  if(small.count > 0) {
+    args_tensor_small = args_tensor_small.to(
+        first_input.device(),
+        /*non_blocking=*/true);
+        
+        // Offset raw ptrs in GPU memory
+        offset_args(
+            &small.input_ptrs,
+            &small.output_ptrs,
+            &small.indices_ptrs,
+            &small.warp_offsets_group,
+            &small.num_cols_group,
+            reinterpret_cast<int64_t*>(args_tensor_small.data_ptr()),
+            args_ptrs_offsets);
+  }
 
-  // Offset raw ptrs in GPU memory
-  offset_args(
-      &input_ptrs,
-      &output_ptrs,
-      &indices_ptrs,
-      &warp_offsets_group,
-      &num_cols_group,
-      reinterpret_cast<int64_t*>(args_tensor.data_ptr()),
-      args_ptrs_offsets);
+  if(large.count > 0) {
+    args_tensor_large = args_tensor_large.to(
+        first_input.device(),
+        /*non_blocking=*/true);
+        
+        // Offset raw ptrs in GPU memory
+        offset_args(
+            &large.input_ptrs,
+            &large.output_ptrs,
+            &large.indices_ptrs,
+            &large.warp_offsets_group,
+            &large.num_cols_group,
+            reinterpret_cast<int64_t*>(args_tensor_large.data_ptr()),
+            args_ptrs_offsets);
+  }  
 
-  int64_t saved_data[] = {
-      static_cast<int64_t>(group_size),
+  int64_t saved_data_small[] = {
+      static_cast<int64_t>(small.count),
       use_var_cols,
-      reinterpret_cast<int64_t>(warp_offsets_group),
-      reinterpret_cast<int64_t>(num_cols_group),
-      warp_offset,
+      reinterpret_cast<int64_t>(small.warp_offsets_group),
+      reinterpret_cast<int64_t>(small.num_cols_group),
+      small.total_warps,
   };
-  auto saved_data_t = at::empty(
-      {sizeof(saved_data) / sizeof(int64_t)},
+  auto saved_data_t_small = at::empty(
+      {sizeof(saved_data_small) / sizeof(int64_t)},
       at::TensorOptions().dtype(at::kLong));
-  TORCH_CHECK(saved_data_t.is_contiguous());
-  memcpy(saved_data_t.data_ptr<int64_t>(), saved_data, sizeof(saved_data));
+  TORCH_CHECK(saved_data_t_small.is_contiguous());
+  memcpy(saved_data_t_small.data_ptr<int64_t>(), saved_data_small, sizeof(saved_data_small));
 
-  group_index_select_or_add_cuda(
-      input_ptrs,
-      output_ptrs,
-      indices_ptrs,
-      warp_offsets_group,
-      num_cols_group,
-      first_input.scalar_type(),
-      first_indices.scalar_type(),
-      first_input.device().index(),
-      num_output_rows,
-      /*total_num_warps=*/warp_offset,
-      group_size,
-      /*use_index_select=*/true,
-      use_var_cols);
+  int64_t saved_data_large[] = {
+      static_cast<int64_t>(large.count),
+      use_var_cols,
+      reinterpret_cast<int64_t>(large.warp_offsets_group),
+      reinterpret_cast<int64_t>(large.num_cols_group),
+      large.total_warps,
+  };
+  auto saved_data_t_large = at::empty(
+      {sizeof(saved_data_large) / sizeof(int64_t)},
+      at::TensorOptions().dtype(at::kLong));
+  TORCH_CHECK(saved_data_t_large.is_contiguous());
+  memcpy(saved_data_t_large.data_ptr<int64_t>(), saved_data_large, sizeof(saved_data_large));
 
-  output_group.push_back(args_tensor);
-  output_group.push_back(saved_data_t);
+  if(small.count > 0) {
+    group_index_select_or_add_cuda_smallEmbD(
+        small.input_ptrs,
+        small.output_ptrs,
+        small.indices_ptrs,
+        small.warp_offsets_group,
+        small.num_cols_group,
+        first_input.scalar_type(),
+        first_indices.scalar_type(),
+        first_input.device().index(),
+        num_output_rows,
+        /*total_num_warps=*/small.total_warps,
+        small.count,
+        /*use_index_select=*/true,
+        use_var_cols);
+  }
+
+  if(large.count > 0) {
+    group_index_select_or_add_cuda(
+        large.input_ptrs,
+        large.output_ptrs,
+        large.indices_ptrs,
+        large.warp_offsets_group,
+        large.num_cols_group,
+        first_input.scalar_type(),
+        first_indices.scalar_type(),
+        first_input.device().index(),
+        num_output_rows,
+        /*total_num_warps=*/large.total_warps,
+        large.count,
+        /*use_index_select=*/true,
+        use_var_cols);
+  }
+
+  output_group.push_back(args_tensor_small);
+  output_group.push_back(args_tensor_large);
+  output_group.push_back(saved_data_t_small);
+  output_group.push_back(saved_data_t_large);
 
   // return format:
-  // (group_size outputs, 1 args_tensor, 1 saved_data)
+  // (group_size outputs, 2 args_tensor2, 2 saved_data)
   return output_group;
 }
 
 static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     at::TensorList all_inputs,
     c10::SymIntArrayRef output_shape_group_ref) {
-  TORCH_CHECK(all_inputs.size() > 2);
+  TORCH_CHECK(all_inputs.size() > 4);
 
   // all_input size =  group_size * 2 (from grads, indices)
-  // + 1 args_tensor + 1 saved_data + 1 first input
-  const int64_t group_size = (all_inputs.size() - 3) / 2;
+  // + 2 args_tensor2 + 2 saved_data + 1 first input
+  const int64_t group_size = (all_inputs.size() - 5) / 2;
 
-  const Tensor& fwd_input = all_inputs[2 * group_size + 2];
-  const int64_t output_dim = fwd_input.dim();
-  const Tensor& saved_data = all_inputs[2 * group_size + 1];
+  const Tensor& fwd_input = all_inputs[2 * group_size + 4];
+  const Tensor& saved_data_small = all_inputs[2 * group_size + 2];
+  const Tensor& saved_data_large = all_inputs[2 * group_size + 3];
+  
   const Tensor& first_indices = all_inputs[group_size];
+  const int64_t output_dim = fwd_input.dim();
 
   auto grad_output_group = std::vector<Tensor>(
       all_inputs.cbegin(), all_inputs.cbegin() + group_size);
@@ -422,15 +513,23 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       all_inputs.cbegin() + group_size, all_inputs.cbegin() + 2 * group_size);
 
   // Retrieve saved data
-  TORCH_CHECK(saved_data.device() == at::kCPU);
-  TORCH_CHECK(saved_data.is_contiguous());
-  int64_t* saved_data_ptr = saved_data.data_ptr<int64_t>();
-  // Check that the size is the same
-  TORCH_CHECK(saved_data_ptr[0] == group_size);
-  const bool use_var_cols = saved_data_ptr[1];
-  int64_t* warp_offsets_group = reinterpret_cast<int64_t*>(saved_data_ptr[2]);
-  int32_t* num_cols_group = reinterpret_cast<int32_t*>(saved_data_ptr[3]);
-  int64_t total_num_warps = saved_data_ptr[4];
+  TORCH_CHECK(saved_data_small.device() == at::kCPU);
+  TORCH_CHECK(saved_data_small.is_contiguous());
+  int64_t* saved_data_small_ptr = saved_data_small.data_ptr<int64_t>();
+  auto count_small = saved_data_small_ptr[0];
+  const bool use_var_cols = saved_data_small_ptr[1];
+  int64_t* warp_offsets_group_small = reinterpret_cast<int64_t*>(saved_data_small_ptr[2]);
+  int32_t* num_cols_group_small = reinterpret_cast<int32_t*>(saved_data_small_ptr[3]);
+  int64_t total_num_warps_small = saved_data_small_ptr[4];
+
+  TORCH_CHECK(saved_data_large.device() == at::kCPU);
+  TORCH_CHECK(saved_data_large.is_contiguous());
+  int64_t* saved_data_large_ptr = saved_data_large.data_ptr<int64_t>();
+  auto count_large = saved_data_large_ptr[0];
+  const bool use_var_cols_large = saved_data_large_ptr[1];
+  int64_t* warp_offsets_group_large = reinterpret_cast<int64_t*>(saved_data_large_ptr[2]);
+  int32_t* num_cols_group_large = reinterpret_cast<int32_t*>(saved_data_large_ptr[3]);
+  int64_t total_num_warps_large = saved_data_large_ptr[4];  
 
   // We checked in forward that all output rows are the same for all member
   // in the group
@@ -453,15 +552,25 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     outputs.push_back(at::empty({0}, at::TensorOptions().dtype(at::kLong)));
   }
 
-  // Allocate Tensor for ptrs of grad output and input, and indices
-  Tensor args_tensor = at::empty(
-      {group_size * 3},
+  // Allocate Tensors for ptrs of grad output and input, and indices
+  Tensor args_tensor_small = at::empty(
+      {count_small * 3},
       at::TensorOptions().dtype(at::kLong).pinned_memory(true));
-  // Ensure that args_tensor is contiguous
-  TORCH_CHECK(args_tensor.is_contiguous());
-  int64_t* grad_output_ptrs = args_tensor.data_ptr<int64_t>();
-  int64_t* grad_input_ptrs = args_tensor.data_ptr<int64_t>() + group_size;
-  int64_t* indices_ptrs = args_tensor.data_ptr<int64_t>() + 2 * group_size;
+
+  Tensor args_tensor_large = at::empty(
+      {count_large * 3},
+      at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+  // Ensure that args_tensors are contiguous
+  TORCH_CHECK(args_tensor_small.is_contiguous());
+  TORCH_CHECK(args_tensor_large.is_contiguous());
+
+  int64_t* grad_output_ptrs_small = args_tensor_small.data_ptr<int64_t>();
+  int64_t* grad_input_ptrs_small = args_tensor_small.data_ptr<int64_t>() + count_small;
+  int64_t* indices_ptrs_small = args_tensor_small.data_ptr<int64_t>() + 2 * count_small;
+
+  int64_t* grad_output_ptrs_large = args_tensor_large.data_ptr<int64_t>();
+  int64_t* grad_input_ptrs_large = args_tensor_large.data_ptr<int64_t>() + count_large;
+  int64_t* indices_ptrs_large = args_tensor_large.data_ptr<int64_t>() + 2 * count_large;
 
   int64_t group_grad_input_numel = 0;
   std::vector<int64_t> grad_input_numels;
@@ -471,6 +580,10 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   // that the contiguous tensors will outlive the kernel computation
   std::vector<c10::MaybeOwned<at::Tensor>> grad_output_contigs;
   grad_output_contigs.reserve(group_size);
+
+  const int cols_per_warp = get_group_index_select_cols_per_warp();
+  int64_t idx_small = 0;
+  int64_t idx_large = 0;
 
   for (const auto i : c10::irange(group_size)) {
     const auto& grad = grad_output_group[i];
@@ -488,8 +601,15 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     group_grad_input_numel += grad_input_numel;
 
     // Put all grad output/input pointers in an array
-    grad_output_ptrs[i] =
-        reinterpret_cast<int64_t>(grad_output_contigs[i]->data_ptr());
+    if(grad.size(1) < cols_per_warp) {
+      grad_output_ptrs_small[idx_small] =
+          reinterpret_cast<int64_t>(grad_output_contigs[i]->data_ptr());
+          idx_small++;
+    } else {
+      grad_output_ptrs_large[idx_large] =
+          reinterpret_cast<int64_t>(grad_output_contigs[i]->data_ptr());
+          idx_large++;
+    }
   }
 
   // Allocate a big tensor to avoid calling many small elementwise kernels
@@ -502,6 +622,10 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
 
   TORCH_CHECK(output_group.size() == static_cast<size_t>(group_size));
 
+  // Reset the counters of the small and large arguments
+  idx_small = 0;
+  idx_large = 0;
+
   // Reshape grad inputs and obtain their pointers
   for (int i = 0; i < group_size; i++) {
     const auto grad_input_shape = std::vector<int64_t>(
@@ -509,11 +633,22 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
         output_shape_group.begin() + (i + 1) * output_dim);
     output_group[i] = output_group[i].reshape(grad_input_shape);
     TORCH_CHECK(output_group[i].is_contiguous());
-    grad_input_ptrs[i] = reinterpret_cast<int64_t>(output_group[i].data_ptr());
+
+    if(grad_output_group[i].size(1) < cols_per_warp) {
+      grad_input_ptrs_small[idx_small] = reinterpret_cast<int64_t>(output_group[i].data_ptr());
+      idx_small++;
+    } else {
+      grad_input_ptrs_large[idx_large] = reinterpret_cast<int64_t>(output_group[i].data_ptr());
+      idx_large++;
+    }
 
     // 2) Add group_size gradients for inputs
     outputs.push_back(output_group[i]);
   }
+
+  // Reset the counters of the small and large arguments
+  idx_small = 0;
+  idx_large = 0;
 
   // Calculate indices_ptrs
   std::vector<c10::MaybeOwned<at::Tensor>> index_contigs;
@@ -521,26 +656,53 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   for (const auto i : c10::irange(group_size)) {
     const auto& indices = indices_group[i];
     index_contigs.push_back(indices.expect_contiguous());
-    indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+    
+    if(grad_output_group[i].size(1) < cols_per_warp) {
+      indices_ptrs_small[idx_small] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+      idx_small++;
+    } else {
+      indices_ptrs_large[idx_large] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+      idx_large++;
+    }
   }
 
   // Transfer grad output pointers to GPU
-  args_tensor = args_tensor.to(first_indices.device(), /*non_blocking=*/true);
+  args_tensor_small = args_tensor_small.to(first_indices.device(), /*non_blocking=*/true);
+  args_tensor_large = args_tensor_large.to(first_indices.device(), /*non_blocking=*/true);
 
-  group_index_select_or_add_cuda(
-      args_tensor.data_ptr<int64_t>(),
-      args_tensor.data_ptr<int64_t>() + group_size,
-      args_tensor.data_ptr<int64_t>() + 2 * group_size,
-      warp_offsets_group,
-      num_cols_group,
+  if(count_small > 0) {
+    group_index_select_or_add_cuda_smallEmbD(
+      args_tensor_small.data_ptr<int64_t>(),
+      args_tensor_small.data_ptr<int64_t>() + count_small,
+      args_tensor_small.data_ptr<int64_t>() + 2 * count_small,
+      warp_offsets_group_small,
+      num_cols_group_small,
       fwd_input.scalar_type(),
       first_indices.scalar_type(),
       fwd_input.device().index(),
       num_input_rows,
-      total_num_warps,
+      total_num_warps_small,
       group_size,
       /*use_index_select=*/false,
       use_var_cols);
+  }
+
+  if(count_large > 0) {
+    group_index_select_or_add_cuda(
+      args_tensor_large.data_ptr<int64_t>(),
+      args_tensor_large.data_ptr<int64_t>() + count_large,
+      args_tensor_large.data_ptr<int64_t>() + 2 * count_large,
+      warp_offsets_group_large,
+      num_cols_group_large,
+      fwd_input.scalar_type(),
+      first_indices.scalar_type(),
+      fwd_input.device().index(),
+      num_input_rows,
+      total_num_warps_large,
+      group_size,
+      /*use_index_select=*/false,
+      use_var_cols_large);
+  }
 
   return outputs;
 }

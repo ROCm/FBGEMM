@@ -947,7 +947,16 @@ def group_index_select_dim0_gpu_impl_abstract(
         )
     )
 
+    ret.append(
+        # sizeof(int64_t) = 8, torch.uint8 = at::kByte
+        input_group[0].new_empty(
+            args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+        )
+    )
+
     ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+    ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+
 
     return ret
 
