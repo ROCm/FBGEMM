@@ -69,13 +69,14 @@
      if (entry < num_entries) {
        const int bid = entry / output_batch_size; // the key this threads works on
        const int idx_in_batch = entry - bid * output_batch_size; // avoid expensive modulo on AMD
+      const int bid_base = bid * input_batch_size; // reuse for input indexing
       const index_t sel_idx = indices[idx_in_batch]; // prefetch index into register
        local_data[i] =
  #ifdef __HIP_PLATFORM_AMD__
            __builtin_nontemporal_load( // avoid polluting caches on MI-series
-              &input[bid * input_batch_size + sel_idx]);
+              &input[bid_base + sel_idx]);
  #else
-          input[bid * input_batch_size + sel_idx];
+          input[bid_base + sel_idx];
  #endif
        output[entry] = local_data[i]; // output lengths
      } else {
