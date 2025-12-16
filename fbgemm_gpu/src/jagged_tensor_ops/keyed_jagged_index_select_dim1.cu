@@ -7,25 +7,19 @@
  */
 
  #include "common.cuh"
- #include <roctracer/include/roctracer_ext.h>
-
 
  using Tensor = at::Tensor;
  
  namespace fbgemm_gpu {
  
  template <
-     typename scalar_t, // scalar data type, e.g. float or half
-     typename index_t, // index data type, e.g. int32 or int64
-     typename acc_t, // accumulator data type, e.g. float or half
+     typename scalar_t,
+     typename index_t,
+     typename acc_t,
      int NUM_THREADS_PER_BLOCK,
-     int MAX_ENTRIES_PER_BLOCK, // total entries a block covers (threads * VEC)
+     int MAX_ENTRIES_PER_BLOCK,
      int VEC>
  
- // Index Select + Cumulative Sum Kernel
- // Fused operations to avoid extra kernel launch overhead
- // Index select calculates output lengths
- // Cumsum calculates output offsets
  __global__ void index_select_scalar_cumsum_kernel(
      pta::PackedTensorAccessor32<scalar_t, 1, at::RestrictPtrTraits> output,
      pta::PackedTensorAccessor32<acc_t, 1, at::RestrictPtrTraits> output_cumsum,
@@ -37,28 +31,23 @@
      const int last_block_num_entries,
      int* block_flags,
      acc_t* block_sums) {
-   typedef cub::BlockScan<acc_t, NUM_THREADS_PER_BLOCK> BlockScan; // CUDA's cumsum within one block
-   __shared__ typename BlockScan::TempStorage bs_temp_storage; // temp storage needed for cumsum
-   __shared__ acc_t block_prefix; // previous block prefix, minimizes shared usage on ROCm
- 
-   const int output_batch_size = indices.size(0); // how many users are selected
-   const int num_entries = num_batches * output_batch_size; // total entries
+   typedef cub::BlockScan<acc_t, NUM_THREADS_PER_BLOCK> BlockScan;
+   __shared__ typename BlockScan::TempStorage bs_temp_storage;
+   __shared__ acc_t block_prefix;
+
+// ROCm path
+#ifdef USE_ROCM
+   const int output_batch_size = indices.size(0);
+   const int num_entries = num_batches * output_batch_size;
    const bool multi_block = gridDim.x > 1;
    const int block_entries = blockIdx.x == gridDim.x - 1
-       ? last_block_num_entries // entries this block should cover
-       : MAX_ENTRIES_PER_BLOCK; // full entries capacity (threads * VEC)
+       ? last_block_num_entries
+       : MAX_ENTRIES_PER_BLOCK;
    const int block_entry_start = blockIdx.x * MAX_ENTRIES_PER_BLOCK;
    const int remaining_entries = num_entries - block_entry_start;
    const int num_entries_per_block = remaining_entries > 0
        ? (remaining_entries < block_entries ? remaining_entries : block_entries)
        : 0;
-       // total number of entries = num_batches (how many keys) * output_batch_size (how many users per key)
-       // an entry is the length of a user's embedding vector, a scalar value
-       // each thread handles one scalar value if VEC=1
-       // e.g. if there are 10 keys and 100 users are selected per key, there are 1000 entries
-       // first 3 blocks handle 256 entries
-       // the last block will handle 232 entries
-       // the cumsum kernel now uses these entries to find the offset values
  
    const int base_entry = block_entry_start + threadIdx.x * VEC;
    acc_t local_data[VEC];
@@ -67,24 +56,24 @@
    for (int i = 0; i < VEC; ++i) {
      const int entry = base_entry + i;
      if (entry < num_entries) {
-       const int bid = entry / output_batch_size; // the key this threads works on
-       const int idx_in_batch = entry - bid * output_batch_size; // avoid expensive modulo on AMD
-      const int bid_base = bid * input_batch_size; // reuse for input indexing
-      const index_t sel_idx = indices[idx_in_batch]; // prefetch index into register
+       const int bid = entry / output_batch_size;
+       const int idx_in_batch = entry - bid * output_batch_size;
+      const int bid_base = bid * input_batch_size;
+      const index_t sel_idx = indices[idx_in_batch];
        local_data[i] =
  #ifdef __HIP_PLATFORM_AMD__
-           __builtin_nontemporal_load( // avoid polluting caches on MI-series
+           __builtin_nontemporal_load(
               &input[bid_base + sel_idx]);
  #else
           input[bid_base + sel_idx];
  #endif
-       output[entry] = local_data[i]; // output lengths
+       output[entry] = local_data[i];
      } else {
        local_data[i] = 0;
      }
    }
  
-   // Fast path: single block needs only intra-block scan, no flags/sums
+   // Faster path for single block
    if (!multi_block) {
      if (num_entries_per_block > 0) {
        BlockScan(bs_temp_storage).InclusiveSum(local_data, local_data);
@@ -101,7 +90,6 @@
      return;
    }
  
-   // Cumsum kernel calculates the output offsets
    if (num_entries_per_block > 0) {
      inclusive_sum_scan_kernel<acc_t, VEC, NUM_THREADS_PER_BLOCK>(
          local_data,
@@ -115,17 +103,50 @@
          1);
    }
  
-   // Store data
-   if (base_entry < num_entries) {
+   if (base_entry < num_entries) {  
  #pragma unroll
      for (int i = 0; i < VEC; ++i) {
        const int entry = base_entry + i;
        if (entry < num_entries) {
-         output_cumsum[entry] = local_data[i]; // output offsets
+         output_cumsum[entry] = local_data[i];
        }
      }
-   }   
   }
+#else
+  // CUDA path
+  __shared__ acc_t smem[MAX_ENTRIES_PER_BLOCK];
+  const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int output_batch_size = indices.size(0);
+  const int bid = tid / output_batch_size;
+  const auto num_entries_per_block = blockIdx.x == gridDim.x - 1
+      ? last_block_num_entries
+      : MAX_ENTRIES_PER_BLOCK;
+
+  acc_t local_data[1];
+  if (tid < num_batches * output_batch_size) {
+    *local_data =
+        input[bid * input_batch_size + indices[tid % output_batch_size]];
+    output[tid] = *local_data;
+  } else {
+    *local_data = 0;
+  }
+
+  inclusive_sum_scan_kernel<acc_t, 1, NUM_THREADS_PER_BLOCK>(
+      local_data,
+      bs_temp_storage,
+      block_flags,
+      block_sums,
+      &smem[0],
+      num_entries_per_block,
+      blockIdx.x,
+      gridDim.x > 1,
+      1);
+
+  if (tid < num_batches * output_batch_size) {
+    output_cumsum[tid] = *local_data;
+  }
+#endif
+}
  
  template <
      typename scalar_t,
@@ -252,6 +273,7 @@ class KeyedJaggedIndexSelectDim1GPUOp
     const int num_batches = lengths.numel() / batch_size;
     const int num_output_lengths = num_batches * indices.numel();
     const int MAX_CUMSUM_ENTRIES_PER_BLOCK = 256;
+#ifdef USE_ROCM
     const int vec_candidates[] = {4, 2, 1};
     int VEC = 1;
     for (int v : vec_candidates) {
@@ -263,6 +285,12 @@ class KeyedJaggedIndexSelectDim1GPUOp
     const int ENTRIES_PER_BLOCK = MAX_CUMSUM_ENTRIES_PER_BLOCK * VEC;
     auto grid_size = (num_output_lengths + ENTRIES_PER_BLOCK - 1) /
         ENTRIES_PER_BLOCK;
+#else
+    const int VEC = 1;
+    const int ENTRIES_PER_BLOCK = MAX_CUMSUM_ENTRIES_PER_BLOCK;
+    auto grid_size = cuda_calc_xblock_count(
+        num_output_lengths, MAX_CUMSUM_ENTRIES_PER_BLOCK);
+#endif
 
     Tensor output_offsets =
         at::empty({num_batches * indices.numel()}, offsets.options());

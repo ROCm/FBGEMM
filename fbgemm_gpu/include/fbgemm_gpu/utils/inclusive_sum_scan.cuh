@@ -69,25 +69,19 @@ __inline__ __device__ void inclusive_sum_scan_kernel(
     const int block_id,
     const bool is_multi_block,
     const int signal) {
-
-  // Perform scan within a block
+// ROCm path
+#ifdef USE_ROCM
   cub::BlockScan<scalar_t, NUM_THREADS_PER_BLOCK>(temp_storage)
       .InclusiveSum(arr, arr);
 
-  // Perform stream scan across blocks
   if (is_multi_block) {
     const bool is_last_thread =
         threadIdx.x == (num_entries_per_block - 1) / ITEMS_PER_THREAD;
 
-    // The thread that holds the last entry in the block does synchronization
-    // Writes this block’s sum for others blocks
     if (is_last_thread) {
       scalar_t block_prev_local = 0;
       if (block_id != 0) {
-        // Spin wait for the previous block to write the sum value
         volatile int* flags = block_flags;
-
-        // Get sum from the previous block
         *block_prev = block_prev_local = block_sums[block_id - 1];
       }
 
@@ -95,13 +89,12 @@ __inline__ __device__ void inclusive_sum_scan_kernel(
       const int scope = (num_entries_per_block - 1) % ITEMS_PER_THREAD;
       block_sums[block_id] = block_prev_local + arr[scope];
       __threadfence();
-      // Set a flag to notify the next block (store signal directly to avoid RMW)
+      // Set a flag to notify the next block
       atomicExch(&block_flags[block_id], signal);
     }
 
     __syncthreads();
 
-    // Shifts this block’s scan by the sum from previous block
     if (block_id != 0) {
       scalar_t block_prev_local = *block_prev;
       for (int i = 0; i < ITEMS_PER_THREAD; i++) {
@@ -109,6 +102,36 @@ __inline__ __device__ void inclusive_sum_scan_kernel(
       }
     }
   }
-}
+#else
+  // CUDA path
+  cub::BlockScan<scalar_t, NUM_THREADS_PER_BLOCK>(temp_storage)
+      .InclusiveSum(arr, arr);
 
+  if (is_multi_block) {
+    if (threadIdx.x == (num_entries_per_block - 1) / ITEMS_PER_THREAD) {
+      scalar_t block_prev_local = 0;
+      if (block_id != 0) {
+        while (atomicAdd(&block_flags[block_id - 1], 0) < signal)
+          ;
+
+        *block_prev = block_prev_local = block_sums[block_id - 1];
+      }
+
+      const int scope = (num_entries_per_block - 1) % ITEMS_PER_THREAD;
+      block_sums[block_id] = block_prev_local + arr[scope];
+      __threadfence();
+      atomicAdd(&block_flags[block_id], 1);
+    }
+
+    __syncthreads();
+
+    if (block_id != 0) {
+      scalar_t block_prev_local = *block_prev;
+      for (int i = 0; i < ITEMS_PER_THREAD; i++) {
+        arr[i] += block_prev_local;
+      }
+    }
+  }
+#endif
+}
 } // namespace fbgemm_gpu
