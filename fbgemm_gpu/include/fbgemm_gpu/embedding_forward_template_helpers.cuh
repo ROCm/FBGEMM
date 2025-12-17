@@ -167,7 +167,7 @@ __device__ __forceinline__ void cp_async_fence() {
 
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
-  asm volatile("s_waitcnt vmcnt(0)\n");
+  __builtin_amdgcn_s_waitcnt(0);
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
@@ -177,7 +177,7 @@ __device__ __forceinline__ void cp_async_wait() {
 /// Blocks until all previous cp.async.commit_group operations have committed.
 template <>
 __device__ __forceinline__ void cp_async_wait<0>() {
-  asm volatile("s_waitcnt vmcnt(0)\n");
+  __builtin_amdgcn_s_waitcnt(0);
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_all;\n" ::);
@@ -233,7 +233,8 @@ __device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr
 /// Partial specialization
 template <int SizeInBytes>
 __device__ __forceinline__ void
-cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard) {
+cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard,
+                  [[maybe_unused]] void const* fallback_ptr = nullptr) {
 #if __CUDA_ARCH__ >= 800
   static_assert(
       SizeInBytes == 16,
@@ -247,8 +248,39 @@ cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard) {
       "n"(SizeInBytes),
       "r"(src_in_bytes));
 
+#elif defined(USE_ROCM)
+  static __device__ __constant__ uint4 zero_tile = {0, 0, 0, 0};
+  static_assert(
+      SizeInBytes == 16 || SizeInBytes == 4,
+      "cp_async_zfill_cg() function is implemented for 16B and 4B inputs only");
+// if ROCm version >= 7.2 and MI350
+#if (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||                    \
+    (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
+
+  const void *src_ptr = (pred_guard) ? global_ptr : &zero_tile;
+  __builtin_amdgcn_global_load_lds(src_ptr, smem_ptr, SizeInBytes, 0, 0);
+// if ROCm version >= 7.0 and MI3xx
+#elif ROCM_VERSION_MAJOR >= 7 && (defined(__gfx950__) || defined(__gfx942__))
+  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
+  // #ifdef USE_ROCM
+  const void *src_ptr = (pred_guard) ? global_ptr : &zero_tile;
+  constexpr int kFetchSizeInBytes = 4;
+  constexpr int kNum4ByteFetches = SizeInBytes / kFetchSizeInBytes;
+  __builtin_amdgcn_global_load_lds(src_ptr,
+                                  smem,
+                                  kFetchSizeInBytes, 0, 0);
+  __builtin_amdgcn_global_load_lds(src_ptr,
+                                  smem,
+                                  kFetchSizeInBytes, 4, 0);
+  __builtin_amdgcn_global_load_lds(src_ptr,
+                                  smem,
+                                  kFetchSizeInBytes, 8, 0);
+  __builtin_amdgcn_global_load_lds(src_ptr,
+                                  smem,
+                                  kFetchSizeInBytes, 12, 0);
+#endif // (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||
+       // (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
 #else
-  static_assert(SizeInBytes == 16, "");
   using AccessType = uint4;
   if (pred_guard) {
     *static_cast<AccessType*>(smem_ptr) =

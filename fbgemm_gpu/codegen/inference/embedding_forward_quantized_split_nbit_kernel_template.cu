@@ -200,13 +200,17 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
           bool final_valid = row_valid_v[inner_i];
           if constexpr (PackedMode) {
             // Store row data with uint4_loads_per_row offset
-            cp_async4(
+            cp_async_zfill_cg<sizeof(uint4)>(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx + uint4_loads_per_row * packed_bag_load_idx],
-                (final_valid == true) ? &row_v[inner_i][row_load_idx] : &row_v[inner_i][0]);
+                &row_v[inner_i][row_load_idx],
+                final_valid,
+                /*fallback_ptr=*/&row_v[inner_i][0]);
           } else {
-            cp_async4(
+            cp_async_zfill_cg<sizeof(uint4)>(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx],
-                (final_valid == true) ? &row_v[inner_i][row_load_idx] : &row_v[inner_i][0]);
+                &row_v[inner_i][row_load_idx],
+                final_valid,
+                /*fallback_ptr=*/&row_v[inner_i][0]);
           }
         }
         {% if weighted %}
@@ -217,12 +221,17 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
           if (row_load_idx == 0)  {
             // Use only one thread to load the index weight to prevent a race
             // condition when writing to the shared memory
-            cp_async(
-                &buffers_indice_weights[warp_idx][i][input_row_idx][packed_bag_load_idx],
-                final_valid ? &indice_weights[indices_starts[i] + L_start + input_row_idx] : &indice_weights[indices_starts[i] + L_start]);
+            // cp_async_zfill_cg<sizeof(float)>(
+            //     &buffers_indice_weights[warp_idx][i][input_row_idx][packed_bag_load_idx],
+            //     &indice_weights[indices_starts[i] + L_start + input_row_idx],
+            //     final_valid,
+            //     /*fallback_ptr=*/&indice_weights[indices_starts[i] + L_start]);
+            buffers_indice_weights[warp_idx][i][input_row_idx][packed_bag_load_idx] =
+              final_valid ? indice_weights[indices_starts[i] + L_start + input_row_idx] : 0.0;
           }
         }
         {% endif %}
+        cp_async_wait<0>();
       }
       {%- endif %}
 
