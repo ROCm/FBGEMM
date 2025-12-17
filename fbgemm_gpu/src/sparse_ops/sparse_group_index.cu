@@ -15,7 +15,7 @@ namespace fbgemm_gpu {
 #ifdef USE_ROCM
 // The wave size is forced to be 32 on ROCm devices in favor
 // of granularity losses reduction.
-constexpr int EMULATED_WARP_SIZE = 32;
+constexpr int EMULATED_WARP_SIZE = 64;
 #else
 constexpr int EMULATED_WARP_SIZE = kWarpSize;
 #endif
@@ -31,6 +31,37 @@ constexpr int GROUP_INDEX_SELECT_LOG_COLS_PER_WARP =
 
 int get_group_index_select_cols_per_warp() {
   return GROUP_INDEX_SELECT_COLS_PER_WARP;
+}
+
+template <typename T>
+__device__ inline T shfl_scalar(T val, int srcLane) {
+    // 32-bit types (Float, Int32)
+    if constexpr (sizeof(T) == 4) {
+        int v = *reinterpret_cast<const float*>(&val);
+        v = __shfl(v, srcLane);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 64-bit types (Double, Int64)
+    else if constexpr (sizeof(T) == 8) {
+        // HIP/CUDA usually support double directly for 64-bit shuffle
+        // If T is already double, this is a no-op cast
+        double v = *reinterpret_cast<const double*>(&val);
+        v = __shfl(v, srcLane);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 16-bit types (Half, BFloat16)
+    else if constexpr (sizeof(T) == 2) {
+        // Cast 16 bits to short, promote to int for the shuffle
+        unsigned short v = *reinterpret_cast<const unsigned short*>(&val);
+        int iv = static_cast<int>(v);
+        iv = __shfl(iv, srcLane);
+        unsigned short ret = static_cast<unsigned short>(iv);
+        return *reinterpret_cast<T*>(&ret);
+    }
+    else {
+        // Fallback or error
+        return val; 
+    }
 }
 
 template <
@@ -106,6 +137,12 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         scalar_t* input_base = reinterpret_cast<scalar_t*>(input_ptrs[member_id]);
         scalar_t* output_base = reinterpret_cast<scalar_t*>(output_ptrs[member_id]);
 
+        // Determine all the other lanes that are working on the same column
+        auto col_mask = __match_any(col);
+        
+        // Determing all the other lanes that are working on the same index
+        auto index_mask = __match_any(*reinterpret_cast<unsigned long long*>(&idx));
+
 #pragma unroll
         for (int i = 0; i < UNROLL_FACTOR && col + i < num_cols; i++) {
           // Compile time conditional
@@ -113,9 +150,35 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
             output_base[current_row * num_cols + col] = 
                 LDG(&input_base[idx * num_cols + col]);
           } else {
-            gpuAtomicAddNoReturn(
-                &output_base[idx * num_cols + col], 
-                input_base[current_row * num_cols + col]);
+
+            // The lanes that will write to the same output location are the intersection
+            auto peer_mask = col_mask & index_mask;
+
+            // Within the peer group, we select a leader to add-up the values from all the peers
+            // and perform the final global atomic add at the output location
+            auto leader_lane = __ffsll(peer_mask) - 1; // ffsll returns 1-based index
+
+            auto my_value = input_base[current_row * num_cols + col];
+            if(threadIdx.x == leader_lane) {
+              scalar_t group_sum = 0;
+              // Accumulate values from all the peer lanes
+              while(peer_mask) {
+                // Selecting the smallest present lane in the peer group
+                int peer_lane = __ffsll(peer_mask) - 1;
+
+                // Extract the value from the peer lane
+                auto peer_value = shfl_scalar(my_value, peer_lane);
+                group_sum += peer_value;
+
+                // Remove the selected lane from the peer mask
+                peer_mask ^= (1ULL << peer_lane);
+              }
+
+              // Only the leader lane performs the global atomic add
+              gpuAtomicAddNoReturn(
+                  &output_base[idx * num_cols + col], 
+                  group_sum);
+            }
           }
         }
       }
