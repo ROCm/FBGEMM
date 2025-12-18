@@ -233,8 +233,7 @@ __device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr
 /// Partial specialization
 template <int SizeInBytes>
 __device__ __forceinline__ void
-cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard,
-                  [[maybe_unused]] void const* fallback_ptr = nullptr) {
+cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard) {
 #if __CUDA_ARCH__ >= 800
   static_assert(
       SizeInBytes == 16,
@@ -253,6 +252,10 @@ cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard,
   static_assert(
       SizeInBytes == 16 || SizeInBytes == 4,
       "cp_async_zfill_cg() function is implemented for 16B and 4B inputs only");
+  using scalar_t = uint32_t;
+  using address_t = uint64_t;
+  constexpr address_t kInvalidAddress = std::numeric_limits<address_t>::max();
+
 // if ROCm version >= 7.2 and MI350
 #if (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||                    \
     (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
@@ -261,23 +264,34 @@ cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard,
   __builtin_amdgcn_global_load_lds(src_ptr, smem_ptr, SizeInBytes, 0, 0);
 // if ROCm version >= 7.0 and MI3xx
 #elif ROCM_VERSION_MAJOR >= 7 && (defined(__gfx950__) || defined(__gfx942__))
-  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
-  // #ifdef USE_ROCM
-  const void *src_ptr = (pred_guard) ? global_ptr : &zero_tile;
+
+  const void *base_src_ptr = (pred_guard) ? global_ptr : &zero_tile;
   constexpr int kFetchSizeInBytes = 4;
   constexpr int kNum4ByteFetches = SizeInBytes / kFetchSizeInBytes;
-  __builtin_amdgcn_global_load_lds(src_ptr,
-                                  smem,
-                                  kFetchSizeInBytes, 0, 0);
-  __builtin_amdgcn_global_load_lds(src_ptr,
-                                  smem,
-                                  kFetchSizeInBytes, 4, 0);
-  __builtin_amdgcn_global_load_lds(src_ptr,
-                                  smem,
-                                  kFetchSizeInBytes, 8, 0);
-  __builtin_amdgcn_global_load_lds(src_ptr,
-                                  smem,
-                                  kFetchSizeInBytes, 12, 0);
+
+  const int lane_id = threadIdx.x % fbgemm_gpu::kWarpSize;
+#pragma unroll kNum4ByteFetches
+  for (int i = 0; i < kNum4ByteFetches; ++i) {
+    address_t src_addr = kInvalidAddress;
+    // In case of 1 fetch, no shuffle is needed
+    if constexpr (kNum4ByteFetches == 1) {
+      src_addr = reinterpret_cast<address_t>(base_src_ptr);
+    } else {
+      // Transpose source addresses
+      const int src_lane =
+          lane_id / kNum4ByteFetches + i * kNum4ByteFetches * kNum4ByteFetches;
+      const address_t offset =
+          (lane_id % kFetchSizeInBytes) * kFetchSizeInBytes;
+      src_addr = __shfl_sync(fbgemm_gpu::kFullWarpMask, reinterpret_cast<address_t>(base_src_ptr),
+                                       src_lane) +
+                 offset;
+    }
+
+    __builtin_amdgcn_global_load_lds(
+        reinterpret_cast<const scalar_t *>(src_addr),
+        static_cast<scalar_t *>(smem_ptr) + fbgemm_gpu::kWarpSize * i,
+        kFetchSizeInBytes, 0, 0);
+  }
 #endif // (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||
        // (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
 #else
