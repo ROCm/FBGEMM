@@ -19,11 +19,45 @@
 #include <torch/library.h>
 #include <torch/script.h>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept> // for logic_error
+
+#ifdef USE_ROCM
+#include <ATen/cuda/CUDAContext.h>
+#include "fbgemm_gpu/split_embeddings_utils.cuh"
+#endif
 
 using Tensor = at::Tensor;
 
+namespace {
+#if defined(USE_ROCM)
+bool is_group_index_row_sort_enabled() {
+  static const bool kEnabled = []() {
+    const char* flag = std::getenv("FBGEMM_ENABLE_GROUP_INDEX_ROW_SORT");
+    return flag && flag[0] != '\0' && !(flag[0] == '0' && flag[1] == '\0');
+  }();
+  return kEnabled;
+}
+#endif
+} // namespace
+
 namespace fbgemm_gpu {
+
+void group_index_select_or_add_with_row_order_cuda(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* row_order_ptrs,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const c10::ScalarType& input_scalar_type,
+    const c10::ScalarType& indices_scalar_type,
+    const c10::DeviceIndex& device,
+    const int num_work_rows,
+    const int64_t total_num_warps,
+    const int group_size,
+    const bool use_index_select,
+    const bool use_var_cols);
 
 namespace {
 
@@ -445,13 +479,12 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
 
   // Allocate Tensor for ptrs of grad output and input, and indices
   Tensor args_tensor = at::empty(
-      {group_size * 3},
+      {group_size * 4},
       at::TensorOptions().dtype(at::kLong).pinned_memory(true));
-  // Ensure that args_tensor is contiguous
-  TORCH_CHECK(args_tensor.is_contiguous());
   int64_t* grad_output_ptrs = args_tensor.data_ptr<int64_t>();
-  int64_t* grad_input_ptrs = args_tensor.data_ptr<int64_t>() + group_size;
-  int64_t* indices_ptrs = args_tensor.data_ptr<int64_t>() + 2 * group_size;
+  int64_t* grad_input_ptrs = grad_output_ptrs + group_size;
+  int64_t* indices_ptrs = grad_input_ptrs + group_size;
+  int64_t* row_order_ptrs = indices_ptrs + group_size;
 
   int64_t group_grad_input_numel = 0;
   std::vector<int64_t> grad_input_numels;
@@ -508,30 +541,121 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   // Calculate indices_ptrs
   std::vector<c10::MaybeOwned<at::Tensor>> index_contigs;
   index_contigs.reserve(group_size);
+#if defined(USE_ROCM)
+  const bool enable_row_sort = is_group_index_row_sort_enabled();
+#else
+  const bool enable_row_sort = false;
+#endif
+  std::vector<Tensor> row_permute_tensors(enable_row_sort ? group_size : 0);
+  Tensor row_ids_template;
+#if defined(USE_ROCM)
+  at::TensorOptions row_perm_opts =
+      first_indices.options().dtype(at::kInt);
+  if (enable_row_sort) {
+    row_ids_template =
+        at::arange(num_input_rows, row_perm_opts);
+  }
+#endif
   for (const auto i : c10::irange(group_size)) {
     const auto& indices = indices_group[i];
     index_contigs.push_back(indices.expect_contiguous());
-    indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+    indices_ptrs[i] =
+        reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+#if defined(USE_ROCM)
+    if (enable_row_sort) {
+      Tensor permuted_rows =
+          at::empty({num_input_rows}, row_perm_opts);
+      Tensor sorted_keys = at::empty_like(*index_contigs[i]);
+      size_t temp_storage_bytes = 0;
+      auto stream = at::cuda::getCurrentCUDAStream();
+      AT_DISPATCH_INDEX_TYPES(
+          index_contigs[i]->scalar_type(),
+          "group_index_sort_rows_query",
+          [&] {
+            C10_CUDA_CHECK(radix_sort_pairs(
+                nullptr,
+                temp_storage_bytes,
+                index_contigs[i]->data_ptr<index_t>(),
+                sorted_keys.data_ptr<index_t>(),
+                row_ids_template.data_ptr<int32_t>(),
+                permuted_rows.data_ptr<int32_t>(),
+                num_input_rows,
+                0,
+                sizeof(index_t) * 8,
+                stream.stream()));
+          });
+      if (temp_storage_bytes > 0) {
+        Tensor temp_storage = at::empty(
+            {static_cast<int64_t>(temp_storage_bytes)},
+            row_perm_opts.dtype(at::kByte));
+        AT_DISPATCH_INDEX_TYPES(
+            index_contigs[i]->scalar_type(),
+            "group_index_sort_rows",
+            [&] {
+              C10_CUDA_CHECK(radix_sort_pairs(
+                  temp_storage.data_ptr(),
+                  temp_storage_bytes,
+                  index_contigs[i]->data_ptr<index_t>(),
+                  sorted_keys.data_ptr<index_t>(),
+                  row_ids_template.data_ptr<int32_t>(),
+                  permuted_rows.data_ptr<int32_t>(),
+                  num_input_rows,
+                  0,
+                  sizeof(index_t) * 8,
+                  stream.stream()));
+            });
+      }
+      row_permute_tensors[i] = std::move(permuted_rows);
+      row_order_ptrs[i] = reinterpret_cast<int64_t>(
+          row_permute_tensors[i].data_ptr<int32_t>());
+    } else {
+      row_order_ptrs[i] = 0;
+    }
+#else
+    (void)row_ids_template;
+    row_order_ptrs[i] = 0;
+#endif
   }
 
   // Transfer grad output pointers to GPU
   args_tensor = args_tensor.to(first_indices.device(), /*non_blocking=*/true);
+  auto* args_device = args_tensor.data_ptr<int64_t>();
+  const int64_t* row_ptrs_device = enable_row_sort
+      ? (args_device + 3 * group_size)
+      : nullptr;
 
-  group_index_select_or_add_cuda(
-      args_tensor.data_ptr<int64_t>(),
-      args_tensor.data_ptr<int64_t>() + group_size,
-      args_tensor.data_ptr<int64_t>() + 2 * group_size,
-      warp_offsets_group,
-      num_cols_group,
-      fwd_input.scalar_type(),
-      first_indices.scalar_type(),
-      fwd_input.device().index(),
-      num_input_rows,
-      total_num_warps,
-      group_size,
-      /*use_index_select=*/false,
-      use_var_cols);
-
+  if (row_ptrs_device && enable_row_sort) {
+    group_index_select_or_add_with_row_order_cuda(
+        args_device,
+        args_device + group_size,
+        args_device + 2 * group_size,
+        row_ptrs_device,
+        warp_offsets_group,
+        num_cols_group,
+        fwd_input.scalar_type(),
+        first_indices.scalar_type(),
+        fwd_input.device().index(),
+        num_input_rows,
+        total_num_warps,
+        group_size,
+        /*use_index_select=*/false,
+        use_var_cols);
+  } else {
+    group_index_select_or_add_cuda(
+        args_device,
+        args_device + group_size,
+        args_device + 2 * group_size,
+        warp_offsets_group,
+        num_cols_group,
+        fwd_input.scalar_type(),
+        first_indices.scalar_type(),
+        fwd_input.device().index(),
+        num_input_rows,
+        total_num_warps,
+        group_size,
+        /*use_index_select=*/false,
+        use_var_cols);
+  }
   return outputs;
 }
 

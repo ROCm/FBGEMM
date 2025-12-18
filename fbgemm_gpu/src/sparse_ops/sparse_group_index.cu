@@ -7,19 +7,38 @@
  */
 
 #include "common.cuh"
+#if __has_include(<ATen/ATEN.h>)
+#include <ATen/ATEN.h>
+#elif __has_include(<ATen/ATen.h>)
+#include <ATen/ATen.h>
+#else
+#error "ATen headers not found. Expected <ATen/ATEN.h> or <ATen/ATen.h>."
+#endif
 #include <vector>
 
 using Tensor = at::Tensor;
 
 namespace fbgemm_gpu {
-namespace {
+namespace detail {
 
 constexpr int kGroupIndexWarpSize = kWarpSize;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+constexpr unsigned long long kGroupIndexFullWarpMask = 0xffffffffffffffffull;
+#else
+constexpr unsigned int kGroupIndexFullWarpMask = 0xffffffffu;
+#endif
 constexpr int GROUP_INDEX_SELECT_UNROLL_FACTOR = 2;
 constexpr int GROUP_INDEX_SELECT_COLS_PER_WARP =
     GROUP_INDEX_SELECT_UNROLL_FACTOR * kGroupIndexWarpSize;
 constexpr int GROUP_INDEX_SELECT_LOG_COLS_PER_WARP =
     log2_calc<GROUP_INDEX_SELECT_COLS_PER_WARP>::value;
+
+enum class GroupIndexLdsStrategy : uint8_t {
+  kDisabled = 0,
+  kDirectMapped,
+  kHashtable,
+};
+
 constexpr int kGroupIndexDirectMappedSlots = 32;
 constexpr int kGroupIndexDirectMappedRowLimit = 48;
 constexpr int kGroupIndexHashtableRowLimit = 192;
@@ -93,13 +112,13 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* row_order_ptrs,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const int64_t num_work_rows,
     const int64_t group_size) {
   const auto total_num_warps = warp_offsets_group[group_size];
   extern __shared__ __align__(16) unsigned char group_index_shared_cache[];
-  __shared__ index_t warp_index_cache[kMaxThreads / kGroupIndexWarpSize];
   if (USE_INDEX_SELECT) {
     for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
          warp_id < total_num_warps;
@@ -125,20 +144,32 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         member_id = warp_id / (warps_per_row * num_work_rows);
         member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
       }
-      const auto row = member_warp_id / warps_per_row;
       const auto col_offset =
           ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
           (threadIdx.x * UNROLL_FACTOR);
+      const auto logical_row = member_warp_id / warps_per_row;
+      const int32_t* member_row_order = nullptr;
+      if (row_order_ptrs) {
+        const int64_t ptr_val = row_order_ptrs[member_id];
+        if (ptr_val) {
+          member_row_order =
+              reinterpret_cast<const int32_t*>(ptr_val);
+        }
+      }
+      const int64_t row = member_row_order
+          ? static_cast<int64_t>(member_row_order[logical_row])
+          : logical_row;
       scalar_t* input =
           reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
       scalar_t* output =
           reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
       index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+      index_t lane_idx = 0;
       if (threadIdx.x == 0) {
-        warp_index_cache[threadIdx.y] = indices[row];
+        lane_idx = indices[row];
       }
-      syncwarp();
-      const index_t idx = warp_index_cache[threadIdx.y];
+      const index_t idx = __shfl_sync(
+          kGroupIndexFullWarpMask, lane_idx, 0, kGroupIndexWarpSize);
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
         output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
@@ -158,9 +189,6 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         : kGroupIndexLdsCacheSlots;
     using LdsCacheEntry =
         GroupIndexLdsCacheEntry<index_t, scalar_t, COLS_PER_WARP>;
-    __shared__ int lds_slot_buffer[kMaxThreads / kGroupIndexWarpSize];
-    __shared__ int lds_flush_slot_buffer[kMaxThreads / kGroupIndexWarpSize];
-    __shared__ int lds_new_entry_buffer[kMaxThreads / kGroupIndexWarpSize];
     index_t cached_idx[kCacheSlots];
     scalar_t cached_vals[kCacheSlots][UNROLL_FACTOR];
     bool cached_valid[kCacheSlots];
@@ -462,11 +490,12 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         continue;
       }
 
+      index_t lane_idx = 0;
       if (threadIdx.x == 0) {
-        warp_index_cache[threadIdx.y] = active_indices[row];
+        lane_idx = active_indices[row];
       }
-      syncwarp();
-      const index_t idx = warp_index_cache[threadIdx.y];
+      const index_t idx = __shfl_sync(
+          kGroupIndexFullWarpMask, lane_idx, 0, kGroupIndexWarpSize);
 
       scalar_t local_vals[UNROLL_FACTOR];
 #pragma unroll
@@ -575,6 +604,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* row_order_ptrs,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const int64_t num_work_rows,
@@ -611,21 +641,33 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
     }
-    const auto row = member_warp_id / warps_per_row;
     const auto col_offset =
         ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
         (threadIdx.x * UNROLL_FACTOR);
+    const auto logical_row = member_warp_id / warps_per_row;
+    const int32_t* member_row_order = nullptr;
+    if (row_order_ptrs) {
+      const int64_t ptr_val = row_order_ptrs[member_id];
+      if (ptr_val) {
+        member_row_order =
+            reinterpret_cast<const int32_t*>(ptr_val);
+      }
+    }
+    const int64_t row = member_row_order
+        ? static_cast<int64_t>(member_row_order[logical_row])
+        : logical_row;
     scalar_t* input =
         reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
     scalar_t* output =
         reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+    index_t lane_idx = 0;
     if (threadIdx.x == 0) {
-      warp_index_cache[threadIdx.y] = indices[row];
+      lane_idx = indices[row];
     }
-    syncwarp();
-    const index_t idx = warp_index_cache[threadIdx.y];
+    const index_t idx = __shfl_sync(
+        kGroupIndexFullWarpMask, lane_idx, 0, kGroupIndexWarpSize);
 #pragma unroll
     for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
       if constexpr (USE_INDEX_SELECT) {
@@ -640,22 +682,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 
 #endif // USE_ROCM
 
-} // namespace
-
-int get_group_index_select_cols_per_warp() {
-  return GROUP_INDEX_SELECT_COLS_PER_WARP;
-}
-
-enum class GroupIndexLdsStrategy : uint8_t {
-  kDisabled = 0,
-  kDirectMapped,
-  kHashtable,
-};
-
-DLL_PUBLIC void group_index_select_or_add_cuda(
+void group_index_select_or_add_cuda_impl(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* row_order_ptrs,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const c10::ScalarType& input_scalar_type,
@@ -669,25 +700,31 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
   if (group_size == 0) {
     return;
   }
-
   at::cuda::OptionalCUDAGuard device_guard(device);
-
 #ifdef USE_ROCM
   GroupIndexLdsStrategy lds_strategy = GroupIndexLdsStrategy::kDisabled;
   if (!use_index_select && group_size > 0) {
-    std::vector<int32_t> num_cols_host(group_size);
-    auto memcpy_status = cudaMemcpy(
-        num_cols_host.data(),
+    auto num_cols_host = at::empty(
+        {group_size},
+        at::TensorOptions().dtype(at::kInt).pinned_memory(true));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto memcpy_status = cudaMemcpyAsync(
+        num_cols_host.data_ptr<int32_t>(),
         num_cols_group,
         sizeof(int32_t) * group_size,
-        cudaMemcpyDeviceToHost);
+        cudaMemcpyDeviceToHost,
+        stream.stream());
     TORCH_CHECK(
         memcpy_status == cudaSuccess,
         "Failed to copy num_cols_group for LDS heuristic");
+    TORCH_CHECK(
+        cudaStreamSynchronize(stream.stream()) == cudaSuccess,
+        "Failed to sync LDS heuristic copy");
+    const int32_t* num_cols_host_ptr = num_cols_host.data_ptr<int32_t>();
     const int cols_per_warp = get_group_index_select_cols_per_warp();
     bool lds_candidate_found = false;
     for (int i = 0; i < group_size; ++i) {
-      const int num_cols = num_cols_host[i];
+      const int num_cols = num_cols_host_ptr[i];
       const int warps_per_row =
           (num_cols + cols_per_warp - 1) / cols_per_warp;
       if (num_cols <= kGroupIndexLdsColsThreshold && warps_per_row == 1) {
@@ -703,8 +740,9 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       }
     }
   }
+#else
+  constexpr GroupIndexLdsStrategy lds_strategy = GroupIndexLdsStrategy::kDisabled;
 #endif
-
   uint32_t num_warps_per_threadblock = kMaxThreads / kGroupIndexWarpSize;
   dim3 block_size(kGroupIndexWarpSize, num_warps_per_threadblock, 1);
   const auto* device_prop = at::cuda::getCurrentDeviceProperties();
@@ -751,6 +789,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
         input_ptrs, \
         output_ptrs, \
         indices_ptrs, \
+        row_order_ptrs, \
         warp_offsets_group, \
         num_cols_group, \
         num_work_rows, \
@@ -793,6 +832,74 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
 
 #undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
 #undef INVOKE_GROUP_INDEX_SELECT_OR_ADD_WITH_STRATEGY
+} // namespace detail
+}
+
+int get_group_index_select_cols_per_warp() {
+  return detail::GROUP_INDEX_SELECT_COLS_PER_WARP;
+}
+
+void group_index_select_or_add_with_row_order_cuda(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* row_order_ptrs,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const c10::ScalarType& input_scalar_type,
+    const c10::ScalarType& indices_scalar_type,
+    const c10::DeviceIndex& device,
+    const int num_work_rows,
+    const int64_t total_num_warps,
+    const int group_size,
+    const bool use_index_select,
+    const bool use_var_cols) {
+  detail::group_index_select_or_add_cuda_impl(
+      input_ptrs,
+      output_ptrs,
+      indices_ptrs,
+      row_order_ptrs,
+      warp_offsets_group,
+      num_cols_group,
+      input_scalar_type,
+      indices_scalar_type,
+      device,
+      num_work_rows,
+      total_num_warps,
+      group_size,
+      use_index_select,
+      use_var_cols);
+}
+
+void group_index_select_or_add_cuda(
+    const int64_t* input_ptrs,
+    const int64_t* output_ptrs,
+    const int64_t* indices_ptrs,
+    const int64_t* warp_offsets_group,
+    const int32_t* num_cols_group,
+    const c10::ScalarType& input_scalar_type,
+    const c10::ScalarType& indices_scalar_type,
+    const c10::DeviceIndex& device,
+    const int num_work_rows,
+    const int64_t total_num_warps,
+    const int group_size,
+    const bool use_index_select,
+    const bool use_var_cols) {
+  detail::group_index_select_or_add_cuda_impl(
+      input_ptrs,
+      output_ptrs,
+      indices_ptrs,
+      /*row_order_ptrs=*/nullptr,
+      warp_offsets_group,
+      num_cols_group,
+      input_scalar_type,
+      indices_scalar_type,
+      device,
+      num_work_rows,
+      total_num_warps,
+      group_size,
+      use_index_select,
+      use_var_cols);
 }
 
 } // namespace fbgemm_gpu
