@@ -138,10 +138,20 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         scalar_t* output_base = reinterpret_cast<scalar_t*>(output_ptrs[member_id]);
 
         // Determine all the other lanes that are working on the same column
-        auto col_mask = __match_any(col);
+        auto col_mask = __match_any_sync(__activemask(), col);
         
         // Determing all the other lanes that are working on the same index
-        auto index_mask = __match_any(*reinterpret_cast<unsigned long long*>(&idx));
+        uint64_t index_mask = 0;
+
+        if constexpr (sizeof(index_t) == 8) {
+            // Safe to treat as 64-bit
+            unsigned long long idx_val = *reinterpret_cast<const unsigned long long*>(&idx);
+            index_mask = __match_any_sync(__activemask(), idx_val);
+        } else {
+            // It is 32-bit (or smaller), treat as 32-bit int
+            unsigned int idx_val = static_cast<unsigned int>(idx);
+            index_mask = __match_any_sync(__activemask(), idx_val);
+        }
 
 #pragma unroll
         for (int i = 0; i < UNROLL_FACTOR && col + i < num_cols; i++) {
@@ -159,22 +169,27 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
             auto leader_lane = __ffsll(peer_mask) - 1; // ffsll returns 1-based index
 
             auto my_value = input_base[current_row * num_cols + col];
-            if(threadIdx.x == leader_lane) {
-              scalar_t group_sum = 0;
-              // Accumulate values from all the peer lanes
-              while(peer_mask) {
-                // Selecting the smallest present lane in the peer group
-                int peer_lane = __ffsll(peer_mask) - 1;
 
-                // Extract the value from the peer lane
-                auto peer_value = shfl_scalar(my_value, peer_lane);
+            scalar_t group_sum = 0;
+
+            // Accumulate values from all the peer lanes
+            while(peer_mask) {
+              // Selecting the smallest present lane in the peer group
+              int peer_lane = __ffsll(peer_mask) - 1;
+
+              // Extract the value from the peer lane
+              auto peer_value = __shfl(*reinterpret_cast<float*>(&my_value), peer_lane);
+
+              if(threadIdx.x == leader_lane) {
                 group_sum += peer_value;
-
-                // Remove the selected lane from the peer mask
-                peer_mask ^= (1ULL << peer_lane);
               }
 
-              // Only the leader lane performs the global atomic add
+              // Remove the selected lane from the peer mask
+              peer_mask ^= (1ULL << peer_lane);
+            }
+
+            // Only the leader lane performs the global atomic add
+            if(threadIdx.x == leader_lane) {
               gpuAtomicAddNoReturn(
                   &output_base[idx * num_cols + col], 
                   group_sum);
