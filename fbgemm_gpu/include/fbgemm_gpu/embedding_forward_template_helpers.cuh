@@ -167,25 +167,31 @@ __device__ __forceinline__ void cp_async_fence() {
 
 template <int N>
 __device__ __forceinline__ void cp_async_wait() {
-  __builtin_amdgcn_s_waitcnt(0);
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#elif defined(USE_ROCM) &&                                                     \
+    (ROCM_VERSION_MAJOR <= 7 && ROCM_VERSION_MINOR < 2) && defined(__gfx950__)
+
+  __builtin_amdgcn_s_waitcnt(0);
 #endif
 }
 
 /// Blocks until all previous cp.async.commit_group operations have committed.
 template <>
 __device__ __forceinline__ void cp_async_wait<0>() {
-  __builtin_amdgcn_s_waitcnt(0);
 #if __CUDA_ARCH__ >= 800
 
   asm volatile("cp.async.wait_all;\n" ::);
+#elif defined(USE_ROCM) &&                                                     \
+    (ROCM_VERSION_MAJOR <= 7 && ROCM_VERSION_MINOR < 2) && defined(__gfx950__)
+
+  __builtin_amdgcn_s_waitcnt(0);
 #endif
 }
 
 template<typename T>
-__device__ __forceinline__ uint32_t cvta_to_shared(const T* ptr) {
+__device__ __forceinline__ uint32_t hip_cvta_to_shared_address(const T* ptr) {
     // First get the address as a size_t to handle all pointer sizes
     size_t addr = reinterpret_cast<size_t>(ptr);
 
@@ -194,50 +200,10 @@ __device__ __forceinline__ uint32_t cvta_to_shared(const T* ptr) {
     return static_cast<uint32_t>(addr & 0xFFFFFFFF);
 }
 
-__device__ inline void cp_async(__shared__ void* smem_ptr, const void* glob_ptr, const bool pred_guard) {
-  const int BYTES = 4;
-  static __device__ __constant__ uint zero = 0;
-  const void *src_ptr = (pred_guard) ? glob_ptr : &zero;
-  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
-  #ifdef USE_ROCM
-  // asm volatile("s_mov_b32 m0, %0\n"
-  //              "global_load_lds_dword %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
-  __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(src_ptr), smem_ptr, BYTES, 0, 0);
-  #else
-  asm volatile(
-      "{\n"
-      "   .reg .pred p;\n"
-      "   setp.ne.b32 p, %0, 0;\n"
-      "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-      "}\n" ::"r"((int)pred),
-      "r"(smem), "l"(glob_ptr), "n"(BYTES));
-  #endif
-}
-
-__device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr, const bool pred_guard) {
-  const int BYTES = 16;
-  static __device__ __constant__ uint4 zero_tile = {0, 0, 0, 0};
-  uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
-  const void *src_ptr = (pred_guard) ? glob_ptr : &zero_tile;
-  #ifdef USE_ROCM
-  asm volatile("s_mov_b32 m0, %0\n"
-               "global_load_lds_dwordx4 %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(src_ptr)) : );
-  // __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(glob_ptr), smem_ptr, BYTES, 0, 0);
-  #else
-  asm volatile(
-      "{\n"
-      "   .reg .pred p;\n"
-      "   setp.ne.b32 p, %0, 0;\n"
-      "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-      "}\n" ::"r"((int)pred),
-      "r"(smem), "l"(glob_ptr), "n"(BYTES));
-  #endif
-}
-
 /// Partial specialization
 template <int SizeInBytes>
 __device__ __forceinline__ void
-cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard) {
+cp_async_zfill_cg(__shared__ void* smem_ptr, void const* global_ptr, bool pred_guard) {
 #if __CUDA_ARCH__ >= 800
   static_assert(
       SizeInBytes == 16,
@@ -254,51 +220,28 @@ cp_async_zfill_cg(void* smem_ptr, void const* global_ptr, bool pred_guard) {
 #elif defined(USE_ROCM)
   static __device__ __constant__ uint4 zero_tile = {0, 0, 0, 0};
   static_assert(
-      SizeInBytes == 16 || SizeInBytes == 4,
-      "cp_async_zfill_cg() function is implemented for 16B and 4B inputs only");
-  using scalar_t = uint32_t;
-  using address_t = uint64_t;
-  constexpr address_t kInvalidAddress = std::numeric_limits<address_t>::max();
+      SizeInBytes == 16,
+      "cp_async_zfill_cg() function is implemented for 16B inputs only");
 
 // if ROCm version >= 7.2 and MI350
-#if (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||                    \
-    (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
+#if (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) && defined(__gfx950__)
 
   const void *src_ptr = (pred_guard) ? global_ptr : &zero_tile;
   __builtin_amdgcn_global_load_lds(src_ptr, smem_ptr, SizeInBytes, 0, 0);
-// if ROCm version >= 7.0 and MI3xx
-#elif ROCM_VERSION_MAJOR >= 7 && (defined(__gfx950__) || defined(__gfx942__))
+// if ROCm version in [7.0, 7.2) and MI350
+#elif ROCM_VERSION_MAJOR >= 7 && defined(__gfx950__)
 
-  const void *base_src_ptr = (pred_guard) ? global_ptr : &zero_tile;
-  constexpr int kFetchSizeInBytes = 4;
-  constexpr int kNum4ByteFetches = SizeInBytes / kFetchSizeInBytes;
-
-  const int lane_id = threadIdx.x % fbgemm_gpu::kWarpSize;
-#pragma unroll kNum4ByteFetches
-  for (int i = 0; i < kNum4ByteFetches; ++i) {
-    address_t src_addr = kInvalidAddress;
-    // In case of 1 fetch, no shuffle is needed
-    if constexpr (kNum4ByteFetches == 1) {
-      src_addr = reinterpret_cast<address_t>(base_src_ptr);
-    } else {
-      // Transpose source addresses
-      const int src_lane =
-          lane_id / kNum4ByteFetches + i * kNum4ByteFetches * kNum4ByteFetches;
-      const address_t offset =
-          (lane_id % kFetchSizeInBytes) * kFetchSizeInBytes;
-      src_addr = __shfl_sync(fbgemm_gpu::kFullWarpMask, reinterpret_cast<address_t>(base_src_ptr),
-                                       src_lane) +
-                 offset;
-    }
-
-    __builtin_amdgcn_global_load_lds(
-        reinterpret_cast<const scalar_t *>(src_addr),
-        static_cast<scalar_t *>(smem_ptr) + fbgemm_gpu::kWarpSize * i,
-        kFetchSizeInBytes, 0, 0);
-  }
+  uint32_t smem =
+      __builtin_amdgcn_readfirstlane(hip_cvta_to_shared_address(smem_ptr));
+  const void *src_ptr = (pred_guard) ? global_ptr : &zero_tile;
+  asm volatile("s_mov_b32 m0, %0\n"
+               "global_load_lds_dwordx4 %1, off\n" ::"s"(smem),
+               "v"(static_cast<const uint32_t *>(src_ptr))
+               :);
 #endif // (ROCM_VERSION_MAJOR >= 7 && ROCM_VERSION_MINOR >= 2) ||
        // (ROCM_VERSION_MAJOR > 7) && defined(__gfx950__)
 #else
+  static_assert(SizeInBytes == 16, "");
   using AccessType = uint4;
   if (pred_guard) {
     *static_cast<AccessType*>(smem_ptr) =
