@@ -194,13 +194,15 @@ __device__ __forceinline__ uint32_t cvta_to_shared(const T* ptr) {
     return static_cast<uint32_t>(addr & 0xFFFFFFFF);
 }
 
-__device__ inline void cp_async(__shared__ void* smem_ptr, const void* glob_ptr) {
-  const int BYTES = 16;
+__device__ inline void cp_async(__shared__ void* smem_ptr, const void* glob_ptr, const bool pred_guard) {
+  const int BYTES = 4;
+  static __device__ __constant__ uint zero = 0;
+  const void *src_ptr = (pred_guard) ? glob_ptr : &zero;
   uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
   #ifdef USE_ROCM
-  asm volatile("s_mov_b32 m0, %0\n"
-               "global_load_lds_dword %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
-  // __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(glob_ptr), smem_ptr, BYTES, 0, 0);
+  // asm volatile("s_mov_b32 m0, %0\n"
+  //              "global_load_lds_dword %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
+  __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(src_ptr), smem_ptr, BYTES, 0, 0);
   #else
   asm volatile(
       "{\n"
@@ -212,12 +214,14 @@ __device__ inline void cp_async(__shared__ void* smem_ptr, const void* glob_ptr)
   #endif
 }
 
-__device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr) {
+__device__ inline void cp_async4(__shared__ void* smem_ptr, const void* glob_ptr, const bool pred_guard) {
   const int BYTES = 16;
+  static __device__ __constant__ uint4 zero_tile = {0, 0, 0, 0};
   uint32_t smem = __builtin_amdgcn_readfirstlane(cvta_to_shared(smem_ptr));
+  const void *src_ptr = (pred_guard) ? glob_ptr : &zero_tile;
   #ifdef USE_ROCM
   asm volatile("s_mov_b32 m0, %0\n"
-               "global_load_lds_dwordx4 %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(glob_ptr)) : );
+               "global_load_lds_dwordx4 %1, off\n": : "s"(smem), "v"(static_cast<const uint32_t*>(src_ptr)) : );
   // __builtin_amdgcn_global_load_lds(static_cast<const uint32_t*>(glob_ptr), smem_ptr, BYTES, 0, 0);
   #else
   asm volatile(

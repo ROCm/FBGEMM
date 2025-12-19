@@ -149,8 +149,7 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
     typedef float AllIndiceWeights[WarpsPerBlock][OutputRowsPerThread][InputRowsInFlight][PackedMode ? NumUint4LoadsPerRow : 1];
     __shared__ AllIndiceWeights buffers_indice_weights;
     {% endif %}
-    static_assert(InputRowsInFlight * NumUint4LoadsPerRow % 64 == 0, "Sh");
-    for (uint32_t load_idx = threadIdx.x; load_idx < InputRowsInFlight * NumUint4LoadsPerRow; load_idx += kWarpSize) {
+    for (uint32_t load_idx = threadIdx.x; load_idx < input_rows_in_flight * NumUint4LoadsPerRow; load_idx += kWarpSize) {
       uint32_t row_load_idx = load_idx % NumUint4LoadsPerRow;
       if constexpr (PackedMode) {
         // The actual row index in packed bag w.r.t. the required uint4 loads.
@@ -159,8 +158,7 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
       uint32_t input_row_idx = (load_idx / NumUint4LoadsPerRow);
       // In case of PackedMode, packed_bag_load_idx already takes into account uint4_loads_per_row,
       // so only the packed_bag index should be evaluated against total number of packed bags.
-      bool load_idx_valid = (PackedMode ? packed_bag_load_idx < num_packed_bags : row_load_idx < uint4_loads_per_row) 
-                         && (load_idx < input_rows_in_flight * NumUint4LoadsPerRow);
+      bool load_idx_valid = (PackedMode ? packed_bag_load_idx < num_packed_bags : row_load_idx < uint4_loads_per_row);
       {%- if is_rocm %}
       constexpr uint32_t kMaxRowUnroll = 4;
       constexpr uint32_t kRowUnroll = OutputRowsPerThread < kMaxRowUnroll ? OutputRowsPerThread : kMaxRowUnroll;
@@ -202,12 +200,12 @@ __global__ void {{ emb_weight_type.enum_name }}_split_embedding{{ "_nobag" if no
           bool final_valid = row_valid_v[inner_i];
           if constexpr (PackedMode) {
             // Store row data with uint4_loads_per_row offset
-            cp_async_zfill_cg<sizeof(uint4)>(
+            cp_async4(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx + uint4_loads_per_row * packed_bag_load_idx],
                 &row_v[inner_i][row_load_idx],
                 final_valid);
           } else {
-            cp_async_zfill_cg<sizeof(uint4)>(
+            cp_async4(
                 &buffers[warp_idx][i][input_row_idx][row_load_idx],
                 &row_v[inner_i][row_load_idx],
                 final_valid);
