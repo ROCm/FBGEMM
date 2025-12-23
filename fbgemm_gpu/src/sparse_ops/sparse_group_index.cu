@@ -62,9 +62,16 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   int cached_member_id = -1;
   int cached_upper_bound = -1;
 
-  for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
-       warp_id < total_num_warps;
-       warp_id += gridDim.x * blockDim.y) {
+  const int64_t linear_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+  const int64_t warps_per_launch = gridDim.x * blockDim.y;
+  const int64_t chunk_size =
+      (total_num_warps + warps_per_launch - 1) / warps_per_launch;
+  const int64_t start_warp_id = linear_warp_id * chunk_size;
+  const int64_t warp_end = start_warp_id + chunk_size < total_num_warps
+      ? start_warp_id + chunk_size
+      : total_num_warps;
+
+  for (int64_t warp_id = start_warp_id; warp_id < warp_end; ++warp_id) {
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
