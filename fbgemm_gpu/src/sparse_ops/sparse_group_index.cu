@@ -59,17 +59,26 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
   }
 
+  int cached_member_id = -1;
+  int cached_upper_bound = -1;
+
   for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
        warp_id < total_num_warps;
        warp_id += gridDim.x * blockDim.y) {
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
-      warp_upper_bound<int64_t, EMULATED_WARP_SIZE>(
-            &member_id,
-            warp_offsets_group + 1,
-            warp_id,
-            group_size);
+      if (warp_id >= cached_upper_bound) {
+        warp_upper_bound<int64_t, EMULATED_WARP_SIZE>(
+              &member_id,
+              &cached_upper_bound,
+              warp_offsets_group + 1,
+              warp_id,
+              group_size);
+        cached_member_id = member_id;
+      } else {
+        member_id = cached_member_id;
+      }
       num_cols = num_cols_group[member_id];
       warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
       member_warp_id = warp_id - warp_offsets_group[member_id];

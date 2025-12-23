@@ -19,6 +19,7 @@ namespace fbgemm_gpu {
 template <typename scalar_t, int kLogicalWarpSize = kWarpSize>
 __device__ __forceinline__ void warp_upper_bound(
     int* found,
+    int* cached_boundary,
     const scalar_t* arr,
     const scalar_t target,
     const int num_entries) {
@@ -45,6 +46,7 @@ __device__ __forceinline__ void warp_upper_bound(
   }
 
   int result = -1;
+  int cached_result = *cached_boundary;
   for (int base = 0; base < num_entries; base += kLogicalWarpSize) {
     const int idx = base + logical_lane;
     const bool valid = idx < num_entries;
@@ -59,11 +61,13 @@ __device__ __forceinline__ void warp_upper_bound(
 #endif
       const int first_lane = first_lane_hw - logical_warp_id * kLogicalWarpSize;
       result = base + first_lane;
+      cached_result = __shfl_sync(active_mask, val, first_lane_hw);
       break;
     }
   }
 
   *found = result;
+  *cached_boundary = cached_result;
 }
 #endif
 
