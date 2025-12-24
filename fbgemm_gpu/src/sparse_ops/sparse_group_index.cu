@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <cassert>
+
 #include "common.cuh"
 
 using Tensor = at::Tensor;
@@ -38,6 +40,8 @@ template <
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
+    bool USE_CONTIGUOUS_WARPS, 
+    bool USE_SORTED_INDICES,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -62,16 +66,27 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   int cached_member_id = -1;
   int cached_upper_bound = -1;
 
-  const int64_t linear_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
-  const int64_t warps_per_launch = gridDim.x * blockDim.y;
-  const int64_t chunk_size =
-      (total_num_warps + warps_per_launch - 1) / warps_per_launch;
-  const int64_t start_warp_id = linear_warp_id * chunk_size;
-  const int64_t warp_end = start_warp_id + chunk_size < total_num_warps
-      ? start_warp_id + chunk_size
-      : total_num_warps;
+  int64_t start_warp_id = 0;
+  int64_t warp_end = 0;
+  int64_t warp_stride = 0;
 
-  for (int64_t warp_id = start_warp_id; warp_id < warp_end; ++warp_id) {
+  if constexpr (USE_CONTIGUOUS_WARPS) {
+    const int64_t linear_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+    const int64_t warps_per_launch = gridDim.x * blockDim.y;
+    const int64_t chunk_size =
+        (total_num_warps + warps_per_launch - 1) / warps_per_launch;
+    start_warp_id = linear_warp_id * chunk_size;
+    warp_end = start_warp_id + chunk_size < total_num_warps
+        ? start_warp_id + chunk_size
+        : total_num_warps;
+    warp_stride = 1;
+  } else {
+    start_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+    warp_end = total_num_warps;
+    warp_stride = gridDim.x * blockDim.y;
+  }
+
+  for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
@@ -122,6 +137,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* sorted_indices_ptrs,
+    const int64_t* reverse_indices_ptrs, 
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const c10::ScalarType& input_scalar_type,
@@ -131,12 +148,18 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t total_num_warps,
     const int group_size,
     const bool use_index_select,
-    const bool use_var_cols) {
+    const bool use_var_cols,
+    const bool use_sorted_indices, 
+    const bool use_contiguous_warps) {
   if (group_size == 0) {
     return;
   }
 
   at::cuda::OptionalCUDAGuard device_guard(device);
+
+  if (use_sorted_indices) {
+    assert(sorted_indices_ptrs && reverse_indices_ptrs);
+  }
 
   // Partition work based on num_work_rows
   uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
@@ -147,13 +170,15 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
 
-#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS) \
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS, USE_CONTIGUOUS_WARPS, USE_SORTED_INDICES) \
   FBGEMM_LAUNCH_KERNEL(                                                  \
       (group_index_select_or_add_2d_kernel<                              \
           index_t,                                                       \
           scalar_t,                                                      \
           USE_INDEX_SELECT,                                              \
           USE_VAR_COLS,                                                  \
+          USE_CONTIGUOUS_WARPS,                                          \
+          USE_SORTED_INDICES,                                            \
           GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
           GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
           GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
@@ -169,21 +194,79 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       num_work_rows,                                                     \
       group_size)
 
+  // Rework this abomination with std::visit + std::variant
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
         FBGEMM_DISPATCH_FLOATING_TYPES(
             input_scalar_type, "group_index_select_2d_wrapper_2", [&] {
-              if (use_index_select) {
-                if (use_var_cols) {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true);
+              if (use_sorted_indices) {
+                if (use_contiguous_warps) {
+                  if (use_index_select) {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, true, true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, true, true);
+                    }
+                  } else {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, true, true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, true,
+                                                       true);
+                    }
+                  }
                 } else {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false);
+                  if (use_index_select) {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, false, true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, false,
+                                                       true);
+                    }
+                  } else {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, false,
+                                                       true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, false,
+                                                       true);
+                    }
+                  }
                 }
               } else {
-                if (use_var_cols) {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true);
+                if (use_contiguous_warps) {
+                  if (use_index_select) {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, true, true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, true, true);
+                    }
+                  } else {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, true, true);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, true,
+                                                       true);
+                    }
+                  }
                 } else {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false);
+                  if (use_index_select) {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, false,
+                                                       false);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, false,
+                                                       false);
+                    }
+                  } else {
+                    if (use_var_cols) {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, false,
+                                                       false);
+                    } else {
+                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, false,
+                                                       false);
+                    }
+                  }
                 }
               }
             });
