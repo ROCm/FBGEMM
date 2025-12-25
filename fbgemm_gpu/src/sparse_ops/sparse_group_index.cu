@@ -7,6 +7,8 @@
  */
 
 #include <cassert>
+#include <type_traits>
+#include <variant>
 
 #include "common.cuh"
 
@@ -170,109 +172,69 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
 
-#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS, USE_CONTIGUOUS_WARPS, USE_SORTED_INDICES) \
-  FBGEMM_LAUNCH_KERNEL(                                                  \
-      (group_index_select_or_add_2d_kernel<                              \
-          index_t,                                                       \
-          scalar_t,                                                      \
-          USE_INDEX_SELECT,                                              \
-          USE_VAR_COLS,                                                  \
-          USE_CONTIGUOUS_WARPS,                                          \
-          USE_SORTED_INDICES,                                            \
-          GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
-          GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
-          GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
-      grid_size,                                                         \
-      block_size,                                                        \
-      0,                                                                 \
-      at::cuda::getCurrentCUDAStream(),                                  \
-      input_ptrs,                                                        \
-      output_ptrs,                                                       \
-      indices_ptrs,                                                      \
-      warp_offsets_group,                                                \
-      num_cols_group,                                                    \
-      num_work_rows,                                                     \
-      group_size)
+  auto invoke_group_index_select_or_add = [&]<typename index_t,
+                                                        typename scalar_t,
+                                                        bool USE_INDEX_SELECT,
+                                                        bool USE_VAR_COLS,
+                                                        bool USE_CONTIGUOUS_WARPS,
+                                                        bool USE_SORTED_INDICES>() {
+    FBGEMM_LAUNCH_KERNEL(
+        (group_index_select_or_add_2d_kernel<
+            index_t,
+            scalar_t,
+            USE_INDEX_SELECT,
+            USE_VAR_COLS,
+            USE_CONTIGUOUS_WARPS,
+            USE_SORTED_INDICES,
+            GROUP_INDEX_SELECT_UNROLL_FACTOR,
+            GROUP_INDEX_SELECT_COLS_PER_WARP,
+            GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),
+        grid_size,
+        block_size,
+        0,
+        at::cuda::getCurrentCUDAStream(),
+        input_ptrs,
+        output_ptrs,
+        indices_ptrs,
+        warp_offsets_group,
+        num_cols_group,
+        num_work_rows,
+        group_size);
+  };
+  
+  using bool_variant_t = std::variant<std::true_type, std::false_type>;
 
-  // Rework this abomination with std::visit + std::variant
+  auto get_bool_type = [](const bool var) -> bool_variant_t {
+      if (var) {
+          return std::true_type{};
+      } else {
+          return std::false_type{};
+      }
+  };
+
+  const bool_variant_t use_index_select_variant = get_bool_type(use_index_select);
+  const bool_variant_t use_var_cols_variant = get_bool_type(use_var_cols);
+  const bool_variant_t use_contiguous_warps_variant = get_bool_type(use_contiguous_warps);
+  const bool_variant_t use_sorted_indices_variant = get_bool_type(use_sorted_indices);
+
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
         FBGEMM_DISPATCH_FLOATING_TYPES(
             input_scalar_type, "group_index_select_2d_wrapper_2", [&] {
-              if (use_sorted_indices) {
-                if (use_contiguous_warps) {
-                  if (use_index_select) {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, true, true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, true, true);
-                    }
-                  } else {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, true, true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, true,
-                                                       true);
-                    }
-                  }
-                } else {
-                  if (use_index_select) {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, false, true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, false,
-                                                       true);
-                    }
-                  } else {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, false,
-                                                       true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, false,
-                                                       true);
-                    }
-                  }
-                }
-              } else {
-                if (use_contiguous_warps) {
-                  if (use_index_select) {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, true, true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, true, true);
-                    }
-                  } else {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, true, true);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, true,
-                                                       true);
-                    }
-                  }
-                } else {
-                  if (use_index_select) {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, false,
-                                                       false);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, false,
-                                                       false);
-                    }
-                  } else {
-                    if (use_var_cols) {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, false,
-                                                       false);
-                    } else {
-                      INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, false,
-                                                       false);
-                    }
-                  }
-                }
-              }
+              std::visit(
+                  [&](auto use_index_select_arg, 
+                      auto use_var_cols_arg,
+                      auto use_contiguous_warps_arg,
+                      auto use_sorted_indices_arg) {
+                    invoke_group_index_select_or_add.template operator()<
+                        index_t, scalar_t, use_index_select_arg.value,
+                        use_var_cols_arg.value, use_contiguous_warps_arg.value,
+                        use_sorted_indices_arg.value>();
+                  },
+                  use_index_select_variant, use_var_cols_variant,
+                  use_contiguous_warps_variant, use_sorted_indices_variant);
             });
       });
-
-#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
 }
 
 } // namespace fbgemm_gpu
