@@ -52,6 +52,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* reverse_indices_ptrs,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const int64_t num_work_rows, // number of rows to work on per member
@@ -111,7 +112,8 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
     }
-    const auto row = member_warp_id / warps_per_row;
+    const index_t* reverse_indices = USE_SORTED_INDICES ? reinterpret_cast<index_t*>(reverse_indices_ptrs[member_id]) : nullptr;
+    const auto row = USE_SORTED_INDICES ? reverse_indices[member_warp_id / warps_per_row] : member_warp_id / warps_per_row;
     const auto col_offset =
         ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
         (threadIdx.x * UNROLL_FACTOR);
@@ -121,7 +123,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-    const index_t idx = indices[row];
+    const index_t idx = indices[member_warp_id / warps_per_row];
 #pragma unroll
     for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
       // Compile time conditional
@@ -195,7 +197,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
         at::cuda::getCurrentCUDAStream(),
         input_ptrs,
         output_ptrs,
-        indices_ptrs,
+        use_sorted_indices ? sorted_indices_ptrs : indices_ptrs,
+        reverse_indices_ptrs,
         warp_offsets_group,
         num_cols_group,
         num_work_rows,
