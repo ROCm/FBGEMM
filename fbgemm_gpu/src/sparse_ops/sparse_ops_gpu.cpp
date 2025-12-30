@@ -413,11 +413,14 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     // auto reverse_row = reverse_indices_storage.select(0, i);
     // at::sort_out(sorted_row, reverse_row, *index_contigs[i], /*dim=*/0, false);
     if (use_sorted_indices) {
-        const auto [sorted_indices, reverse_indices] = index_contigs[i]->sort();
+        const auto [sorted_indices, reverse_indices] =
+            sort_indices_with_rocprim(*index_contigs[i]);
         sorted_indices_storage.select(0, i).copy_(sorted_indices);
         reverse_indices_storage.select(0, i).copy_(reverse_indices);
-        sorted_indices_ptrs[i] = reinterpret_cast<int64_t>(sorted_indices_storage.select(0, i).data_ptr());
-        reverse_indices_ptrs[i] = reinterpret_cast<int64_t>(reverse_indices_storage.select(0, i).data_ptr());
+        sorted_indices_ptrs[i] = reinterpret_cast<int64_t>(
+            sorted_indices_storage.select(0, i).data_ptr());
+        reverse_indices_ptrs[i] = reinterpret_cast<int64_t>(
+            reverse_indices_storage.select(0, i).data_ptr());
     }
     warp_offset += warps_per_row * num_output_rows;
   }

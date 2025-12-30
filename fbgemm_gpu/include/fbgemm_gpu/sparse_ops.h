@@ -1019,6 +1019,9 @@ void compute_frequency_sequence(
     const int start_input,
     const int output_size);
 
+std::tuple<at::Tensor, at::Tensor> sort_indices_with_rocprim(
+    const at::Tensor& indices);
+
 ///@ingroup sparse-data-cuda
 at::Tensor index_select_cuda(
     const at::Tensor& input,
