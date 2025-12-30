@@ -1091,7 +1091,8 @@ void group_index_select_or_add_cuda(
     const bool use_index_select,
     const bool use_var_cols,
     const bool use_sorted_indices,
-    const bool use_contiguous_warps);
+    const bool use_contiguous_warps,
+    const bool use_cache);
 
 int get_group_index_select_cols_per_warp();
 

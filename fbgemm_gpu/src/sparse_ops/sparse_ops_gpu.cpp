@@ -318,6 +318,16 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     }
   }
 
+  bool use_cache = false;
+  if (const char* env_p = std::getenv("FBGEMM_USE_CACHE"))
+  {
+    try {
+        use_cache = std::stoi(env_p);
+    } catch (const std::exception& e) {
+        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CACHE. Falling back to default value (0)")
+    }
+  }
+
   Tensor sorted_indices_storage = at::empty(
     {static_cast<long>(group_size), static_cast<long>(num_output_rows)},
     first_indices.options());
@@ -463,7 +473,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       /*use_index_select=*/true,
       use_var_cols,
       use_sorted_indices,
-      use_contiguous_warps);
+      use_contiguous_warps,
+      use_cache);
 
   output_group.push_back(args_tensor);
   output_group.push_back(saved_data_t);
@@ -501,6 +512,16 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
         use_contiguous_warps = std::stoi(env_p);
     } catch (const std::exception& e) {
         TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CONTIGUOUS_WARPS. Falling back to default value (0)")
+    }
+  }
+
+  bool use_cache = false;
+  if (const char* env_p = std::getenv("FBGEMM_USE_CACHE"))
+  {
+    try {
+        use_cache = std::stoi(env_p);
+    } catch (const std::exception& e) {
+        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CACHE. Falling back to default value (0)")
     }
   }
 
@@ -686,7 +707,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       /*use_index_select=*/false,
       use_var_cols,
       use_sorted_indices,
-      use_contiguous_warps);
+      use_contiguous_warps,
+      use_cache);
 
   return outputs;
 }

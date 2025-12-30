@@ -7,6 +7,7 @@
  */
 
 #include <cassert>
+#include <limits>
 #include <type_traits>
 #include <variant>
 
@@ -44,6 +45,7 @@ template <
     bool USE_VAR_COLS,
     bool USE_CONTIGUOUS_WARPS, 
     bool USE_SORTED_INDICES,
+    bool USE_CACHE,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -57,6 +59,8 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int32_t* num_cols_group,
     const int64_t num_work_rows, // number of rows to work on per member
     const int64_t group_size) {
+  constexpr index_t kInvalidIdx = std::numeric_limits<index_t>::max();
+
   const auto total_num_warps = warp_offsets_group[group_size];
   int32_t num_cols = 0;
   int32_t warps_per_row = 0;
@@ -66,8 +70,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
   }
 
-  int cached_member_id = -1;
-  int cached_upper_bound = -1;
+  [[maybe_unused]] int cached_member_id = -1;
+  [[maybe_unused]] int cached_upper_bound = -1;
+  [[maybe_unused]] int32_t last_member_id_for_accum = -1;
+  [[maybe_unused]] int32_t last_member_num_cols = 0;
+  [[maybe_unused]] scalar_t* last_member_output_tile = nullptr;
 
   int64_t start_warp_id = 0;
   int64_t warp_end = 0;
@@ -88,6 +95,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     warp_end = total_num_warps;
     warp_stride = gridDim.x * blockDim.y;
   }
+
+  auto storage = scalar_t(0);
+  auto cached_idx = kInvalidIdx;
 
   for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
     int32_t member_id = 0;
@@ -112,10 +122,24 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
     }
+
+    int64_t row_in_member = 0;
+    int64_t col_tile = 0;
+    if constexpr (USE_CONTIGUOUS_WARPS) {
+      // Contiguous warp traversal: iterate rows sequentially while column tiles
+      // remain strided so each warp processes a different tile for successive rows.
+      row_in_member = member_warp_id % num_work_rows;
+      col_tile = member_warp_id / num_work_rows;
+    } else {
+      // Original strided mapping: each warp walks tiles first, distributing rows round-robin.
+      row_in_member = member_warp_id / warps_per_row;
+      col_tile = member_warp_id % warps_per_row;
+    }
+
     const index_t* reverse_indices = USE_SORTED_INDICES ? reinterpret_cast<index_t*>(reverse_indices_ptrs[member_id]) : nullptr;
-    const auto row = USE_SORTED_INDICES ? reverse_indices[member_warp_id / warps_per_row] : member_warp_id / warps_per_row;
+    const auto row = USE_SORTED_INDICES ? reverse_indices[row_in_member] : row_in_member;
     const auto col_offset =
-        ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
+        (static_cast<int64_t>(col_tile) << LOG_COLS_PER_WARP) +
         (threadIdx.x * UNROLL_FACTOR);
     scalar_t* input =
         reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
@@ -123,15 +147,59 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-    const index_t idx = indices[member_warp_id / warps_per_row];
+    const index_t idx = indices[row_in_member];
+    // TODO: Account for UNROLL_FACTOR
 #pragma unroll
     for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
       // Compile time conditional
       if constexpr (USE_INDEX_SELECT) {
-        output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+        if constexpr (USE_CACHE) {
+          if (cached_idx != idx) {
+            storage = LDG(&input[idx * num_cols + i]);
+            cached_idx = idx;
+          }
+
+          output[row * num_cols + i] = storage;
+        } else {
+          output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+        }
       } else {
-        gpuAtomicAddNoReturn(
+        if constexpr (USE_CACHE) {
+          const bool member_changed = (last_member_id_for_accum != -1 &&
+                                      member_id != last_member_id_for_accum);
+          // Probably might be merged into following if-else cascade
+          if (member_changed && last_member_output_tile && cached_idx != kInvalidIdx) {
+            gpuAtomicAddNoReturn(
+                &last_member_output_tile[cached_idx * last_member_num_cols + i],
+                storage);
+          }
+
+          const bool is_first_warp = member_changed || (warp_id == start_warp_id);
+          const bool is_last_warp = (warp_id + warp_stride >= warp_end);
+          if (is_first_warp) {
+            storage = input[row * num_cols + i];
+            cached_idx = idx;
+          } else if (cached_idx != idx) {
+            gpuAtomicAddNoReturn(
+              &output[cached_idx * num_cols + i], storage);
+            storage = input[row * num_cols + i];
+            cached_idx = idx;
+          } else {
+            storage += input[row * num_cols + i];
+          }
+
+          if (is_last_warp) {
+            gpuAtomicAddNoReturn(
+              &output[idx * num_cols + i], storage);
+          }
+
+          last_member_output_tile = output;
+          last_member_num_cols = num_cols;
+          last_member_id_for_accum = member_id;
+        } else {
+          gpuAtomicAddNoReturn(
             &output[idx * num_cols + i], input[row * num_cols + i]);
+        }
       }
     }
   }
@@ -154,7 +222,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const bool use_index_select,
     const bool use_var_cols,
     const bool use_sorted_indices, 
-    const bool use_contiguous_warps) {
+    const bool use_contiguous_warps,
+    const bool use_cache) {
   if (group_size == 0) {
     return;
   }
@@ -179,7 +248,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                                                         bool USE_INDEX_SELECT,
                                                         bool USE_VAR_COLS,
                                                         bool USE_CONTIGUOUS_WARPS,
-                                                        bool USE_SORTED_INDICES>() {
+                                                        bool USE_SORTED_INDICES,
+                                                        bool USE_CACHE>() {
     FBGEMM_LAUNCH_KERNEL(
         (group_index_select_or_add_2d_kernel<
             index_t,
@@ -188,6 +258,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
             USE_VAR_COLS,
             USE_CONTIGUOUS_WARPS,
             USE_SORTED_INDICES,
+            USE_CACHE,
             GROUP_INDEX_SELECT_UNROLL_FACTOR,
             GROUP_INDEX_SELECT_COLS_PER_WARP,
             GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),
@@ -219,6 +290,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
   const bool_variant_t use_var_cols_variant = get_bool_type(use_var_cols);
   const bool_variant_t use_contiguous_warps_variant = get_bool_type(use_contiguous_warps);
   const bool_variant_t use_sorted_indices_variant = get_bool_type(use_sorted_indices);
+  const bool_variant_t use_cache_variant = get_bool_type(use_cache);
 
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
@@ -228,14 +300,16 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                   [&](auto use_index_select_arg, 
                       auto use_var_cols_arg,
                       auto use_contiguous_warps_arg,
-                      auto use_sorted_indices_arg) {
+                      auto use_sorted_indices_arg,
+                      auto use_cache_arg) {
                     invoke_group_index_select_or_add.template operator()<
                         index_t, scalar_t, use_index_select_arg.value,
                         use_var_cols_arg.value, use_contiguous_warps_arg.value,
-                        use_sorted_indices_arg.value>();
+                        use_sorted_indices_arg.value,
+                        use_cache_arg.value>();
                   },
                   use_index_select_variant, use_var_cols_variant,
-                  use_contiguous_warps_variant, use_sorted_indices_variant);
+                  use_contiguous_warps_variant, use_sorted_indices_variant, use_cache_variant);
             });
       });
 }
