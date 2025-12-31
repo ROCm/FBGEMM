@@ -1099,6 +1099,8 @@ void group_index_select_or_add_cuda(
 
 int get_group_index_select_cols_per_warp();
 
+int get_group_index_select_unroll_factor();
+
 std::vector<at::Tensor> jagged_index_select_2d(
     const at::Tensor& values,
     const at::Tensor& lengths,

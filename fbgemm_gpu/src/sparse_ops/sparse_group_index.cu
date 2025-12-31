@@ -38,6 +38,10 @@ int get_group_index_select_cols_per_warp() {
   return GROUP_INDEX_SELECT_COLS_PER_WARP;
 }
 
+int get_group_index_select_unroll_factor() {
+  return GROUP_INDEX_SELECT_UNROLL_FACTOR;
+}
+
 template <
     typename index_t,
     typename scalar_t,
@@ -100,6 +104,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   auto cached_idx = kInvalidIdx;
 
   for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
+#ifdef USE_ROCM
+    bool use_small_dim_path = false;
+    int rows_per_warp_small = 0;
+#endif
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
@@ -121,33 +129,77 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // All columns are the same
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+#ifdef USE_ROCM
+      if constexpr (!USE_CONTIGUOUS_WARPS) {
+        if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
+          rows_per_warp_small = COLS_PER_WARP / num_cols;
+          const auto warps_per_member =
+              (num_work_rows + rows_per_warp_small - 1) / rows_per_warp_small;
+          member_id = warp_id / warps_per_member;
+          member_warp_id = warp_id % warps_per_member;
+          use_small_dim_path = true;
+        }
+      }
+#endif // USE_ROCM
     }
 
-    int64_t row_in_member = 0;
-    int64_t col_tile = 0;
-    if constexpr (USE_CONTIGUOUS_WARPS) {
-      // Contiguous warp traversal: iterate rows sequentially while column tiles
-      // remain strided so each warp processes a different tile for successive rows.
-      row_in_member = member_warp_id % num_work_rows;
-      col_tile = member_warp_id / num_work_rows;
-    } else {
-      // Original strided mapping: each warp walks tiles first, distributing rows round-robin.
-      row_in_member = member_warp_id / warps_per_row;
-      col_tile = member_warp_id % warps_per_row;
-    }
+    index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+    const index_t* reverse_indices = USE_SORTED_INDICES
+        ? reinterpret_cast<index_t*>(reverse_indices_ptrs[member_id])
+        : nullptr;
 
-    const index_t* reverse_indices = USE_SORTED_INDICES ? reinterpret_cast<index_t*>(reverse_indices_ptrs[member_id]) : nullptr;
-    const auto row = USE_SORTED_INDICES ? reverse_indices[row_in_member] : row_in_member;
-    const auto col_offset =
-        (static_cast<int64_t>(col_tile) << LOG_COLS_PER_WARP) +
-        (threadIdx.x * UNROLL_FACTOR);
+    int64_t logical_row = 0;
+    int64_t row = 0;
+    int64_t col_offset = 0;
+    bool handled_small_dim_path = false;
+
+#ifdef USE_ROCM
+    if constexpr (!USE_CONTIGUOUS_WARPS) {
+      if (use_small_dim_path) {
+        const int rows_per_warp = rows_per_warp_small;
+        const int64_t start_row = member_warp_id * rows_per_warp;
+        const int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols;
+        const int64_t current_row = start_row + local_row;
+        const int col_offset_small = (threadIdx.x * UNROLL_FACTOR) % num_cols;
+
+        if (local_row < rows_per_warp && current_row < num_work_rows) {
+          logical_row = current_row;
+          row = USE_SORTED_INDICES ? reverse_indices[current_row] : current_row;
+          col_offset = col_offset_small;
+          handled_small_dim_path = true;
+        } else {
+          continue;
+        }
+      }
+    }
+#endif // USE_ROCM
+
+    if (!handled_small_dim_path) {
+      int64_t row_in_member = 0;
+      int64_t col_tile = 0;
+      if constexpr (USE_CONTIGUOUS_WARPS) {
+        // Contiguous warp traversal: iterate rows sequentially while column tiles
+        // remain strided so each warp processes a different tile for successive rows.
+        row_in_member = member_warp_id % num_work_rows;
+        col_tile = member_warp_id / num_work_rows;
+      } else {
+        // Original strided mapping: each warp walks tiles first, distributing rows round-robin.
+        row_in_member = member_warp_id / warps_per_row;
+        col_tile = member_warp_id % warps_per_row;
+      }
+
+      logical_row = row_in_member;
+      row = USE_SORTED_INDICES ? reverse_indices[row_in_member] : row_in_member;
+      col_offset =
+          (static_cast<int64_t>(col_tile) << LOG_COLS_PER_WARP) +
+          (threadIdx.x * UNROLL_FACTOR);
+    }
     scalar_t* input =
         reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
     scalar_t* output =
         reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
-    index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-    const index_t idx = indices[row_in_member];
+    const index_t idx = indices[logical_row];
     // TODO: Account for UNROLL_FACTOR
 #pragma unroll
     for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
