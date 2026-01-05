@@ -147,7 +147,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
 #ifdef USE_ROCM
-      if constexpr (!USE_CONTIGUOUS_WARPS) {
+      if constexpr (USE_PACKED_ROWS) {
         if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
           rows_per_warp_small = COLS_PER_WARP / num_cols;
           const auto warps_per_member =
@@ -171,7 +171,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     bool handled_small_dim_path = false;
 
 #ifdef USE_ROCM
-    if constexpr (!USE_CONTIGUOUS_WARPS && USE_PACKED_ROWS) {
+    if constexpr (USE_PACKED_ROWS) {
       if (use_small_dim_path) {
         const int rows_per_warp = rows_per_warp_small;
         const int64_t start_row = member_warp_id * rows_per_warp;
