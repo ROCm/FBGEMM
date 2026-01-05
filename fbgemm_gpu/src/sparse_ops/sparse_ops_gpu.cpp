@@ -12,21 +12,19 @@
 #include "fbgemm_gpu/sparse_ops.h"
 #include "fbgemm_gpu/utils/ops_utils.h"
 #include "fbgemm_gpu/utils/tensor_utils.h"
+#ifdef USE_ROCM
+#include "fbgemm_gpu/utils/rocm/sparse_group_utils.h"
+#endif
 
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/core/op_registration/op_registration.h>
-#include <exception>
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/library.h>
 #include <torch/script.h>
 #include <cstdint>
-
-// For experimental purposes
-#include <cstdlib>
-#include <string>
-#include <stdexcept>
-
 #include <stdexcept> // for logic_error
+#include <utility>
 
 using Tensor = at::Tensor;
 
@@ -298,43 +296,10 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   int64_t warp_offset = 0;
   bool use_var_cols = false;
 
-  // For experimental purposes. Shouldn't go into prod
-  bool use_sorted_indices = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_SORTED_INDICES"))
-  {
-    try {
-        use_sorted_indices = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_SORTED_INDICES. Falling back to default value (0)")
-    }
-  }
-
-  bool use_contiguous_warps = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_CONTIGUOUS_WARPS"))
-  {
-    try {
-        use_contiguous_warps = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CONTIGUOUS_WARPS. Falling back to default value (0)")
-    }
-  }
-
-  bool use_cache = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_CACHE"))
-  {
-    try {
-        use_cache = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CACHE. Falling back to default value (0)")
-    }
-  }
-
-  Tensor sorted_indices_storage = at::empty(
-    {static_cast<long>(group_size), static_cast<long>(num_output_rows)},
-    first_indices.options());
-  Tensor reverse_indices_storage = at::empty(
-    {static_cast<long>(group_size), static_cast<long>(num_output_rows)},
-    first_indices.options());
+  Tensor sorted_indices_storage =
+    at::empty({0}, first_indices.options());
+  Tensor reverse_indices_storage =
+    at::empty({0}, first_indices.options());
 
   // Allocate memory for output_group
   std::vector<Tensor> output_group;
@@ -348,6 +313,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   input_contigs.reserve(group_size);
   index_contigs.reserve(group_size);
 
+  bool use_packed_rows = false;
+  size_t num_total_indices = 0;
   // For each group, copy input to output
   for (const auto i : c10::irange(group_size)) {
     const auto& input = input_group[i];
@@ -369,6 +336,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     TENSORS_ON_SAME_CUDA_GPU_IF_NOT_OPTIONAL(input, indices);
 
     auto num_output_rows_ = indices.size(0);
+    num_total_indices += num_output_rows_;
 
     // Verify that all input tensors have the same shape[0]
     TORCH_CHECK_VALUE(
@@ -392,6 +360,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         // Optimization: Pack multiple rows into one warp
         int rows_per_warp = cols_per_warp / num_cols_;
         warps_needed = (num_output_rows_ + rows_per_warp - 1) / rows_per_warp;
+        use_packed_rows = true;
     } else {
         // Standard: One or more warps per row
         int warps_per_row = (num_cols_ + cols_per_warp - 1) / cols_per_warp;
@@ -425,22 +394,21 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
     warp_offsets_group[i] = warp_offset;
     num_cols_group[i] = num_cols_;
-    if (use_sorted_indices) {
-        const auto [sorted_indices, reverse_indices] =
-            sort_indices_with_rocprim(*index_contigs[i]);
-        sorted_indices_storage.select(0, i).copy_(sorted_indices);
-        reverse_indices_storage.select(0, i).copy_(reverse_indices);
-        sorted_indices_ptrs[i] = reinterpret_cast<int64_t>(
-            sorted_indices_storage.select(0, i).data_ptr());
-        reverse_indices_ptrs[i] = reinterpret_cast<int64_t>(
-            reverse_indices_storage.select(0, i).data_ptr());
-    }
 #ifdef USE_ROCM
     warp_offset += warps_needed;
 #else
     warp_offset += warps_per_row * num_output_rows;
 #endif // USE_ROCM
   }
+
+#ifdef USE_ROCM
+  constexpr size_t kSortIndicesThreshold = 15'000'000;
+  const bool use_sorted_indices_for_bwd =
+      (num_total_indices < kSortIndicesThreshold);
+#else
+  const bool use_sorted_indices_for_bwd = false;
+  (void)num_total_indices;
+#endif
 
   // Store the last offset
   warp_offsets_group[group_size] = warp_offset;
@@ -465,6 +433,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   int64_t saved_data[] = {
       static_cast<int64_t>(group_size),
       use_var_cols,
+      use_packed_rows,
+      use_sorted_indices_for_bwd,
       reinterpret_cast<int64_t>(warp_offsets_group),
       reinterpret_cast<int64_t>(num_cols_group),
       warp_offset,
@@ -480,8 +450,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       input_ptrs,
       output_ptrs,
       indices_ptrs,
-      use_sorted_indices ? sorted_indices_ptrs : nullptr,
-      use_sorted_indices ? reverse_indices_ptrs : nullptr,
+      /*sorted_indices_ptrs=*/nullptr,
+      /*reverse_indices_ptrs=*/nullptr,
       warp_offsets_group,
       num_cols_group,
       first_input.scalar_type(),
@@ -492,9 +462,9 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       group_size,
       /*use_index_select=*/true,
       use_var_cols,
-      use_sorted_indices,
-      use_contiguous_warps,
-      use_cache);
+      /*use_contiguous_warps=*/false,
+      /*use_cache=*/false,
+      use_packed_rows);
 
   output_group.push_back(args_tensor);
   output_group.push_back(saved_data_t);
@@ -514,37 +484,6 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       "all_inputs size must be larger than 4, but got ",
       all_inputs.size());
 
-  // For experimental purposes. Shouldn't go into prod
-  bool use_sorted_indices = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_SORTED_INDICES"))
-  {
-    try {
-        use_sorted_indices = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_SORTED_INDICES. Falling back to default value (0)")
-    }
-  }
-
-  bool use_contiguous_warps = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_CONTIGUOUS_WARPS"))
-  {
-    try {
-        use_contiguous_warps = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CONTIGUOUS_WARPS. Falling back to default value (0)")
-    }
-  }
-
-  bool use_cache = false;
-  if (const char* env_p = std::getenv("FBGEMM_USE_CACHE"))
-  {
-    try {
-        use_cache = std::stoi(env_p);
-    } catch (const std::exception& e) {
-        TORCH_WARN_ONCE("Failed to get FBGEMM_USE_CACHE. Falling back to default value (0)")
-    }
-  }
-
   // all_input size =  group_size * 2 (from grads, indices)
   // + 1 args_tensor + 1 saved_data + 1 first input
   const int64_t group_size = (all_inputs.size() - 5) / 2;
@@ -552,8 +491,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   const Tensor& fwd_input = all_inputs[2 * group_size + 4];
   const int64_t output_dim = fwd_input.dim();
   const Tensor& saved_data = all_inputs[2 * group_size + 1];
-  const Tensor& sorted_indices = all_inputs[2 * group_size + 2];
-  const Tensor& reverse_indices = all_inputs[2 * group_size + 3];
+  const Tensor& sorted_indices_storage = all_inputs[2 * group_size + 2];
+  const Tensor& reverse_indices_storage = all_inputs[2 * group_size + 3];
   const Tensor& first_indices = all_inputs[group_size];
 
   auto grad_output_group = std::vector<Tensor>(
@@ -568,28 +507,24 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       all_inputs.cbegin() + group_size, all_inputs.cbegin() + 2 * group_size);
 
   // Retrieve saved data
-  TORCH_CHECK(
+    TORCH_CHECK(
       saved_data.device() == at::kCPU, "Tensor saved_data must be on CPU.");
-  TORCH_CHECK(
+    TORCH_CHECK(
       saved_data.is_contiguous(), "Tensor saved_data must be contiguous.");
-  int64_t* saved_data_ptr = saved_data.data_ptr<int64_t>();
-  // Check that the size is the same
-  TORCH_CHECK_VALUE(
+    int64_t* saved_data_ptr = saved_data.data_ptr<int64_t>();
+    // Check that the size is the same
+    TORCH_CHECK_VALUE(
       saved_data_ptr[0] == group_size,
       "The size of saved_data[0] must match group_size. Expect ",
       group_size,
       " but got ",
       saved_data_ptr[0]);
   const bool use_var_cols = saved_data_ptr[1];
-  int64_t* warp_offsets_group = reinterpret_cast<int64_t*>(saved_data_ptr[2]);
-  int32_t* num_cols_group = reinterpret_cast<int32_t*>(saved_data_ptr[3]);
-  int64_t total_num_warps = saved_data_ptr[4];
-
-  TENSOR_ON_CUDA_GPU(sorted_indices);
-  TENSOR_ON_CUDA_GPU(reverse_indices);
-  TORCH_CHECK(sorted_indices.dim() == 2);
-  TORCH_CHECK(sorted_indices.size(0) == group_size);
-  TORCH_CHECK(reverse_indices.sizes() == sorted_indices.sizes());
+  const bool use_packed_rows = saved_data_ptr[2];
+  const bool use_sorted_indices = saved_data_ptr[3];
+  int64_t* warp_offsets_group = reinterpret_cast<int64_t*>(saved_data_ptr[4]);
+  int32_t* num_cols_group = reinterpret_cast<int32_t*>(saved_data_ptr[5]);
+  int64_t total_num_warps = saved_data_ptr[6];
 
   // We checked in forward that all output rows are the same for all member
   // in the group
@@ -692,23 +627,45 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
 
   // Calculate indices_ptrs
   std::vector<c10::MaybeOwned<at::Tensor>> index_contigs;
+  std::vector<at::Tensor> sorted_indices_contigs;
+  std::vector<at::Tensor> reverse_indices_contigs;
   index_contigs.reserve(group_size);
+  if (use_sorted_indices) {
+    sorted_indices_contigs.reserve(group_size);
+    reverse_indices_contigs.reserve(group_size);
+  }
   for (const auto i : c10::irange(group_size)) {
     const auto& indices = indices_group[i];
     index_contigs.push_back(indices.expect_contiguous());
     indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
-    const auto sorted_row = sorted_indices.select(0, i);
-    const auto reverse_row = reverse_indices.select(0, i);
-    TORCH_CHECK(sorted_row.is_contiguous());
-    TORCH_CHECK(reverse_row.is_contiguous());
-    sorted_indices_ptrs[i] =
-        reinterpret_cast<int64_t>(sorted_row.data_ptr());
-    reverse_indices_ptrs[i] =
-        reinterpret_cast<int64_t>(reverse_row.data_ptr());
+    reverse_indices_ptrs[i] = 0;
+#ifdef USE_ROCM
+    if (use_sorted_indices) {
+      auto [sorted_tensor, reverse_tensor] =
+        rocm::sort_indices_with_rocprim(*index_contigs[i]);
+      const auto stream = at::cuda::getCurrentCUDAStream();
+      sorted_tensor.record_stream(stream);
+      reverse_tensor.record_stream(stream);
+      sorted_indices_contigs.push_back(std::move(sorted_tensor));
+      reverse_indices_contigs.push_back(std::move(reverse_tensor));
+      sorted_indices_ptrs[i] = reinterpret_cast<int64_t>(
+          sorted_indices_contigs.back().data_ptr());
+      reverse_indices_ptrs[i] = reinterpret_cast<int64_t>(
+          reverse_indices_contigs.back().data_ptr());
+    }
+#endif
   }
 
   // Transfer grad output pointers to GPU
   args_tensor = args_tensor.to(first_indices.device(), /*non_blocking=*/true);
+
+#ifdef USE_ROCM
+  constexpr bool use_contiguous_warps = true;
+  constexpr bool use_cache = true;
+#else
+  constexpr bool use_contiguous_warps = false;
+  constexpr bool use_cache = false;
+#endif
 
   group_index_select_or_add_cuda(
       args_tensor.data_ptr<int64_t>(),
@@ -726,9 +683,9 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       group_size,
       /*use_index_select=*/false,
       use_var_cols,
-      use_sorted_indices,
       use_contiguous_warps,
-      use_cache);
+      use_cache,
+      use_packed_rows);
 
   return outputs;
 }

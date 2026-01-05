@@ -12,6 +12,9 @@
 #include <variant>
 
 #include "common.cuh"
+#ifdef USE_ROCM
+#include "fbgemm_gpu/utils/rocm/sparse_group_utils.h"
+#endif
 
 using Tensor = at::Tensor;
 
@@ -50,6 +53,7 @@ template <
     bool USE_CONTIGUOUS_WARPS, 
     bool USE_SORTED_INDICES,
     bool USE_CACHE,
+    bool USE_PACKED_ROWS,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -111,8 +115,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
+#ifdef USE_ROCM
       if (warp_id >= cached_upper_bound) {
-        warp_upper_bound<int64_t, EMULATED_WARP_SIZE>(
+        rocm::warp_upper_bound<int64_t, EMULATED_WARP_SIZE>(
               &member_id,
               &cached_upper_bound,
               warp_offsets_group + 1,
@@ -122,6 +127,18 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       } else {
         member_id = cached_member_id;
       }
+#else
+      __shared__ int member_ids[kMaxThreads / EMULATED_WARP_SIZE];
+      if (threadIdx.x == 0) {
+        binary_search_range(
+            &member_ids[threadIdx.y],
+            warp_offsets_group + 1,
+            warp_id,
+            group_size);
+      }
+      syncwarp();
+      member_id = member_ids[threadIdx.y];
+#endif
       num_cols = num_cols_group[member_id];
       warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
       member_warp_id = warp_id - warp_offsets_group[member_id];
@@ -154,7 +171,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     bool handled_small_dim_path = false;
 
 #ifdef USE_ROCM
-    if constexpr (!USE_CONTIGUOUS_WARPS) {
+    if constexpr (!USE_CONTIGUOUS_WARPS && USE_PACKED_ROWS) {
       if (use_small_dim_path) {
         const int rows_per_warp = rows_per_warp_small;
         const int64_t start_row = member_warp_id * rows_per_warp;
@@ -173,7 +190,6 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       }
     }
 #endif // USE_ROCM
-
     if (!handled_small_dim_path) {
       int64_t row_in_member = 0;
       int64_t col_tile = 0;
@@ -273,18 +289,15 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int group_size,
     const bool use_index_select,
     const bool use_var_cols,
-    const bool use_sorted_indices, 
     const bool use_contiguous_warps,
-    const bool use_cache) {
+    const bool use_cache,
+    const bool use_packed_rows) {
   if (group_size == 0) {
     return;
   }
 
   at::cuda::OptionalCUDAGuard device_guard(device);
-
-  if (use_sorted_indices) {
-    assert(sorted_indices_ptrs && reverse_indices_ptrs);
-  }
+  const bool use_sorted_indices = (sorted_indices_ptrs && reverse_indices_ptrs);
 
   // Partition work based on num_work_rows
   uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
@@ -301,7 +314,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                                                         bool USE_VAR_COLS,
                                                         bool USE_CONTIGUOUS_WARPS,
                                                         bool USE_SORTED_INDICES,
-                                                        bool USE_CACHE>() {
+                                                        bool USE_CACHE,
+                                                        bool USE_PACKED_ROWS>() {
     FBGEMM_LAUNCH_KERNEL(
         (group_index_select_or_add_2d_kernel<
             index_t,
@@ -311,6 +325,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
             USE_CONTIGUOUS_WARPS,
             USE_SORTED_INDICES,
             USE_CACHE,
+            USE_PACKED_ROWS,
             GROUP_INDEX_SELECT_UNROLL_FACTOR,
             GROUP_INDEX_SELECT_COLS_PER_WARP,
             GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),
@@ -343,6 +358,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
   const bool_variant_t use_contiguous_warps_variant = get_bool_type(use_contiguous_warps);
   const bool_variant_t use_sorted_indices_variant = get_bool_type(use_sorted_indices);
   const bool_variant_t use_cache_variant = get_bool_type(use_cache);
+  const bool_variant_t use_packed_rows_variant = get_bool_type(use_packed_rows);
 
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
@@ -353,15 +369,24 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                       auto use_var_cols_arg,
                       auto use_contiguous_warps_arg,
                       auto use_sorted_indices_arg,
-                      auto use_cache_arg) {
+                      auto use_cache_arg,
+                      auto use_packed_rows_arg) {
                     invoke_group_index_select_or_add.template operator()<
-                        index_t, scalar_t, use_index_select_arg.value,
-                        use_var_cols_arg.value, use_contiguous_warps_arg.value,
+                        index_t, 
+                        scalar_t, 
+                        use_index_select_arg.value,
+                        use_var_cols_arg.value, 
+                        use_contiguous_warps_arg.value,
                         use_sorted_indices_arg.value,
-                        use_cache_arg.value>();
+                        use_cache_arg.value,
+                        use_packed_rows_arg.value>();
                   },
-                  use_index_select_variant, use_var_cols_variant,
-                  use_contiguous_warps_variant, use_sorted_indices_variant, use_cache_variant);
+                  use_index_select_variant, 
+                  use_var_cols_variant,
+                  use_contiguous_warps_variant, 
+                  use_sorted_indices_variant, 
+                  use_cache_variant,
+                  use_packed_rows_variant);
             });
       });
 }
