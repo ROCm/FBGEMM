@@ -67,6 +67,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int32_t* num_cols_group,
     const int64_t num_work_rows, // number of rows to work on per member
     const int64_t group_size) {
+  static_assert(
+      !USE_CACHE || UNROLL_FACTOR == 1,
+      "Cache path only supports UNROLL_FACTOR == 1");
+
   constexpr index_t kInvalidIdx = std::numeric_limits<index_t>::max();
 
   const auto total_num_warps = warp_offsets_group[group_size];

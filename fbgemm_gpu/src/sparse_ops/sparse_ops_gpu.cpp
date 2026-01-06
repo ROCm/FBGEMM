@@ -507,13 +507,13 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       all_inputs.cbegin() + group_size, all_inputs.cbegin() + 2 * group_size);
 
   // Retrieve saved data
-    TORCH_CHECK(
+  TORCH_CHECK(
       saved_data.device() == at::kCPU, "Tensor saved_data must be on CPU.");
-    TORCH_CHECK(
+  TORCH_CHECK(
       saved_data.is_contiguous(), "Tensor saved_data must be contiguous.");
-    int64_t* saved_data_ptr = saved_data.data_ptr<int64_t>();
-    // Check that the size is the same
-    TORCH_CHECK_VALUE(
+  int64_t* saved_data_ptr = saved_data.data_ptr<int64_t>();
+  // Check that the size is the same
+  TORCH_CHECK_VALUE(
       saved_data_ptr[0] == group_size,
       "The size of saved_data[0] must match group_size. Expect ",
       group_size,
