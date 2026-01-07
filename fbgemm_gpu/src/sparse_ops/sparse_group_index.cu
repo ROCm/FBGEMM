@@ -38,17 +38,15 @@ int get_group_index_select_unroll_factor() {
 }
 
 template <typename T>
-__device__ inline T shfl_scalar(T val, int srcLane) {
+__device__ inline T shfl_scalar(const T val, const int srcLane) {
     // 32-bit types (Float, Int32)
     if constexpr (sizeof(T) == 4) {
-        int v = *reinterpret_cast<const float*>(&val);
+        float v = *reinterpret_cast<const float*>(&val);
         v = __shfl(v, srcLane);
         return *reinterpret_cast<T*>(&v);
     } 
     // 64-bit types (Double, Int64)
     else if constexpr (sizeof(T) == 8) {
-        // HIP/CUDA usually support double directly for 64-bit shuffle
-        // If T is already double, this is a no-op cast
         double v = *reinterpret_cast<const double*>(&val);
         v = __shfl(v, srcLane);
         return *reinterpret_cast<T*>(&v);
@@ -154,7 +152,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         index_t idx = indices[current_row];
 
         // Determine all the other lanes that are working on the same column
-        auto col_mask = __match_any_sync(__activemask(), col);
+        auto col_mask = __match_any_sync(__activemask(), col_offset);
         
         // Determing all the other lanes that are working on the same index
         uint64_t index_mask = 0;
@@ -181,7 +179,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
             // and perform the final global atomic add at the output location
             auto leader_lane = __ffsll(peer_mask) - 1; // ffsll returns 1-based index
 
-            auto my_value = input_base[current_row * num_cols + i];
+            auto my_value = input[current_row * num_cols + i];
 
             scalar_t group_sum = 0;
 
@@ -191,7 +189,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
               int peer_lane = __ffsll(peer_mask) - 1;
 
               // Extract the value from the peer lane
-              auto peer_value = __shfl(*reinterpret_cast<float*>(&my_value), peer_lane);
+              auto peer_value = shfl_scalar<scalar_t>(my_value, peer_lane);
 
               if(threadIdx.x == leader_lane) {
                 group_sum += peer_value;
@@ -204,7 +202,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
             // Only the leader lane performs the global atomic add
             if(threadIdx.x == leader_lane) {
               gpuAtomicAddNoReturn(
-                  &output_base[idx * num_cols + i], 
+                  &output[idx * num_cols + i], 
                   group_sum);
             }
           }
