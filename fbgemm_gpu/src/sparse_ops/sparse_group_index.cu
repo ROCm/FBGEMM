@@ -372,7 +372,9 @@ DLL_PUBLIC void group_index_select_or_add_cuda_smallEmbD(
           scalar_t,                                                      \
           USE_INDEX_SELECT,                                              \
           USE_VAR_COLS,                                                  \
-          GROUP_INDEX_SELECT_COLS_PER_WARP>),                            \
+          GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
+          GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
+          GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
       grid_size,                                                         \
       block_size,                                                        \
       0,                                                                 \
