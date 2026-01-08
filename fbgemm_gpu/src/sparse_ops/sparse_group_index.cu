@@ -110,6 +110,18 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 
   auto storage = scalar_t(0);
   auto cached_idx = kInvalidIdx;
+  // TODO: Account for UNROLL_FACTOR
+  auto flush_cache_accumulator = [&](scalar_t* target_output,
+                                     int32_t target_num_cols) {
+    if constexpr (!USE_INDEX_SELECT && USE_CACHE) {
+      if (target_output && cached_idx != kInvalidIdx) {
+        gpuAtomicAddNoReturn(
+            &target_output[cached_idx * target_num_cols],
+            storage);
+        cached_idx = kInvalidIdx;
+      }
+    }
+  };
 
   for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
 #ifdef USE_ROCM
@@ -189,6 +201,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
           col_offset = col_offset_small;
           handled_small_dim_path = true;
         } else {
+          flush_cache_accumulator(last_member_output_tile, last_member_num_cols);
           continue;
         }
       }
@@ -240,10 +253,8 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
           const bool member_changed = (last_member_id_for_accum != -1 &&
                                       member_id != last_member_id_for_accum);
           // Probably might be merged into following if-else cascade
-          if (member_changed && last_member_output_tile && cached_idx != kInvalidIdx) {
-            gpuAtomicAddNoReturn(
-                &last_member_output_tile[cached_idx * last_member_num_cols + i],
-                storage);
+          if (member_changed) {
+            flush_cache_accumulator(last_member_output_tile, last_member_num_cols);
           }
 
           const bool is_first_warp = member_changed || (warp_id == start_warp_id);
@@ -252,8 +263,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
             storage = input[row * num_cols + i];
             cached_idx = idx;
           } else if (cached_idx != idx) {
-            gpuAtomicAddNoReturn(
-              &output[cached_idx * num_cols + i], storage);
+            flush_cache_accumulator(output, num_cols);
             storage = input[row * num_cols + i];
             cached_idx = idx;
           } else {
@@ -261,8 +271,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
           }
 
           if (is_last_warp) {
-            gpuAtomicAddNoReturn(
-              &output[idx * num_cols + i], storage);
+            flush_cache_accumulator(output, num_cols);
           }
 
           last_member_output_tile = output;
@@ -275,6 +284,8 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       }
     }
   }
+
+  flush_cache_accumulator(last_member_output_tile, last_member_num_cols);
 }
 
 DLL_PUBLIC void group_index_select_or_add_cuda(
