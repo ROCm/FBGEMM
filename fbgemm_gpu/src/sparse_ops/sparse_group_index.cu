@@ -83,7 +83,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   }
 
   [[maybe_unused]] int cached_member_id = -1;
-  [[maybe_unused]] int cached_upper_bound = -1;
+  [[maybe_unused]] int64_t cached_upper_bound = -1;
   [[maybe_unused]] int32_t last_member_id_for_accum = -1;
   [[maybe_unused]] int32_t last_member_num_cols = 0;
   [[maybe_unused]] scalar_t* last_member_output_tile = nullptr;

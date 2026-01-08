@@ -16,7 +16,7 @@ namespace {
 template <typename scalar_t, int kLogicalWarpSize = kWarpSize>
 __device__ __forceinline__ void warp_upper_bound(
     int* found,
-    int* cached_boundary,
+    scalar_t* cached_boundary,
     const scalar_t* arr,
     const scalar_t target,
     const int num_entries) {
@@ -32,18 +32,18 @@ __device__ __forceinline__ void warp_upper_bound(
 
     mask_t logical_mask = mask_t(0);
     if constexpr (kLogicalWarpSize >= kMaskBits) {
-    logical_mask = active_mask;
+        logical_mask = active_mask;
     } else {
-    const mask_t group_bits = (mask_t(1) << kLogicalWarpSize) - 1;
-    const mask_t group_mask = group_bits << (logical_warp_id * kLogicalWarpSize);
-    logical_mask = group_mask & active_mask;
+        const mask_t group_bits = (mask_t(1) << kLogicalWarpSize) - 1;
+        const mask_t group_mask = group_bits << (logical_warp_id * kLogicalWarpSize);
+        logical_mask = group_mask & active_mask;
     }
     if (!logical_mask) {
-    logical_mask = active_mask;
+        logical_mask = active_mask;
     }
 
     int result = -1;
-    int cached_result = *cached_boundary;
+    scalar_t cached_result = *cached_boundary;
     for (int base = 0; base < num_entries; base += kLogicalWarpSize) {
         const int idx = base + logical_lane;
         const bool valid = idx < num_entries;
@@ -54,7 +54,7 @@ __device__ __forceinline__ void warp_upper_bound(
             const int first_lane_hw = __ffsll(static_cast<long long>(logical_ballot)) - 1;
             const int first_lane = first_lane_hw - logical_warp_id * kLogicalWarpSize;
             result = base + first_lane;
-            cached_result = __shfl_sync(active_mask, val, first_lane_hw);
+            cached_result = arr[result];
             break;
         }
     }
