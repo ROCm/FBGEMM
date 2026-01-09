@@ -48,7 +48,7 @@ __device__ __forceinline__ void warp_upper_bound(
         const int idx = base + logical_lane;
         const bool valid = idx < num_entries;
         const scalar_t val = valid ? arr[idx] : scalar_t(0);
-        const mask_t ballot = __ballot_sync(active_mask, valid && val > target);
+        const mask_t ballot = __ballot_sync(logical_mask, valid && val > target);
         const mask_t logical_ballot = ballot & logical_mask;
         if (logical_ballot) {
             const int first_lane_hw = __ffsll(static_cast<long long>(logical_ballot)) - 1;
