@@ -162,19 +162,22 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // All columns are the same
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+    }
+
 #ifdef USE_ROCM
-      if constexpr (USE_PACKED_ROWS) {
-        if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-          rows_per_warp_small = COLS_PER_WARP / num_cols;
+    if constexpr (USE_PACKED_ROWS) {
+      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
+        rows_per_warp_small = COLS_PER_WARP / num_cols;
+        if constexpr (!USE_VAR_COLS) {
           const auto warps_per_member =
               (num_work_rows + rows_per_warp_small - 1) / rows_per_warp_small;
           member_id = warp_id / warps_per_member;
           member_warp_id = warp_id % warps_per_member;
-          use_small_dim_path = true;
         }
+        use_small_dim_path = true;
       }
-#endif // USE_ROCM
     }
+#endif // USE_ROCM
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
     const index_t* reverse_indices = USE_SORTED_INDICES
