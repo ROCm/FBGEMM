@@ -103,12 +103,14 @@ std::tuple<at::Tensor, at::Tensor> sort_indices_with_rocprim(const at::Tensor& i
         auto values_out = reverse_indices.data_ptr<int64_t>();
 
         size_t temp_storage_bytes = 0;
+        // Selected empirically
+        constexpr int k_merge_sort_threshold = 400`000;
 
         using sort_config = rocprim::radix_sort_config<
             rocprim::default_config,
             rocprim::default_config,
             rocprim::default_config,
-            400000>;
+            k_merge_sort_threshold>;
         AT_CUDA_CHECK(rocprim::radix_sort_pairs<sort_config>(
             nullptr,
             temp_storage_bytes,
