@@ -359,7 +359,6 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     input_contigs.push_back(input.expect_contiguous());
     index_contigs.push_back(indices.expect_contiguous());
 
-<<<<<<< HEAD
     if (num_cols_ < cols_per_warp) {
         // Optimization for Small Embedding: Pack multiple rows per warp
         small.input_ptrs[small.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
@@ -379,20 +378,6 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         large.total_warps += warps_needed;
         large.count++;
     }
-=======
-    // Store args
-    input_ptrs[i] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
-    output_ptrs[i] = reinterpret_cast<int64_t>(output.data_ptr());
-    indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
-    warp_offsets_group[i] = warp_offset;
-    num_cols_group[i] = num_cols_;
-
-#ifdef USE_ROCM
-    warp_offset += warps_needed;
-#else
-    warp_offset += warps_per_row * num_output_rows;
-#endif // USE_ROCM
->>>>>>> aryaman/group-index-subwarp
   }
 
   // Store the last offset
