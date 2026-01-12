@@ -285,6 +285,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   Tensor input_reshaped = first_input.reshape({num_input_rows, -1});
   const int num_cols = input_reshaped.size(1);
   const int cols_per_warp = get_group_index_select_cols_per_warp();
+  const int unroll_factor = get_group_index_select_unroll_factor();
   int64_t warp_offset = 0;
   bool use_var_cols = false;
 
@@ -324,8 +325,9 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     // Number of columns can be different
     auto num_cols_ = input_reshaped_.size(1);
 
+#ifdef USE_ROCM
     int64_t warps_needed;
-    if (num_cols_ < cols_per_warp) {
+    if (num_cols_ < cols_per_warp && num_cols_ >= unroll_factor) {
       // Optimization: Pack multiple rows into one warp
       int rows_per_warp = cols_per_warp / num_cols_;
       warps_needed = (num_output_rows_ + rows_per_warp - 1) / rows_per_warp;
@@ -334,6 +336,10 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       int warps_per_row = (num_cols_ + cols_per_warp - 1) / cols_per_warp;
       warps_needed = warps_per_row * num_output_rows_;
     }
+#else
+    // Standard: One or more warps per row
+    auto warps_per_row = (num_cols_ + cols_per_warp - 1) / cols_per_warp;
+#endif // USE_ROCM
 
     // TODO: maintain [use_var_cols] separately for small emb dims
     if (num_cols != num_cols_) {
@@ -353,6 +359,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     input_contigs.push_back(input.expect_contiguous());
     index_contigs.push_back(indices.expect_contiguous());
 
+<<<<<<< HEAD
     if (num_cols_ < cols_per_warp) {
         // Optimization for Small Embedding: Pack multiple rows per warp
         small.input_ptrs[small.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
@@ -372,6 +379,20 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         large.total_warps += warps_needed;
         large.count++;
     }
+=======
+    // Store args
+    input_ptrs[i] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
+    output_ptrs[i] = reinterpret_cast<int64_t>(output.data_ptr());
+    indices_ptrs[i] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
+    warp_offsets_group[i] = warp_offset;
+    num_cols_group[i] = num_cols_;
+
+#ifdef USE_ROCM
+    warp_offset += warps_needed;
+#else
+    warp_offset += warps_per_row * num_output_rows;
+#endif // USE_ROCM
+>>>>>>> aryaman/group-index-subwarp
   }
 
   // Store the last offset
