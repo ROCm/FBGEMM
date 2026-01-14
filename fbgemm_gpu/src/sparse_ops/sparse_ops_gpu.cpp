@@ -287,7 +287,14 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   const int cols_per_warp = get_group_index_select_cols_per_warp();
   const int unroll_factor = get_group_index_select_unroll_factor();
   int64_t warp_offset = 0;
-  bool use_var_cols = false;
+  bool use_var_cols_small = false;
+  bool use_var_cols_large = false;
+  
+  bool first_small_table = true;
+  bool first_large_table = true;
+
+  int prev_num_cols_small;
+  int prev_num_cols_large;
 
   // Allocate memory for output_group
   std::vector<Tensor> output_group;
@@ -341,11 +348,6 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     auto warps_per_row = (num_cols_ + cols_per_warp - 1) / cols_per_warp;
 #endif // USE_ROCM
 
-    // TODO: maintain [use_var_cols] separately for small emb dims
-    if (num_cols != num_cols_) {
-      use_var_cols = true;
-    }
-
     // Create output pointers
     auto input_shape = input.sizes().vec();
     input_shape[0] = num_output_rows_;
@@ -361,6 +363,12 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
 
     if (num_cols_ < cols_per_warp) {
         // Optimization for Small Embedding: Pack multiple rows per warp
+
+        if(!first_small_table && num_cols_ != prev_num_cols_small) {
+          use_var_cols_small = true;
+        }
+        first_small_table = false;
+        prev_num_cols_small = num_cols_;
         small.input_ptrs[small.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
         small.output_ptrs[small.count] = reinterpret_cast<int64_t>(output.data_ptr());
         small.indices_ptrs[small.count] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
@@ -370,6 +378,13 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         small.count++;
     } else {
         // Standard Embedding: One or more warps per row
+
+        if(!first_large_table && num_cols_ != prev_num_cols_large) {
+          use_var_cols_large = true;
+        }
+        first_large_table = false;
+        prev_num_cols_large = num_cols_;
+
         large.input_ptrs[large.count] = reinterpret_cast<int64_t>(input_contigs[i]->data_ptr());
         large.output_ptrs[large.count] = reinterpret_cast<int64_t>(output.data_ptr());
         large.indices_ptrs[large.count] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
@@ -423,7 +438,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
 
   int64_t saved_data_small[] = {
       static_cast<int64_t>(small.count),
-      use_var_cols,
+      use_var_cols_small,
       reinterpret_cast<int64_t>(small.warp_offsets_group),
       reinterpret_cast<int64_t>(small.num_cols_group),
       small.total_warps,
@@ -436,7 +451,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
 
   int64_t saved_data_large[] = {
       static_cast<int64_t>(large.count),
-      use_var_cols,
+      use_var_cols_large,
       reinterpret_cast<int64_t>(large.warp_offsets_group),
       reinterpret_cast<int64_t>(large.num_cols_group),
       large.total_warps,
@@ -461,7 +476,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         /*total_num_warps=*/small.total_warps,
         small.count,
         /*use_index_select=*/true,
-        use_var_cols);
+        use_var_cols_small);
   }
 
   if(large.count > 0) {
@@ -478,7 +493,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         /*total_num_warps=*/large.total_warps,
         large.count,
         /*use_index_select=*/true,
-        use_var_cols);
+        use_var_cols_large);
   }
 
   output_group.push_back(args_tensor_small);
@@ -523,7 +538,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   TORCH_CHECK(saved_data_small.is_contiguous());
   int64_t* saved_data_small_ptr = saved_data_small.data_ptr<int64_t>();
   auto count_small = saved_data_small_ptr[0];
-  const bool use_var_cols = saved_data_small_ptr[1];
+  const bool use_var_cols_small = saved_data_small_ptr[1];
   int64_t* warp_offsets_group_small = reinterpret_cast<int64_t*>(saved_data_small_ptr[2]);
   int32_t* num_cols_group_small = reinterpret_cast<int32_t*>(saved_data_small_ptr[3]);
   int64_t total_num_warps_small = saved_data_small_ptr[4];
@@ -690,7 +705,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       total_num_warps_small,
       group_size,
       /*use_index_select=*/false,
-      use_var_cols);
+      use_var_cols_small);
   }
 
   if(count_large > 0) {
