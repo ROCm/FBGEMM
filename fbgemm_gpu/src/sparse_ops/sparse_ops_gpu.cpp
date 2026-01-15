@@ -703,7 +703,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       fwd_input.device().index(),
       num_input_rows,
       total_num_warps_small,
-      group_size,
+      count_small,
       /*use_index_select=*/false,
       use_var_cols_small);
   }
@@ -720,7 +720,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       fwd_input.device().index(),
       num_input_rows,
       total_num_warps_large,
-      group_size,
+      count_large,
       /*use_index_select=*/false,
       use_var_cols_large);
   }
