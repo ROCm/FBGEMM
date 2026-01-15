@@ -84,82 +84,44 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel_small(
       member_warp_id = warp_id - warp_offsets_group[member_id];
     } else {
       // All columns are the same
-      member_id = warp_id / (warps_per_row * num_work_rows);
-      member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
-#ifdef USE_ROCM
-      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-        // Need to ensure that [member_id] and [member_warp_id] are calculated correctly
-        // for the small embedding dimension path below
-        int rows_per_warp = COLS_PER_WARP / num_cols;
-        auto warps_per_member = (num_work_rows + rows_per_warp - 1) / rows_per_warp;
-        member_id = warp_id / warps_per_member;
-        member_warp_id = warp_id % warps_per_member;
-      }
-#endif // USE_ROCM
+      int rows_per_warp = COLS_PER_WARP / num_cols;
+      auto warps_per_member = (num_work_rows + rows_per_warp - 1) / rows_per_warp;
+      member_id = warp_id / warps_per_member;
+      member_warp_id = warp_id % warps_per_member;
+
     }
 
-#ifdef USE_ROCM
-    if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-      // Optimized path for small embedding dimensions
-      // Each warp processes 'rows_per_warp' rows
-      int rows_per_warp = COLS_PER_WARP / num_cols;
-      int64_t start_row = member_warp_id * rows_per_warp;
-      
-      // Since we are processing multiple rows within the warp, we need to
-      // map each lane to a specific row, in addition to the column
-      int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
-      int col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-      int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
+    // Each warp processes 'rows_per_warp' rows
+    int rows_per_warp = COLS_PER_WARP / num_cols;
+    int64_t start_row = member_warp_id * rows_per_warp;
+    
+    // Since we are processing multiple rows within the warp, we need to
+    // map each lane to a specific row, in addition to the column
+    int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
+    int col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
+    int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
 
-      // local_row may be out of bounds for the last few lanes in the warp if [COLS_PER_WARP % num_cols != 0]
-      // and we also need to confirm that we are within num_work_rows
-      if (local_row < rows_per_warp && current_row < num_work_rows) {
-        scalar_t* input = 
-            reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-        scalar_t* output = 
-            reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
-
-        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-        const index_t idx = indices[current_row];
-#pragma unroll
-        for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
-          // Compile time conditional
-          if constexpr (USE_INDEX_SELECT) {
-            output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
-          } else {
-            gpuAtomicAddNoReturn(
-                &output[idx * num_cols + i], input[current_row * num_cols + i]);
-          }
-        }
-      }
-    } else {
-      // Large embedding dimensions use >= 1 warp per row
-      // which is the default codepath for non-ROCm as well
-#endif // USE_ROCM
-      const auto row = member_warp_id / warps_per_row;
-      const auto col_offset =
-          ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
-          (threadIdx.x * UNROLL_FACTOR);
-      scalar_t* input =
+    // local_row may be out of bounds for the last few lanes in the warp if [COLS_PER_WARP % num_cols != 0]
+    // and we also need to confirm that we are within num_work_rows
+    if (local_row < rows_per_warp && current_row < num_work_rows) {
+      scalar_t* input = 
           reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-      scalar_t* output =
+      scalar_t* output = 
           reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
       index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-      const index_t idx = indices[row];
+      const index_t idx = indices[current_row];
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
         // Compile time conditional
         if constexpr (USE_INDEX_SELECT) {
-          output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+          output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
         } else {
           gpuAtomicAddNoReturn(
-              &output[idx * num_cols + i], input[row * num_cols + i]);
+              &output[idx * num_cols + i], input[current_row * num_cols + i]);
         }
       }
-#ifdef USE_ROCM
     }
-#endif // USE_ROCM
   }
 }
 
@@ -212,80 +174,29 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // All columns are the same
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
-#ifdef USE_ROCM
-      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-        // Need to ensure that [member_id] and [member_warp_id] are calculated correctly
-        // for the small embedding dimension path below
-        int rows_per_warp = COLS_PER_WARP / num_cols;
-        auto warps_per_member = (num_work_rows + rows_per_warp - 1) / rows_per_warp;
-        member_id = warp_id / warps_per_member;
-        member_warp_id = warp_id % warps_per_member;
-      }
-#endif // USE_ROCM
     }
 
-#ifdef USE_ROCM
-    if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-      // Optimized path for small embedding dimensions
-      // Each warp processes 'rows_per_warp' rows
-      int rows_per_warp = COLS_PER_WARP / num_cols;
-      int64_t start_row = member_warp_id * rows_per_warp;
-      
-      // Since we are processing multiple rows within the warp, we need to
-      // map each lane to a specific row, in addition to the column
-      int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
-      int col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-      int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
+    const auto row = member_warp_id / warps_per_row;
+    const auto col_offset =
+        ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
+        (threadIdx.x * UNROLL_FACTOR);
+    scalar_t* input =
+        reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
+    scalar_t* output =
+        reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
-      // local_row may be out of bounds for the last few lanes in the warp if [COLS_PER_WARP % num_cols != 0]
-      // and we also need to confirm that we are within num_work_rows
-      if (local_row < rows_per_warp && current_row < num_work_rows) {
-        scalar_t* input = 
-            reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-        scalar_t* output = 
-            reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
-
-        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-        const index_t idx = indices[current_row];
+    index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+    const index_t idx = indices[row];
 #pragma unroll
-        for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
-          // Compile time conditional
-          if constexpr (USE_INDEX_SELECT) {
-            output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
-          } else {
-            gpuAtomicAddNoReturn(
-                &output[idx * num_cols + i], input[current_row * num_cols + i]);
-          }
-        }
+    for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
+      // Compile time conditional
+      if constexpr (USE_INDEX_SELECT) {
+        output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
+      } else {
+        gpuAtomicAddNoReturn(
+            &output[idx * num_cols + i], input[row * num_cols + i]);
       }
-    } else {
-      // Large embedding dimensions use >= 1 warp per row
-      // which is the default codepath for non-ROCm as well
-#endif // USE_ROCM
-      const auto row = member_warp_id / warps_per_row;
-      const auto col_offset =
-          ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
-          (threadIdx.x * UNROLL_FACTOR);
-      scalar_t* input =
-          reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-      scalar_t* output =
-          reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
-
-      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-      const index_t idx = indices[row];
-#pragma unroll
-      for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
-        // Compile time conditional
-        if constexpr (USE_INDEX_SELECT) {
-          output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
-        } else {
-          gpuAtomicAddNoReturn(
-              &output[idx * num_cols + i], input[row * num_cols + i]);
-        }
-      }
-#ifdef USE_ROCM
     }
-#endif // USE_ROCM
   }
 }
 
