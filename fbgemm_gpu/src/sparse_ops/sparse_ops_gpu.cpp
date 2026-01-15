@@ -621,8 +621,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     grad_input_numels.push_back(grad_input_numel);
     group_grad_input_numel += grad_input_numel;
 
-    auto grad_reshaped = grad.reshape({grad.size(0), -1});
-    auto num_cols_ = grad_reshaped.size(1);
+    const auto grad_reshaped = grad.reshape({grad.size(0), -1});
+    const auto num_cols_ = grad_reshaped.size(1);
 
     // Put all grad output/input pointers in an array
     if(num_cols_ < cols_per_warp) {
@@ -658,8 +658,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     output_group[i] = output_group[i].reshape(grad_input_shape);
     TORCH_CHECK(output_group[i].is_contiguous());
 
-    auto output_group_reshaped = grad_output_group[i].reshape({grad_output_group[i].size(0), -1});
-    auto num_cols_ = output_group_reshaped.size(1);
+    const auto output_group_reshaped = grad_output_group[i].reshape({grad_output_group[i].size(0), -1});
+    const auto num_cols_ = output_group_reshaped.size(1);
     if(num_cols_ < cols_per_warp) {
       grad_input_ptrs_small[idx_small] = reinterpret_cast<int64_t>(output_group[i].data_ptr());
       idx_small++;
@@ -683,8 +683,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     const auto& indices = indices_group[i];
     index_contigs.push_back(indices.expect_contiguous());
     
-    auto grad_output_reshaped = grad_output_group[i].reshape({grad_output_group[i].size(0), -1});
-    auto num_cols_ = grad_output_reshaped.size(1);
+    const auto grad_output_reshaped = grad_output_group[i].reshape({grad_output_group[i].size(0), -1});
+    const auto num_cols_ = grad_output_reshaped.size(1);
     if(num_cols_ < cols_per_warp) {
       indices_ptrs_small[idx_small] = reinterpret_cast<int64_t>(index_contigs[i]->data_ptr());
       idx_small++;
