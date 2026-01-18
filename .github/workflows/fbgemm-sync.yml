@@ -1,0 +1,108 @@
+name: One-way Sync of PyTorch FBGEMM to ROCm upstream/main
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-from-pytorch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ROCM_FBGEMM_APP_ID }}
+          private-key: ${{ secrets.ROCM_FBGEMM_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: FBGEMM
+
+      - name: Checkout pytorch/FBGEMM main branch
+        uses: actions/checkout@v4
+        with:
+          repository: pytorch/FBGEMM
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "FBGEMM-Sync-Bot[bot]"
+          git config --global user.email "FBGEMM-Sync-Bot[bot]@users.noreply.github.com"
+
+      - name: Add ROCm/FBGEMM remote
+        run: |
+          git remote add rocm-repo https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/ROCm/FBGEMM.git
+          git fetch rocm-repo upstream/main
+
+      - name: Check sync status
+        id: check_status
+        run: |
+          PYTORCH_MAIN_COMMIT=$(git rev-parse HEAD)
+          ROCM_UPSTREAM_COMMIT=$(git rev-parse rocm-repo/upstream/main)
+
+          echo "PyTorch FBGEMM main HEAD: $PYTORCH_MAIN_COMMIT"
+          echo "ROCm upstream/main HEAD: $ROCM_UPSTREAM_COMMIT"
+
+          # Check if pytorch/FBGEMM main has commits not in ROCm upstream/main
+          COMMITS_AHEAD=$(git rev-list --count rocm-repo/upstream/main..HEAD)
+          echo "Commits ahead: $COMMITS_AHEAD"
+
+          if [ "$COMMITS_AHEAD" -eq 0 ]; then
+            echo "status=in_sync" >> $GITHUB_OUTPUT
+            echo "Branches are already in sync"
+          else
+            echo "status=needs_sync" >> $GITHUB_OUTPUT
+            echo "$COMMITS_AHEAD commit(s) to sync"
+          fi
+
+      - name: Check for merge conflicts
+        id: conflict_check
+        if: steps.check_status.outputs.status == 'needs_sync'
+        run: |
+          # Create a temporary branch from ROCm upstream/main
+          git checkout -b temp-upstream-sync rocm-repo/upstream/main
+
+          # Attempt merge with --no-commit to check for conflicts
+          if git merge --no-commit --no-ff main 2>/dev/null; then
+            echo "conflict=false" >> $GITHUB_OUTPUT
+            echo "No conflicts detected"
+            git merge --abort || true
+          else
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            echo "CONFLICT DETECTED - Sync halted!"
+            git merge --abort || true
+            exit 1
+          fi
+
+      - name: Prepare and push sync
+        if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
+        run: |
+          PYTORCH_COMMIT=$(git rev-parse main)
+
+          # Switch to upstream/main from ROCm repo
+          git checkout -b upstream-main-sync rocm-repo/upstream/main
+
+          # Merge pytorch/FBGEMM main
+          git merge main -m "Sync: Merge from pytorch/FBGEMM:main
+
+          Auto-sync via GitHub Actions
+          Source commit: $PYTORCH_COMMIT"
+
+          # Push to ROCm/FBGEMM upstream/main
+          git push rocm-repo upstream-main-sync:upstream/main
+          echo "Successfully synced pytorch/FBGEMM:main to ROCm/FBGEMM:upstream/main"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check_status.outputs.status }}" == "in_sync" ]; then
+            echo "No sync needed - branches already in sync"
+          elif [ "${{ steps.conflict_check.outputs.conflict }}" == "true" ]; then
+            echo "Sync failed due to conflicts - manual resolution required"
+          else
+            echo "Sync completed successfully"
+          fi
