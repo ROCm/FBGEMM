@@ -118,7 +118,7 @@ Tensor jagged_index_select_2d_forward_cuda(
                 FBGEMM_LAUNCH_KERNEL(
                     (jagged_index_select_2d_kernel<index_t, int64_t, scalar_t>),
                     dim3(num_blocks),
-                    dim3(num_cols),
+                    dim3(num_threads),
                     0,
                     at::cuda::getCurrentCUDAStream(),
                     PTA_B(output, scalar_t, 2, 64),
