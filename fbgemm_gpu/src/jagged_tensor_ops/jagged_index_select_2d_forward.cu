@@ -91,6 +91,13 @@ Tensor jagged_index_select_2d_forward_cuda(
       values, indices, input_offsets, output_offsets);
   CUDA_DEVICE_GUARD(values);
 
+  TORCH_CHECK(output_offsets.numel() == indices.numel(),
+      "Shape mismatch: output_offsets length must be "
+      "indices length. output_offsets length: ",
+      output_offsets.numel(),
+      ", indices length: ",
+      indices.numel());
+
   auto num_cols = values.size(1);
 
   const int64_t max_num_blocks = 1024; // Arbitrarily set to this number of now
