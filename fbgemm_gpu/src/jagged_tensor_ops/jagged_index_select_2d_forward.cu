@@ -34,7 +34,7 @@ __global__ __launch_bounds__(kMaxThreads) void jagged_index_select_2d_kernel(
       const auto num_output_rows = indices.size(0);
       binary_search_range(
           &local_index_pos,
-          &output_offsets[0],
+          &output_offsets[1],
           dense_output_offset,
           num_output_rows);
     }
@@ -56,11 +56,9 @@ __global__ __launch_bounds__(kMaxThreads) void jagged_index_select_2d_kernel(
 
     // TODO: Can also be obtained during the binary search
     // Relative index position
-    const offset_t rel_index = dense_output_offset -
-        (index_pos == 0 ? 0 : output_offsets[index_pos - 1]);
+    const offset_t rel_index = dense_output_offset - output_offsets[index_pos];
     const index_t index = indices[index_pos];
-    const offset_t input_offset =
-        (index == 0 ? 0 : input_offsets[index - 1]) + rel_index;
+    const offset_t input_offset = input_offsets[index] + rel_index;
 
     const auto num_cols = input.size(1);
     for (auto i = threadIdx.x; i < num_cols; i += blockDim.x) {
@@ -91,9 +89,9 @@ Tensor jagged_index_select_2d_forward_cuda(
       values, indices, input_offsets, output_offsets);
   CUDA_DEVICE_GUARD(values);
 
-  TORCH_CHECK(output_offsets.numel() == indices.numel(),
+  TORCH_CHECK(output_offsets.numel() == indices.numel() + 1,
       "Shape mismatch: output_offsets length must be "
-      "indices length. output_offsets length: ",
+      "indices length + 1. output_offsets length: ",
       output_offsets.numel(),
       ", indices length: ",
       indices.numel());
