@@ -42,94 +42,7 @@ template <
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
-    int UNROLL_FACTOR,
-    int COLS_PER_WARP,
-    int LOG_COLS_PER_WARP>
-__global__
-__launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel_small(
-    const int64_t* input_ptrs,
-    const int64_t* output_ptrs,
-    const int64_t* indices_ptrs,
-    const int64_t* warp_offsets_group,
-    const int32_t* num_cols_group,
-    const int64_t num_work_rows, // number of rows to work on per member
-    const int64_t group_size) {
-  const auto total_num_warps = warp_offsets_group[group_size];
-  int32_t num_cols = 0;
-  int32_t warps_per_row = 0;
-
-  if constexpr (!USE_VAR_COLS) {
-    num_cols = num_cols_group[0];
-    warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
-  }
-
-  for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
-       warp_id < total_num_warps;
-       warp_id += gridDim.x * blockDim.y) {
-    int32_t member_id = 0;
-    int32_t member_warp_id = 0;
-    if constexpr (USE_VAR_COLS) {
-      __shared__ int member_ids[kMaxThreads / EMULATED_WARP_SIZE];
-      if (threadIdx.x == 0) {
-        binary_search_range(
-            &member_ids[threadIdx.y],
-            warp_offsets_group + 1,
-            warp_id,
-            group_size);
-      }
-      syncwarp();
-      member_id = member_ids[threadIdx.y];
-      num_cols = num_cols_group[member_id];
-      warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
-      member_warp_id = warp_id - warp_offsets_group[member_id];
-    } else {
-      // All columns are the same
-      int rows_per_warp = COLS_PER_WARP / num_cols;
-      auto warps_per_member = (num_work_rows + rows_per_warp - 1) / rows_per_warp;
-      member_id = warp_id / warps_per_member;
-      member_warp_id = warp_id % warps_per_member;
-
-    }
-
-    // Each warp processes 'rows_per_warp' rows
-    int rows_per_warp = COLS_PER_WARP / num_cols;
-    int64_t start_row = member_warp_id * rows_per_warp;
-    
-    // Since we are processing multiple rows within the warp, we need to
-    // map each lane to a specific row, in addition to the column
-    int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
-    int col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-    int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
-
-    // local_row may be out of bounds for the last few lanes in the warp if [COLS_PER_WARP % num_cols != 0]
-    // and we also need to confirm that we are within num_work_rows
-    if (local_row < rows_per_warp && current_row < num_work_rows) {
-      scalar_t* input = 
-          reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-      scalar_t* output = 
-          reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
-
-      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-      const index_t idx = indices[current_row];
-#pragma unroll
-      for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
-        // Compile time conditional
-        if constexpr (USE_INDEX_SELECT) {
-          output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
-        } else {
-          gpuAtomicAddNoReturn(
-              &output[idx * num_cols + i], input[current_row * num_cols + i]);
-        }
-      }
-    }
-  }
-}
-
-template <
-    typename index_t,
-    typename scalar_t,
-    bool USE_INDEX_SELECT,
-    bool USE_VAR_COLS,
+    bool USE_SMALL_EMB_DIM,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -156,6 +69,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
        warp_id += gridDim.x * blockDim.y) {
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
+    int32_t num_cols_local = 0;
+    int32_t warps_per_row_local = 0;
+    [[maybe_unused]] int32_t rows_per_warp_local = 0;
+
     if constexpr (USE_VAR_COLS) {
       __shared__ int member_ids[kMaxThreads / EMULATED_WARP_SIZE];
       if (threadIdx.x == 0) {
@@ -167,34 +84,79 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       }
       syncwarp();
       member_id = member_ids[threadIdx.y];
-      num_cols = num_cols_group[member_id];
-      warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
+      num_cols_local = num_cols_group[member_id];
+      warps_per_row_local =
+          (num_cols_local + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
       member_warp_id = warp_id - warp_offsets_group[member_id];
+      if constexpr (USE_SMALL_EMB_DIM) {
+        rows_per_warp_local = COLS_PER_WARP / num_cols_local;
+      }
     } else {
-      // All columns are the same
-      member_id = warp_id / (warps_per_row * num_work_rows);
-      member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+      num_cols_local = num_cols;
+      warps_per_row_local = warps_per_row;
+      if constexpr (USE_SMALL_EMB_DIM) {
+        rows_per_warp_local = COLS_PER_WARP / num_cols_local;
+        auto warps_per_member =
+            (num_work_rows + rows_per_warp_local - 1) / rows_per_warp_local;
+        member_id = warp_id / warps_per_member;
+        member_warp_id = warp_id % warps_per_member;
+      } else {
+        member_id = warp_id / (warps_per_row_local * num_work_rows);
+        member_warp_id =
+            warp_id - (member_id * warps_per_row_local * num_work_rows);
+      }
     }
 
-    const auto row = member_warp_id / warps_per_row;
-    const auto col_offset =
-        ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
-        (threadIdx.x * UNROLL_FACTOR);
-    scalar_t* input =
-        reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
-    scalar_t* output =
-        reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
+    if constexpr (USE_SMALL_EMB_DIM) {
+      int64_t start_row =
+          static_cast<int64_t>(member_warp_id) * rows_per_warp_local;
+      int lane_col = threadIdx.x * UNROLL_FACTOR;
+      int local_row = lane_col / num_cols_local;
+      int col_offset = lane_col % num_cols_local;
+      int64_t current_row = start_row + local_row;
 
-    index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-    const index_t idx = indices[row];
+      if (local_row < rows_per_warp_local && current_row < num_work_rows) {
+        scalar_t* input =
+            reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
+        scalar_t* output =
+            reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
+
+        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+        const index_t idx = indices[current_row];
 #pragma unroll
-    for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
-      // Compile time conditional
-      if constexpr (USE_INDEX_SELECT) {
-        output[row * num_cols + i] = LDG(&input[idx * num_cols + i]);
-      } else {
-        gpuAtomicAddNoReturn(
-            &output[idx * num_cols + i], input[row * num_cols + i]);
+        for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols_local; i++) {
+          if constexpr (USE_INDEX_SELECT) {
+            output[current_row * num_cols_local + i] =
+                LDG(&input[idx * num_cols_local + i]);
+          } else {
+            gpuAtomicAddNoReturn(
+                &output[idx * num_cols_local + i],
+                input[current_row * num_cols_local + i]);
+          }
+        }
+      }
+    } else {
+      const auto row = member_warp_id / warps_per_row_local;
+      const auto col_offset =
+          ((member_warp_id % warps_per_row_local) << LOG_COLS_PER_WARP) +
+          (threadIdx.x * UNROLL_FACTOR);
+      scalar_t* input =
+          reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
+      scalar_t* output =
+          reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
+
+      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+      const index_t idx = indices[row];
+#pragma unroll
+      for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols_local; i++) {
+        if constexpr (USE_INDEX_SELECT) {
+          output[row * num_cols_local + i] =
+              LDG(&input[idx * num_cols_local + i]);
+        } else {
+          gpuAtomicAddNoReturn(
+              &output[idx * num_cols_local + i],
+              input[row * num_cols_local + i]);
+        }
       }
     }
   }
@@ -236,6 +198,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
           scalar_t,                                                      \
           USE_INDEX_SELECT,                                              \
           USE_VAR_COLS,                                                  \
+          false,                                                         \
           GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
           GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
           GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
@@ -306,11 +269,12 @@ DLL_PUBLIC void group_index_select_or_add_cuda_smallEmbD(
   // Launcher Macro for Small Kernel
 #define INVOKE_GROUP_INDEX_SELECT_OR_ADD_SMALL(USE_INDEX_SELECT, USE_VAR_COLS) \
   FBGEMM_LAUNCH_KERNEL(                                                  \
-      (group_index_select_or_add_2d_kernel_small<                        \
+      (group_index_select_or_add_2d_kernel<                              \
           index_t,                                                       \
           scalar_t,                                                      \
           USE_INDEX_SELECT,                                              \
           USE_VAR_COLS,                                                  \
+          true,                                                          \
           GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
           GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
           GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
