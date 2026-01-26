@@ -402,6 +402,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   }
 
 #ifdef USE_ROCM
+  // The value is selected empirically. Potential
+  // place for optimization.
   constexpr size_t kSortIndicesThreshold = 15'000'000;
   const bool use_sorted_indices_for_bwd =
       (num_total_indices < kSortIndicesThreshold);
