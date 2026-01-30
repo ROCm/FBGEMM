@@ -5,6 +5,10 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+#include <cassert>
+#include <limits>
+#include <type_traits>
+#include <variant>
 
 #include "common.cuh"
 
@@ -42,6 +46,8 @@ template <
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
+    bool USE_CONTIGUOUS_WARPS, 
+    bool USE_SORTED_INDICES,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
@@ -50,6 +56,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* reverse_indices_ptrs,
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const int64_t num_work_rows, // number of rows to work on per member
@@ -63,9 +70,27 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
   }
 
-  for (int64_t warp_id = threadIdx.y * gridDim.x + blockIdx.x;
-       warp_id < total_num_warps;
-       warp_id += gridDim.x * blockDim.y) {
+  int64_t start_warp_id = 0;
+  int64_t warp_end = 0;
+  int64_t warp_stride = 0;
+
+  if constexpr (USE_CONTIGUOUS_WARPS) {
+    const int64_t linear_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+    const int64_t warps_per_launch = gridDim.x * blockDim.y;
+    const int64_t chunk_size =
+        (total_num_warps + warps_per_launch - 1) / warps_per_launch;
+    start_warp_id = linear_warp_id * chunk_size;
+    warp_end = start_warp_id + chunk_size < total_num_warps
+        ? start_warp_id + chunk_size
+        : total_num_warps;
+    warp_stride = 1;
+  } else {
+    start_warp_id = threadIdx.y * gridDim.x + blockIdx.x;
+    warp_end = total_num_warps;
+    warp_stride = gridDim.x * blockDim.y;
+  }
+
+  for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
@@ -99,6 +124,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 #endif // USE_ROCM
     }
 
+    const int64_t* reverse_indices = USE_SORTED_INDICES
+        ? reinterpret_cast<int64_t*>(reverse_indices_ptrs[member_id])
+        : nullptr;
+
 #ifdef USE_ROCM
     if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
       // Optimized path for small embedding dimensions
@@ -111,20 +140,24 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       const auto local_row = (threadIdx.x * UNROLL_FACTOR) /
           num_cols; // the row ID within the set of rows handled by this warp
       const auto col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-      const int64_t current_row = start_row +
-          local_row; // the actual row within the table processed by this lane
+      const auto sorted_row = start_row + local_row;
 
       // local_row may be out of bounds for the last few lanes in the warp if
       // [COLS_PER_WARP % num_cols != 0] and we also need to confirm that we are
-      // within num_work_rows
-      if (local_row < rows_per_warp && current_row < num_work_rows) {
+      // within num_work_rows. For the sorted-indices path we also need to guard
+      // reverse_indices reads to avoid OOB accesses when extra warps are idle.
+      if (local_row < rows_per_warp && sorted_row < num_work_rows) {
+        const int64_t current_row = USE_SORTED_INDICES ? reverse_indices[sorted_row]
+                      // the actual row within the table processed by this lane
+                               : sorted_row;
         scalar_t* input =
             reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
         scalar_t* output =
             reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
         index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-        const index_t idx = indices[current_row];
+        const auto indices_row = USE_SORTED_INDICES ? sorted_row : current_row;
+        const index_t idx = indices[indices_row];
 #pragma unroll
         for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
           // Compile time conditional
@@ -141,7 +174,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // Large embedding dimensions use >= 1 warp per row
       // which is the default codepath for non-ROCm as well
 #endif // USE_ROCM
-      const auto row = member_warp_id / warps_per_row;
+      const auto sorted_row = member_warp_id / warps_per_row;
+      const auto row =
+            USE_SORTED_INDICES ? reverse_indices[sorted_row] : sorted_row;
       const auto col_offset =
           ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
           (threadIdx.x * UNROLL_FACTOR);
@@ -150,8 +185,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       scalar_t* output =
           reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
-      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-      const index_t idx = indices[row];
+        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+        const auto indices_row = USE_SORTED_INDICES ? sorted_row : row;
+        const index_t idx = indices[indices_row];
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
         // Compile time conditional
@@ -172,6 +208,8 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t* input_ptrs,
     const int64_t* output_ptrs,
     const int64_t* indices_ptrs,
+    const int64_t* sorted_indices_ptrs,
+    const int64_t* reverse_indices_ptrs, 
     const int64_t* warp_offsets_group,
     const int32_t* num_cols_group,
     const c10::ScalarType& input_scalar_type,
@@ -181,12 +219,14 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t total_num_warps,
     const int group_size,
     const bool use_index_select,
-    const bool use_var_cols) {
+    const bool use_var_cols,
+    const bool use_contiguous_warps) {
   if (group_size == 0) {
     return;
   }
 
   at::cuda::OptionalCUDAGuard device_guard(device);
+  const bool use_sorted_indices = (sorted_indices_ptrs && reverse_indices_ptrs);
 
   // Partition work based on num_work_rows
   uint32_t num_warps_per_threadblock = kMaxThreads / EMULATED_WARP_SIZE;
@@ -197,49 +237,75 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
 
-#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS) \
-  FBGEMM_LAUNCH_KERNEL(                                                  \
-      (group_index_select_or_add_2d_kernel<                              \
-          index_t,                                                       \
-          scalar_t,                                                      \
-          USE_INDEX_SELECT,                                              \
-          USE_VAR_COLS,                                                  \
-          GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
-          GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
-          GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
-      grid_size,                                                         \
-      block_size,                                                        \
-      0,                                                                 \
-      at::cuda::getCurrentCUDAStream(),                                  \
-      input_ptrs,                                                        \
-      output_ptrs,                                                       \
-      indices_ptrs,                                                      \
-      warp_offsets_group,                                                \
-      num_cols_group,                                                    \
-      num_work_rows,                                                     \
-      group_size)
+auto invoke_group_index_select_or_add = [&]<typename index_t,
+                                            typename scalar_t,
+                                            bool USE_INDEX_SELECT,
+                                            bool USE_VAR_COLS,
+                                            bool USE_CONTIGUOUS_WARPS,
+                                            bool USE_SORTED_INDICES>() {
+    FBGEMM_LAUNCH_KERNEL(
+        (group_index_select_or_add_2d_kernel<
+            index_t,
+            scalar_t,
+            USE_INDEX_SELECT,
+            USE_VAR_COLS,
+            USE_CONTIGUOUS_WARPS,
+            USE_SORTED_INDICES,
+            GROUP_INDEX_SELECT_UNROLL_FACTOR,
+            GROUP_INDEX_SELECT_COLS_PER_WARP,
+            GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),
+        grid_size,
+        block_size,
+        0,
+        at::cuda::getCurrentCUDAStream(),
+        input_ptrs,
+        output_ptrs,
+        use_sorted_indices ? sorted_indices_ptrs : indices_ptrs,
+        reverse_indices_ptrs,
+        warp_offsets_group,
+        num_cols_group,
+        num_work_rows,
+        group_size);
+  };
+  
+  using bool_variant_t = std::variant<std::true_type, std::false_type>;
+
+  auto get_bool_type = [](const bool var) -> bool_variant_t {
+      if (var) {
+          return std::true_type{};
+      } else {
+          return std::false_type{};
+      }
+  };
+
+  const bool_variant_t use_index_select_variant = get_bool_type(use_index_select);
+  const bool_variant_t use_var_cols_variant = get_bool_type(use_var_cols);
+  const bool_variant_t use_contiguous_warps_variant = get_bool_type(use_contiguous_warps);
+  const bool_variant_t use_sorted_indices_variant = get_bool_type(use_sorted_indices);
 
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
         FBGEMM_DISPATCH_FLOATING_TYPES(
             input_scalar_type, "group_index_select_2d_wrapper_2", [&] {
-              if (use_index_select) {
-                if (use_var_cols) {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true);
-                } else {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false);
-                }
-              } else {
-                if (use_var_cols) {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true);
-                } else {
-                  INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false);
-                }
-              }
+              std::visit(
+                  [&](auto use_index_select_arg, 
+                      auto use_var_cols_arg,
+                      auto use_contiguous_warps_arg,
+                      auto use_sorted_indices_arg) {
+                    invoke_group_index_select_or_add.template operator()<
+                        index_t, 
+                        scalar_t, 
+                        use_index_select_arg.value,
+                        use_var_cols_arg.value, 
+                        use_contiguous_warps_arg.value,
+                        use_sorted_indices_arg.value>();
+                  },
+                  use_index_select_variant, 
+                  use_var_cols_variant,
+                  use_contiguous_warps_variant, 
+                  use_sorted_indices_variant);
             });
       });
-
-#undef INVOKE_GROUP_INDEX_SELECT_OR_ADD
 }
 
 } // namespace fbgemm_gpu
