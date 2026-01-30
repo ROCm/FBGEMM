@@ -463,7 +463,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
   memcpy(saved_data_t_large.data_ptr<int64_t>(), saved_data_large, sizeof(saved_data_large));
 
   if(small.count > 0) {
-    group_index_select_or_add_cuda_smallEmbD(
+    group_index_select_or_add_cuda(
         small.input_ptrs,
         small.output_ptrs,
         small.indices_ptrs,
@@ -476,7 +476,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         /*total_num_warps=*/small.total_warps,
         small.count,
         /*use_index_select=*/true,
-        use_var_cols_small);
+        use_var_cols_small,
+        /*use_small_emb_dim=*/true);
   }
 
   if(large.count > 0) {
@@ -493,7 +494,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         /*total_num_warps=*/large.total_warps,
         large.count,
         /*use_index_select=*/true,
-        use_var_cols_large);
+        use_var_cols_large,
+        /*use_small_emb_dim=*/false);
   }
 
   output_group.push_back(args_tensor_small);
@@ -699,7 +701,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   args_tensor_large = args_tensor_large.to(first_indices.device(), /*non_blocking=*/true);
 
   if(count_small > 0) {
-    group_index_select_or_add_cuda_smallEmbD(
+    group_index_select_or_add_cuda(
       args_tensor_small.data_ptr<int64_t>(),
       args_tensor_small.data_ptr<int64_t>() + count_small,
       args_tensor_small.data_ptr<int64_t>() + 2 * count_small,
@@ -712,7 +714,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       total_num_warps_small,
       count_small,
       /*use_index_select=*/false,
-      use_var_cols_small);
+      use_var_cols_small,
+      /*use_small_emb_dim=*/true);
   }
 
   if(count_large > 0) {
@@ -729,7 +732,8 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
       total_num_warps_large,
       count_large,
       /*use_index_select=*/false,
-      use_var_cols_large);
+      use_var_cols_large,
+      /*use_small_emb_dim=*/false);
   }
 
   return outputs;
