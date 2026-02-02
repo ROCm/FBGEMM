@@ -37,6 +37,17 @@ int get_group_index_select_unroll_factor() {
   return GROUP_INDEX_SELECT_UNROLL_FACTOR;
 }
 
+#ifdef USE_ROCM
+template <
+    typename index_t,
+    typename scalar_t,
+    bool USE_INDEX_SELECT,
+    bool USE_VAR_COLS,
+    bool USE_SMALL_EMB_DIM,
+    int UNROLL_FACTOR,
+    int COLS_PER_WARP,
+    int LOG_COLS_PER_WARP>
+#else
 template <
     typename index_t,
     typename scalar_t,
@@ -45,6 +56,7 @@ template <
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
+#endif
 __global__
 __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
@@ -84,39 +96,39 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_warp_id = warp_id - warp_offsets_group[member_id];
     } else {
       // All columns are the same
-      member_id = warp_id / (warps_per_row * num_work_rows);
-      member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
 #ifdef USE_ROCM
-      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-        // Need to ensure that [member_id] and [member_warp_id] are calculated
-        // correctly for the small embedding dimension path below
+      if constexpr (USE_SMALL_EMB_DIM) {
+        // Small embedding: pack multiple rows per warp
         const auto rows_per_warp = COLS_PER_WARP / num_cols;
         const auto warps_per_member =
             DIV_ROUND_UP(num_work_rows, rows_per_warp);
         member_id = warp_id / warps_per_member;
         member_warp_id = warp_id % warps_per_member;
+      } else {
+#endif
+        // Large embedding: one or more warps per row
+        member_id = warp_id / (warps_per_row * num_work_rows);
+        member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+#ifdef USE_ROCM
       }
-#endif // USE_ROCM
+#endif
     }
 
 #ifdef USE_ROCM
-    if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-      // Optimized path for small embedding dimensions
+    if constexpr (USE_SMALL_EMB_DIM) {
+      // Small embedding dimension: pack multiple rows per warp
       // Each warp processes 'rows_per_warp' rows
       const auto rows_per_warp = COLS_PER_WARP / num_cols;
-      const int64_t start_row = member_warp_id * rows_per_warp;
+      int64_t start_row = member_warp_id * rows_per_warp;
 
       // Since we are processing multiple rows within the warp, we need to
       // map each lane to a specific row, in addition to the column
-      const auto local_row = (threadIdx.x * UNROLL_FACTOR) /
-          num_cols; // the row ID within the set of rows handled by this warp
-      const auto col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-      const int64_t current_row = start_row +
-          local_row; // the actual row within the table processed by this lane
+      int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols; // the row ID within the set of rows handled by this warp
+      int col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
+      int64_t current_row = start_row + local_row; // the actual row within the table processed by this lane
 
-      // local_row may be out of bounds for the last few lanes in the warp if
-      // [COLS_PER_WARP % num_cols != 0] and we also need to confirm that we are
-      // within num_work_rows
+      // local_row may be out of bounds for the last few lanes in the warp if [COLS_PER_WARP % num_cols != 0]
+      // and we also need to confirm that we are within num_work_rows
       if (local_row < rows_per_warp && current_row < num_work_rows) {
         scalar_t* input =
             reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
@@ -129,8 +141,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
           // Compile time conditional
           if constexpr (USE_INDEX_SELECT) {
-            output[current_row * num_cols + i] =
-                LDG(&input[idx * num_cols + i]);
+            output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
           } else {
             gpuAtomicAddNoReturn(
                 &output[idx * num_cols + i], input[current_row * num_cols + i]);
@@ -138,9 +149,8 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         }
       }
     } else {
-      // Large embedding dimensions use >= 1 warp per row
-      // which is the default codepath for non-ROCm as well
-#endif // USE_ROCM
+#endif
+      // Large embedding dimension: one or more warps per row
       const auto row = member_warp_id / warps_per_row;
       const auto col_offset =
           ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
@@ -164,7 +174,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       }
 #ifdef USE_ROCM
     }
-#endif // USE_ROCM
+#endif
   }
 }
 
@@ -181,7 +191,11 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int64_t total_num_warps,
     const int group_size,
     const bool use_index_select,
-    const bool use_var_cols) {
+    const bool use_var_cols
+#ifdef USE_ROCM
+    ,const bool use_small_emb_dim
+#endif
+) {
   if (group_size == 0) {
     return;
   }
@@ -197,6 +211,32 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
 
+#ifdef USE_ROCM
+// Kernel launch macro with USE_SMALL_EMB_DIM template parameter
+#define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS, USE_SMALL_EMB_DIM) \
+  FBGEMM_LAUNCH_KERNEL(                                                  \
+      (group_index_select_or_add_2d_kernel<                              \
+          index_t,                                                       \
+          scalar_t,                                                      \
+          USE_INDEX_SELECT,                                              \
+          USE_VAR_COLS,                                                  \
+          USE_SMALL_EMB_DIM,                                             \
+          GROUP_INDEX_SELECT_UNROLL_FACTOR,                              \
+          GROUP_INDEX_SELECT_COLS_PER_WARP,                              \
+          GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),                        \
+      grid_size,                                                         \
+      block_size,                                                        \
+      0,                                                                 \
+      at::cuda::getCurrentCUDAStream(),                                  \
+      input_ptrs,                                                        \
+      output_ptrs,                                                       \
+      indices_ptrs,                                                      \
+      warp_offsets_group,                                                \
+      num_cols_group,                                                    \
+      num_work_rows,                                                     \
+      group_size)
+#else
+// Kernel launch macro for CUDA (no USE_SMALL_EMB_DIM)
 #define INVOKE_GROUP_INDEX_SELECT_OR_ADD(USE_INDEX_SELECT, USE_VAR_COLS) \
   FBGEMM_LAUNCH_KERNEL(                                                  \
       (group_index_select_or_add_2d_kernel<                              \
@@ -218,11 +258,46 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       num_cols_group,                                                    \
       num_work_rows,                                                     \
       group_size)
+#endif
 
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
         FBGEMM_DISPATCH_FLOATING_TYPES(
             input_scalar_type, "group_index_select_2d_wrapper_2", [&] {
+#ifdef USE_ROCM
+              if (use_small_emb_dim) {
+                // Small embedding dimension: pack multiple rows per warp
+                if (use_index_select) {
+                  if (use_var_cols) {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, true);
+                  } else {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, true);
+                  }
+                } else {
+                  if (use_var_cols) {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, true);
+                  } else {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, true);
+                  }
+                }
+              } else {
+                // Large embedding dimension: one or more warps per row
+                if (use_index_select) {
+                  if (use_var_cols) {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true, false);
+                  } else {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, false, false);
+                  }
+                } else {
+                  if (use_var_cols) {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, true, false);
+                  } else {
+                    INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false, false);
+                  }
+                }
+              }
+#else
+              // CUDA: Standard path only (no small embedding optimization)
               if (use_index_select) {
                 if (use_var_cols) {
                   INVOKE_GROUP_INDEX_SELECT_OR_ADD(true, true);
@@ -236,6 +311,7 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
                   INVOKE_GROUP_INDEX_SELECT_OR_ADD(false, false);
                 }
               }
+#endif
             });
       });
 
