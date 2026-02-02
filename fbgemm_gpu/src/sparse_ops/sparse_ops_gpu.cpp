@@ -569,7 +569,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   // Retrieve saved data
   TORCH_CHECK(saved_data_small.device() == at::kCPU, "Tensor saved_data_small must be on CPU.");
   TORCH_CHECK(saved_data_small.is_contiguous(), "Tensor saved_data_small must be contiguous.");
-  int64_t* saved_data_small_ptr = saved_data_small.const_data_ptr<int64_t>();
+  const int64_t* saved_data_small_ptr = saved_data_small.const_data_ptr<int64_t>();
   auto count_small = saved_data_small_ptr[0];
   const bool use_var_cols_small = saved_data_small_ptr[1];
   int64_t* warp_offsets_group_small = reinterpret_cast<int64_t*>(saved_data_small_ptr[2]);
@@ -578,7 +578,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
 
   TORCH_CHECK(saved_data_large.device() == at::kCPU, "Tensor saved_data_large must be on CPU.");
   TORCH_CHECK(saved_data_large.is_contiguous(), "Tensor saved_data_large must be contiguous.");
-  int64_t* saved_data_large_ptr = saved_data_large.const_data_ptr<int64_t>();
+  const int64_t* saved_data_large_ptr = saved_data_large.const_data_ptr<int64_t>();
   auto count_large = saved_data_large_ptr[0];
   const bool use_var_cols_large = saved_data_large_ptr[1];
   int64_t* warp_offsets_group_large = reinterpret_cast<int64_t*>(saved_data_large_ptr[2]);
@@ -711,8 +711,6 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
         " of ",
         group_size,
         " must be contiguous.");
-    grad_input_ptrs[i] =
-        reinterpret_cast<int64_t>(output_group[i].const_data_ptr());
 
     const auto output_group_reshaped = grad_output_group[i].reshape({grad_output_group[i].size(0), -1});
     const auto num_cols_ = output_group_reshaped.size(1);

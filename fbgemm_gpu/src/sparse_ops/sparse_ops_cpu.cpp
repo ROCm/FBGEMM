@@ -3508,14 +3508,10 @@ torch::autograd::variable_list group_index_select_dim0(
       at::Dispatcher::singleton()
           .findSchemaOrThrow("fbgemm::group_index_select_dim0_gpu_impl", "")
           .typed<decltype(group_index_select_dim0_autograd_impl)>();
-<<<<<<< HEAD
-  auto res = forward_op.call(all_indices_input_tensor, group_size);
-  TORCH_CHECK(res.size() >= group_size + 2);
-=======
+
   auto res = forward_op.call(
-      all_indices_input_tensor, static_cast<int64_t>(group_size));
-  TORCH_CHECK(res.size() == group_size + 2);
->>>>>>> origin/main_12162025_upstream
+    all_indices_input_tensor, static_cast<int64_t>(group_size));
+  TORCH_CHECK(res.size() >= group_size + 2);
   // only return the outputs (the first group_size elements)
   res.resize(group_size);
   return res;
@@ -3671,13 +3667,8 @@ torch::autograd::variable_list GroupIndexSelectDim0Op::backward(
   // remove redundant grads
   grad_output_group.resize(group_size);
 
-<<<<<<< HEAD
-  auto saved_tensors = ctx->get_saved_variables();
-  TORCH_CHECK(saved_tensors.size() >= group_size + 3);
-=======
   const auto saved_tensors = ctx->get_saved_variables();
-  TORCH_CHECK(saved_tensors.size() == group_size + 3);
->>>>>>> origin/main_12162025_upstream
+  TORCH_CHECK(saved_tensors.size() >= group_size + 3);
   std::vector<c10::SymInt> output_shape_group;
   int i = 0;
   while (true) {
