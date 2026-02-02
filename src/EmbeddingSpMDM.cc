@@ -18,6 +18,7 @@
 #include <tuple>
 #include "./CodeCache.h" // @manual
 #include "./EmbeddingSpMDMAutovec.h" // @manual
+#include "./EmbeddingSpMDMSve.h"
 #include "./MaskAvx2.h" // @manual
 #include "./RefImplementations.h" // @manual
 #include "fbgemm/FbgemmEmbedding.h"
@@ -976,9 +977,9 @@ typename EmbeddingSpMDMKernelSignature<inType, indxType, offsetType, outType>::
     Type
     GenerateEmbeddingSpMDMWithStrides(
         const int64_t block_size,
-        [[maybe_unused]] bool has_weight,
+        bool has_weight [[maybe_unused]],
         bool normalize_by_lengths,
-        [[maybe_unused]] int prefetch,
+        int prefetch [[maybe_unused]],
         bool is_weight_positional,
         bool use_offsets,
         int64_t output_stride /*=-1*/,
@@ -1128,6 +1129,70 @@ typename EmbeddingSpMDMKernelSignature<inType, indxType, offsetType, outType>::
   }
 #endif // CPUINFO_ARCH_X86 || CPUINFO_ARCH_X86_64
 
+#if HAVE_SVE
+  if constexpr (std::is_same_v<inType, uint8_t>) {
+    if (no_bag) {
+      return [=](int64_t output_size,
+                 int64_t index_size,
+                 int64_t data_size,
+                 const uint8_t* input_u8,
+                 const indxType* indices,
+                 const offsetType* offsets_or_lengths,
+                 const float*
+                     weights, // optional, can be null for non-weighted sum
+                 outType* out) {
+        return internal::
+            EmbeddingSpMDM8Bit_Sve<indxType, offsetType, outType, true, true>(
+                block_size,
+                output_size,
+                index_size,
+                data_size,
+                input_u8,
+                indices,
+                offsets_or_lengths,
+                weights,
+                normalize_by_lengths,
+                out,
+                is_weight_positional,
+                use_offsets,
+                output_stride,
+                input_stride,
+                scale_bias_last,
+                is_bf16_out);
+      };
+    } else {
+      return [=](int64_t output_size,
+                 int64_t index_size,
+                 int64_t data_size,
+                 const uint8_t* input_u8,
+                 const indxType* indices,
+                 const offsetType* offsets_or_lengths,
+                 const float* weights, // optional, can be null for
+                                       // non-weighted sum
+                 outType* out) {
+        return internal::
+            EmbeddingSpMDM8Bit_Sve<indxType, offsetType, outType, false, true>(
+                block_size,
+                output_size,
+                index_size,
+                data_size,
+                input_u8,
+                indices,
+                offsets_or_lengths,
+                weights,
+                normalize_by_lengths,
+                out,
+                is_weight_positional,
+                use_offsets,
+                output_stride,
+                input_stride,
+                scale_bias_last,
+                is_bf16_out);
+      };
+    };
+  }
+#endif
+
 #ifdef FBGEMM_AUTOVEC_AVAILABLE
   if (!cpuinfo_initialize()) {
     throw std::runtime_error("Failed to initialize cpuinfo!");
@@ -1245,8 +1310,11 @@ typename EmbeddingSpMDMKernelSignature<uint8_t, indxType, offsetType, outType>::
   }
 
 #ifdef FBGEMM_AUTOVEC_AVAILABLE
-  if (!is_autovec_disabled()) {
-    // There is only the reference implementation for FP8 embedding
+  if (!cpuinfo_initialize()) {
+    throw std::runtime_error("Failed to initialize cpuinfo!");
+  }
+  if ((is_autovec_forced() || fbgemmHasArmSve2Support()) &&
+      !is_autovec_disabled()) {
     return GenerateEmbeddingSpMDMFP8WithStrides_autovec<
         /*IndexType=*/indxType,
         /*OffsetType=*/offsetType,
@@ -1408,7 +1476,11 @@ GenerateEmbeddingSpMDMRowWiseSparse(
 #endif
 
 #ifdef FBGEMM_AUTOVEC_AVAILABLE
-  if (is_autovec_forced()) {
+  if (!cpuinfo_initialize()) {
+    throw std::runtime_error("Failed to initialize cpuinfo!");
+  }
+  if ((is_autovec_forced() || fbgemmHasArmSve2Support()) &&
+      !is_autovec_disabled()) {
     return GenerateEmbeddingSpMDMRowWiseSparse_autovec<
         /*InType=*/inType,
         /*IndexType=*/indxType,
@@ -1580,7 +1652,7 @@ INSTANTIATE_SPMDM_INDEX_T(uint8_t)
 
 template <typename IndexType>
 void compressed_indices_remap(
-    std::int32_t offsets_len,
+    std::int32_t offsets_numel,
     const IndexType* indices,
     const int32_t* compressed_indices_mapping,
     const IndexType* offsets,
@@ -1598,7 +1670,7 @@ void compressed_indices_remap(
 #ifndef USE_ROCM
     if (weights == nullptr) {
       internal::compressed_indices_remap_avx512<IndexType, false>(
-          offsets_len,
+          offsets_numel,
           indices,
           compressed_indices_mapping,
           offsets,
@@ -1609,7 +1681,7 @@ void compressed_indices_remap(
       return;
     } else {
       internal::compressed_indices_remap_avx512<IndexType, true>(
-          offsets_len,
+          offsets_numel,
           indices,
           compressed_indices_mapping,
           offsets,
@@ -1626,7 +1698,7 @@ void compressed_indices_remap(
 
   // Non-vectorized fallback implementation
   compressed_indices_remap_ref<IndexType>(
-      offsets_len,
+      offsets_numel,
       indices,
       compressed_indices_mapping,
       offsets,

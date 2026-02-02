@@ -65,15 +65,10 @@ at::Tensor mx8mx8bf16_grouped_impl(
     at::Tensor offsets) {
   c10::cuda::CUDAGuard deviceGuard(XQ.device());
   // The number of groups the kernel uses may vary.
-  int kernel_groups = G;
+  const int kernel_groups = G;
 
   at::TensorOptions options;
   options = XQ.options();
-
-  // Return early if there are no elements in the output.
-  if (output.numel() == 0) {
-    return output;
-  }
 
   // WQ is shape (K,N) or (E,K,N) in column major layout, to align with
   // torch._scaled_grouped_mm. We transpose here to match cutlass kernel
@@ -121,11 +116,9 @@ at::Tensor mx8mx8bf16_grouped_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          //   void, // Indicate there is no beta scaling to save register
-          //   space.
-          ElementC,
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
-          128 / cutlass::sizeof_bits<ElementC>::value,
+          void, // No C input - we are doing C = A @ B, not C = A @ B + beta*C
+          void,
+          0,
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           128 / cutlass::sizeof_bits<ElementC>::value,
@@ -298,6 +291,7 @@ at::Tensor mx8mx8bf16_grouped_impl(
       wq_ptr,
       reinterpret_cast<ScaleDtype*>(x_scale.data_ptr()),
       x_scale_ptr,
+      x_scale.numel(),
       reinterpret_cast<ScaleDtype*>(w_scale.data_ptr()),
       w_scale_ptr,
       reinterpret_cast<ElementC*>(output.data_ptr()),

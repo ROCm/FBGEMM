@@ -475,7 +475,8 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                                 : static_cast<index_t*>(nullptr),                           \
                             keep_orig_idx,                                                  \
                             keep_orig_idx_per_feature.has_value()                           \
-                                ? keep_orig_idx_per_feature->data_ptr<bool>()               \
+                                ? keep_orig_idx_per_feature                                 \
+                                      ->const_data_ptr<bool>()                              \
                                 : static_cast<bool*>(nullptr));                             \
                     C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
                   });                                                                       \
@@ -544,7 +545,8 @@ __launch_bounds__(kMaxThreads) void _populate_bucketized_permute_cuda_kernel(
                             : static_cast<index_t*>(nullptr),                               \
                         keep_orig_idx,                                                      \
                         keep_orig_idx_per_feature.has_value()                               \
-                            ? keep_orig_idx_per_feature->data_ptr<bool>()                   \
+                            ? keep_orig_idx_per_feature                                     \
+                                  ->const_data_ptr<bool>()                                  \
                             : static_cast<bool*>(nullptr));                                 \
                     C10_CUDA_KERNEL_LAUNCH_CHECK();                                         \
                   });                                                                       \
@@ -796,34 +798,24 @@ DLL_PUBLIC std::
         const bool keep_orig_idx,
         const std::optional<Tensor>& total_num_blocks,
         const std::optional<at::Tensor>& keep_orig_idx_per_feature) {
-  Tensor new_lengths;
-  Tensor new_indices;
-  Tensor new_weights;
-  std::optional<Tensor> new_pos;
-  std::optional<Tensor> unbucketize_permute;
-  std::tie(
-      new_lengths,
-      new_indices,
-      new_weights,
-      new_pos,
-      unbucketize_permute,
-      std::ignore) =
-      _block_bucketize_sparse_features_2d_weights_cuda(
-          lengths,
-          indices,
-          bucketize_pos,
-          sequence,
-          block_sizes,
-          total_num_blocks,
-          my_size,
-          weights,
-          weights_dim,
-          batch_size_per_feature,
-          max_B,
-          block_bucketize_pos,
-          false,
-          keep_orig_idx,
-          keep_orig_idx_per_feature);
+  auto
+      [new_lengths, new_indices, new_weights, new_pos, unbucketize_permute, _] =
+          _block_bucketize_sparse_features_2d_weights_cuda(
+              lengths,
+              indices,
+              bucketize_pos,
+              sequence,
+              block_sizes,
+              total_num_blocks,
+              my_size,
+              weights,
+              weights_dim,
+              batch_size_per_feature,
+              max_B,
+              block_bucketize_pos,
+              false,
+              keep_orig_idx,
+              keep_orig_idx_per_feature);
   return {new_lengths, new_indices, new_weights, new_pos, unbucketize_permute};
 }
 

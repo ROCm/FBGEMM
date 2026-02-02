@@ -17,6 +17,7 @@ from typing import Optional, TypeVar
 
 import torch
 
+# fmt:skip
 from fbgemm_gpu.quantize_utils import (
     bf16_to_fp32,
     fp16_to_fp32,
@@ -25,12 +26,10 @@ from fbgemm_gpu.quantize_utils import (
     fp32_to_hfp8_with_clamp,
     fp32_to_mx4,
     hfp8_to_fp32,
-    mx4_to_fp32,
+    mx4_to_float,
     RoundingMode,
 )
-
 from fbgemm_gpu.split_embedding_configs import SparseType
-
 from torch.autograd.profiler import record_function  # usort:skip
 from dataclasses import dataclass
 
@@ -123,7 +122,7 @@ def _dequantize_tensor(
     comm_precision: SparseType,
     ctx: Optional[QuantizationContext] = None,
     is_fwd: bool = True,
-    fp8_output_dtype: Optional[SparseType] = None,
+    output_dtype: Optional[SparseType] = None,
 ) -> torch.Tensor:
     if comm_precision == SparseType.FP32:
         assert quantized_tensor.dtype == torch.float
@@ -138,10 +137,8 @@ def _dequantize_tensor(
         if ctx is not None and ctx.row_dim > 0:
             row_dim_quant = ctx.row_dim_quant
             quantized_tensor_2d = quantized_tensor.view((-1, row_dim_quant))
-            # use provided fp8_output_dtype or default to FP32 (0)
-            output_dtype_int = (
-                fp8_output_dtype.as_int() if fp8_output_dtype is not None else 0
-            )
+            # use provided output_dtype or default to FP32 (0)
+            output_dtype_int = output_dtype.as_int() if output_dtype is not None else 0
             dequant_tensor = torch.ops.fbgemm.FP8RowwiseQuantizedToFloat(
                 quantized_tensor_2d,
                 is_fwd,
@@ -161,7 +158,7 @@ def _dequantize_tensor(
         return dequant_tensor.view(-1)
     elif comm_precision == SparseType.MX4:
         mx_group_size = ctx.mx_group_size if ctx is not None else MX_GROUP_SIZE_DEFAULT
-        return mx4_to_fp32(quantized_tensor, mx_group_size)
+        return mx4_to_float(quantized_tensor, mx_group_size, output_dtype=output_dtype)
     else:
         raise ValueError(f"comm_precision={comm_precision} is not supported")
 
@@ -175,7 +172,7 @@ class QuantizedCommCodec:
         row_dim: Optional[int] = None,
         is_fwd: bool = True,
         rounding_mode: Optional[RoundingMode] = None,
-        fp8_output_dtype: Optional[SparseType] = None,
+        output_dtype: Optional[SparseType] = None,
     ) -> None:
         if loss_scale is not None:
             if comm_precision not in [SparseType.FP16, SparseType.BF16]:
@@ -193,7 +190,7 @@ class QuantizedCommCodec:
         self._is_fwd = is_fwd
         self._row_dim: int = -1 if row_dim is None else row_dim
         self._rounding_mode: Optional[RoundingMode] = rounding_mode
-        self._fp8_output_dtype: Optional[SparseType] = fp8_output_dtype
+        self._output_dtype: Optional[SparseType] = output_dtype
         if self._comm_precision == SparseType.MX4:
             self._row_dim = MX_GROUP_SIZE_DEFAULT if row_dim is None else row_dim
             self._rounding_mode = (
@@ -229,7 +226,7 @@ class QuantizedCommCodec:
                 self._comm_precision,
                 ctx,
                 self._is_fwd,
-                fp8_output_dtype=self._fp8_output_dtype,
+                output_dtype=self._output_dtype,
             )
         return dequantized_tensor
 

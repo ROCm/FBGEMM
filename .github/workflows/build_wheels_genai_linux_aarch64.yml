@@ -39,9 +39,9 @@ jobs:
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
     steps:
-    - uses: actions/setup-python@v4
+    - uses: actions/setup-python@v6
     - name: Checkout FBGEMM repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         repository: pytorch/fbgemm
     - name: Filter Generated Built Matrix
@@ -54,7 +54,6 @@ jobs:
         set -ex
         pwd
         ls
-        # MATRIX_BLOB="$( python .github/scripts/filter_nova_matrix.py --filter 'gpu_arch_version:13.0-aarch64' )"
         MATRIX_BLOB="$( python .github/scripts/filter_nova_matrix.py )"
         echo "${MATRIX_BLOB}"
         echo "matrix=${MATRIX_BLOB}" >> "${GITHUB_OUTPUT}"

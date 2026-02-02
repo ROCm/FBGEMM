@@ -20,17 +20,19 @@ struct StreamQueueItem {
   at::Tensor indices;
   at::Tensor weights;
   std::optional<at::Tensor> identities;
+  std::optional<at::Tensor> runtime_meta;
   at::Tensor count;
   StreamQueueItem(
       at::Tensor src_indices,
       at::Tensor src_weights,
       std::optional<at::Tensor> src_identities,
-      at::Tensor src_count) {
-    indices = std::move(src_indices);
-    weights = std::move(src_weights);
-    identities = std::move(src_identities);
-    count = std::move(src_count);
-  }
+      std::optional<at::Tensor> src_runtime_meta,
+      at::Tensor src_count)
+      : indices(std::move(src_indices)),
+        weights(std::move(src_weights)),
+        identities(std::move(src_identities)),
+        runtime_meta(std::move(src_runtime_meta)),
+        count(std::move(src_count)) {}
 };
 
 class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
@@ -44,7 +46,7 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
       std::vector<int64_t> table_offsets,
       const std::vector<int64_t>& table_sizes);
 
-  virtual ~RawEmbeddingStreamer();
+  ~RawEmbeddingStreamer() override;
 
   /// Stream out non-negative elements in <indices> and its paired embeddings
   /// from <weights> for the first <count> elements in the tensor.
@@ -71,6 +73,7 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
       const at::Tensor& indices,
       const at::Tensor& weights,
       std::optional<at::Tensor> identities,
+      std::optional<at::Tensor> runtime_meta,
       const at::Tensor& count,
       bool require_tensor_copy,
       bool blocking_tensor_copy = true);
@@ -79,7 +82,8 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
   folly::coro::Task<void> tensor_stream(
       const at::Tensor& indices,
       const at::Tensor& weights,
-      std::optional<at::Tensor> identities);
+      std::optional<at::Tensor> identities,
+      std::optional<at::Tensor> runtime_meta);
   /*
    * Copy the indices, weights and count tensors and enqueue them for
    * asynchronous stream.
@@ -88,6 +92,7 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
       const at::Tensor& indices,
       const at::Tensor& weights,
       std::optional<at::Tensor> identities,
+      std::optional<at::Tensor> runtime_meta,
       const at::Tensor& count);
 
   /*
@@ -108,8 +113,10 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
   std::atomic<bool> stop_{false};
   std::string unique_id_;
   bool enable_raw_embedding_streaming_;
+#ifdef FBGEMM_FBCODE
   int64_t res_store_shards_;
   int64_t res_server_port_;
+#endif
   std::vector<std::string> table_names_;
   std::vector<int64_t> table_offsets_;
   at::Tensor table_sizes_;
@@ -120,4 +127,10 @@ class RawEmbeddingStreamer : public torch::jit::CustomClassHolder {
 #endif
 };
 
+fbgemm_gpu::StreamQueueItem tensor_copy(
+    const at::Tensor& indices,
+    const at::Tensor& weights,
+    std::optional<at::Tensor> identities,
+    std::optional<at::Tensor> runtime_meta,
+    const at::Tensor& count);
 } // namespace fbgemm_gpu

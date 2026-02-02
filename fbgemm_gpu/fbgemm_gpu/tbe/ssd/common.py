@@ -10,6 +10,7 @@
 
 import torch
 
+# fmt:skip
 from fbgemm_gpu.utils.loader import load_torch_module
 
 try:

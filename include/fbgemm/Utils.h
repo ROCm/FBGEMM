@@ -24,6 +24,8 @@
 #if defined(__aarch64__) && __ARM_FEATURE_SVE && \
     __has_include(<arm_neon_sve_bridge.h>)
 #define HAVE_SVE 1
+#include <arm_neon_sve_bridge.h> // @manual
+#include <arm_sve.h>
 #else
 #define HAVE_SVE 0
 #endif
@@ -470,9 +472,9 @@ template <typename OutType>
 void nbit_embedding_sanity_check(
     // assertions are ignored in release mode, in which case these parameters
     // will be unused
-    [[maybe_unused]] const int input_bit_rate,
-    [[maybe_unused]] const int output_bit_rate,
-    [[maybe_unused]] const bool no_bag) {
+    const int input_bit_rate [[maybe_unused]],
+    const int output_bit_rate [[maybe_unused]],
+    const bool no_bag [[maybe_unused]]) {
   assert(
       (input_bit_rate == 2 || input_bit_rate == 4) &&
       "input_bit_rate must be 2 or 4");

@@ -39,6 +39,60 @@ class GenKernelType(IntEnum):
     UMMA_P = 1
 
 
+def get_splitk_heuristic(
+    batch: int,
+    seqlen_kv: int,
+    kv_heads: int = 1,
+    tile_n: int = 256,
+    sm_count: int | None = None,
+) -> int:
+    """
+    Compute optimal split-K size for Shape<64, 256, 128> tile configuration.
+
+    Targets full GPU utilization by distributing work across all SMs.
+    First calculates SMs per batch, then per kv_head, then divides seqlen_kv by that number.
+    Ensures split size evenly divides seqlen_kv so all CTAs process same number of tiles.
+    Returns 0 (no split) when split would equal seqlen_kv (only 1 split).
+
+    Args:
+        batch: Batch size
+        seqlen_kv: Maximum sequence length for K/V
+        kv_heads: Number of KV heads (default 1 for MQA)
+        tile_n: TileN dimension (default 256 for Shape<64, 256, 128>)
+        sm_count: Number of SMs on the GPU. If None, queries the current device.
+
+    Returns:
+        Optimal split size along the K/V sequence dimension, or 0 to disable split-K
+    """
+    # Get SM count from current device if not provided
+    if sm_count is None:
+        sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+
+    # Calculate number of SMs available per batch element
+    sms_per_batch = max(1, sm_count // batch)
+    # Further divide by kv_heads for multi-head KV
+    sms_per_head_batch = max(1, sms_per_batch // kv_heads)
+
+    # Each (batch, kv_head) element should have sms_per_head_batch splits
+    # So split size = seqlen_kv / sms_per_head_batch
+    ideal_split = seqlen_kv // sms_per_head_batch
+
+    # Round up to multiple of tile_n
+    split = ((ideal_split + tile_n - 1) // tile_n) * tile_n
+
+    # Clamp to valid range: [tile_n, seqlen_kv]
+    split = max(split, tile_n)
+    split = min(split, seqlen_kv)
+
+    # If split equals seqlen_kv, there's only 1 split - disable split-K
+    if split == seqlen_kv:
+        split = 0
+
+    return split
+
+
 def maybe_contiguous(x: torch.Tensor) -> torch.Tensor:
     """
     We only require the head dim to be contiguous
@@ -133,6 +187,47 @@ def _cutlass_blackwell_fmha_backward(
     )
 
 
+def _validate_and_adjust_split_k_size(split_k_size: int) -> int:
+    """
+    Validate and adjust split_k_size parameter for optimal performance.
+
+    Args:
+        split_k_size: The requested split size along the K/V sequence dimension.
+
+    Returns:
+        Adjusted split_k_size that is valid for the kernel.
+
+    Valid values:
+        - split_k_size <= 0: Disable split-K (no splitting)
+        - split_k_size > 0: Enable split-K with specified split size
+    """
+    if not isinstance(split_k_size, int):
+        raise TypeError(
+            f"split_k_size must be an integer, got {type(split_k_size).__name__}"
+        )
+
+    # If split-K is disabled, return as-is
+    if split_k_size <= 0:
+        return split_k_size
+
+    # Constants
+    MIN_RECOMMENDED_SPLIT_SIZE = 256
+    TILE_SIZE = 128
+
+    # Adjust if split_k_size is too small
+    if split_k_size < MIN_RECOMMENDED_SPLIT_SIZE:
+        split_k_size = MIN_RECOMMENDED_SPLIT_SIZE
+
+    # Check if split_k_size is a power of 2
+    is_power_of_2 = (split_k_size & (split_k_size - 1)) == 0
+
+    # If not a power of 2, round to nearest multiple of tile size (128)
+    if not is_power_of_2:
+        split_k_size = ((split_k_size + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+
+    return split_k_size
+
+
 def _validate_decode_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -180,26 +275,6 @@ def _prepare_decode_inputs(
     return q, k, v, batch_size, needs_reshape_output, original_shape
 
 
-def _create_decode_lse(
-    out: torch.Tensor,
-    batch_size: int,
-    needs_reshape_output: bool,
-    q_shape: tuple[int, ...],
-) -> torch.Tensor:
-    """
-    Create dummy LSE tensor for decode output compatibility.
-    Gen kernel doesn't return LSE, so we create a zero tensor.
-    """
-    if needs_reshape_output:
-        # For varlen output format
-        lse_shape = [batch_size, q_shape[-1]]  # [B, H]
-    else:
-        # For batch output format
-        lse_shape = [batch_size, q_shape[-2], q_shape[1]]  # [B, H, 1]
-
-    return torch.zeros(*lse_shape, dtype=torch.float32, device=out.device)
-
-
 def cutlass_blackwell_fmha_decode_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -214,6 +289,8 @@ def cutlass_blackwell_fmha_decode_forward(
     window_left: int = -1,
     window_right: int = -1,
     bottom_right: bool = True,
+    split_k_size: int = 0,
+    use_heuristic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Decode-optimized forward pass using the gen kernel.
@@ -225,32 +302,70 @@ def cutlass_blackwell_fmha_decode_forward(
     Accepts inputs in two formats:
     - Varlen format: [total_queries, num_heads, head_dim] (3D)
     - Batch format: [batch_size, 1, num_heads, head_dim] (4D)
+
+    Args:
+        q: Query tensor in varlen [B, H, D] or batch [B, 1, H, D] format
+        k: Key tensor [B, Sk, H_kv, D]
+        v: Value tensor [B, Sk, H_kv, D]
+        seqlen_kv: Per-batch sequence lengths [B] (required)
+        split_k_size: Size of each split along the K/V sequence dimension.
+                     - split_k_size <= 0 with use_heuristic=True: auto-compute using heuristic
+                     - split_k_size <= 0 with use_heuristic=False: disable split-K
+                     - split_k_size > 0: use the provided split size directly
+                     Values below 256 are adjusted to 256. Non-power-of-2 values
+                     are rounded to the nearest multiple of 128.
+        use_heuristic: If True and split_k_size <= 0, automatically compute optimal
+                      split size using the heuristic. Default is True.
+
+    Returns:
+        Kernel output with Q dimension added:
+        - out: [B, 1, H, num_splits, D] (num_splits=1 when split-K disabled)
+        - lse: [B, num_splits, H, 1]
     """
     _validate_decode_inputs(q, k, v, seqlen_kv)
 
     # Prepare inputs and handle format conversion
-    q, k, v, batch_size, needs_reshape_output, original_shape = _prepare_decode_inputs(
-        q, k, v
-    )
+    q, k, v, batch_size, _, original_shape = _prepare_decode_inputs(q, k, v)
+
+    # Determine effective split_k_size
+    if split_k_size <= 0 and use_heuristic:
+        # Auto-compute using heuristic
+        max_seqlen_kv = k.shape[1]
+        kv_heads = k.shape[2]  # K shape is [B, Sk, H_kv, D]
+        split_k_size = get_splitk_heuristic(batch_size, max_seqlen_kv, kv_heads)
+
+    # Validate and adjust split_k_size
+    split_k_size = _validate_and_adjust_split_k_size(split_k_size)
+
+    # Validate window_right: decode kernel only supports causal attention (window_right <= 0)
+    if window_right > 0:
+        raise ValueError(
+            f"window_right={window_right} is not supported for decode attention. "
+            "The decode kernel only supports causal attention with window_right <= 0. "
+            "Use window_right=0 (causal, current position only)."
+        )
+
     # Call the gen kernel (optimized for decode)
-    out = torch.ops.fbgemm.fmha_gen_fwd(
+    # Note: window_left specifies how many tokens to look back (exclusive)
+    # The kernel will attend to positions [seqlen_kv - window_left, seqlen_kv)
+    out, lse = torch.ops.fbgemm.fmha_gen_fwd(
         q,
         k,
         v,
         seqlen_kv,
         None,
         kernel_type=GenKernelType.UMMA_I,
-        # window_left=window_left,
-        # window_right=window_right,
+        window_left=window_left,
+        window_right=0,
+        split_k_size=split_k_size,
     )
 
-    # Reshape output back to original format if needed
-    if needs_reshape_output:
-        out = out.view(*original_shape)
-
-    # Create dummy LSE for compatibility
-    lse = _create_decode_lse(out, batch_size, needs_reshape_output, original_shape)
-
+    # Kernel returns: out [B, H, num_splits, D], lse [B, num_splits, H]
+    # Reshape to consistent format with Q dimension:
+    # out: [B, H, num_splits, D] -> [B, 1, H, num_splits, D]
+    # lse: [B, num_splits, H] -> [B, num_splits, H, 1]
+    out = out.unsqueeze(1)  # [B, 1, H, num_splits, D]
+    lse = lse.unsqueeze(-1)  # [B, num_splits, H, 1]
     return out, lse
 
 

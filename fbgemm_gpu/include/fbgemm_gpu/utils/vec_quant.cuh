@@ -235,7 +235,7 @@ DEVICE_INLINE T shfl_xor(
     const T val,
     int laneMask,
     int width = kThreadsPerWarp) {
-#if defined(__HIP_PLATFORM_AMD__) || CUDA_VERSION < 9000
+#if defined(__HIP_PLATFORM_AMD__)
   return __shfl_xor(val, laneMask, width);
 #else
   return __shfl_xor_sync(shfl_sync_mask, val, laneMask, width);
@@ -255,7 +255,7 @@ DEVICE_INLINE T warpReduceMax(T val, uint32_t warp_mask = FINAL_MASK) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
 #ifdef __HIP_PLATFORM_AMD__
-    val = max(val, shfl_xor(warp_mask, val, offset, 32));
+    val = std::max(val, shfl_xor(warp_mask, val, offset, 32));
 #else
     val = fmaxf(val, __shfl_down_sync(warp_mask, val, offset));
 #endif

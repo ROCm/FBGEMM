@@ -133,6 +133,7 @@ __configure_fbgemm_gpu_test_cuda () {
   export ignored_tests=(
     ./moe/layers_test.py  # Not a python unittest file
     ./attention/blackwell_fmha_test.py
+    ./attention/blackwell_attention_splitk_test.py
   )
 }
 
@@ -172,6 +173,7 @@ __configure_fbgemm_gpu_test_rocm () {
     ./gather_scatter/gather_scatter_test.py
     ./moe/layers_test.py  # Not a python unittest file
     ./attention/blackwell_fmha_test.py
+    ./attention/blackwell_attention_splitk_test.py
   )
 }
 
@@ -212,6 +214,7 @@ __setup_fbgemm_gpu_test () {
     __configure_fbgemm_gpu_test_cuda
   fi
 
+  # Filter out tests for specific build targets
   if [ "$fbgemm_build_target" == "hstu" ]; then
     ignored_tests+=(
       ./tma_error_test.py
@@ -231,15 +234,6 @@ __setup_fbgemm_gpu_test () {
   # shellcheck disable=SC2086
   print_exec conda env config vars set ${env_prefix} TORCH_SHOW_CPP_STACKTRACES=1
 
-  echo "[TEST] Installing PyTest ..."
-  # shellcheck disable=SC2086
-  (exec_with_retries 3 conda install ${env_prefix} -c conda-forge --override-channels -y \
-    pytest \
-    expecttest) || return 1
-
-  echo "[TEST] Checking imports ..."
-  (test_python_import_package "${env_name}" fbgemm_gpu) || return 1
-
   # Set the feature flags to enable experimental features as needed
   __set_feature_flags
 
@@ -252,7 +246,7 @@ __setup_fbgemm_gpu_test () {
   )
 
   # shellcheck disable=SC2145
-  echo "[TEST] PyTest args:  ${pytest_args[@]}"
+  echo "[TEST] Set PyTest args:  ${pytest_args[@]}"
 }
 
 ################################################################################
@@ -278,17 +272,35 @@ __run_fbgemm_gpu_tests_in_directory () {
   echo ""
 
   echo "[TEST] Enumerating IGNORED test files ..."
-  for f in $ignored_tests; do echo "$f"; done
+  shopt -s nullglob  # Avoid printing pattern if no matches
+  for pattern in "${ignored_tests[@]}"; do
+    for f in $pattern; do   # unquoted $pattern to trigger glob expansion
+      if [[ -e "$f" ]]; then
+        echo "$f"
+      fi
+    done
+  done
   echo ""
 
-  # NOTE: Tests running on single CPU core with a less powerful testing GPU in
-  # GHA can take up to 5 hours.
   for test_file in $all_test_files; do
-    if echo "${ignored_tests[@]}" | grep "${test_file}"; then
+    # Check if test_file matches any ignored glob pattern
+    skip=false
+    for pattern in "${ignored_tests[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$test_file" == $pattern ]]; then
+        skip=true
+        break
+      fi
+    done
+
+    if [[ "$skip" == true ]]; then
       echo "[TEST] Skipping test file: ${test_file}"
       echo ""
+      continue
+
     elif run_python_test "${env_name}" "${test_file}"; then
       echo ""
+
     else
       return 1
     fi
@@ -328,8 +340,46 @@ __determine_test_directories () {
   echo ""
 }
 
+__test_fbgemm_gpu_common_pre_steps () {
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
+
+  # Move to another directory, to avoid Python package import confusion, since
+  # there exists a fbgemm_gpu/ subdirectory in the MSLK repo
+  print_exec mkdir -p _tmp_dir_fbgemm_gpu   || return 1
+  print_exec pushd _tmp_dir_fbgemm_gpu      || return 1
+
+  # Determine the FBGEMM build target and variant
+  # shellcheck disable=SC2086
+  fbgemm_build_target=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__target__)")
+  # shellcheck disable=SC2086
+  fbgemm_build_variant=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__variant__)")
+
+  echo "[TEST] Checking imports ..."
+  (test_python_import_package "${env_name}" torch) || return 1
+
+  echo "[TEST] Determined FBGEMM_GPU (target : variant) from installation: (${fbgemm_build_target} : ${fbgemm_build_variant})"
+  echo "[TEST] Will be running tests specific to this target and variant ..."
+
+  echo "[TEST] Installing PyTest ..."
+  # shellcheck disable=SC2086
+  (exec_with_retries 3 conda install ${env_prefix} -c conda-forge --override-channels -y \
+    pytest \
+    expecttest)                     || return 1
+
+  # Set the ignored tests and PyTest args
+  __setup_fbgemm_gpu_test           || return 1
+
+  # Verify that the GPUs are visible
+  __verify_pytorch_gpu_integration  || return 1
+
+  # Exit tmp directory
+  print_exec popd                   || return 1
+}
+
 test_all_fbgemm_gpu_modules () {
   env_name="$1"
+  local repo="$2"
   if [ "$env_name" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME"
     echo "Example(s):"
@@ -347,231 +397,62 @@ test_all_fbgemm_gpu_modules () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
-  # Determine the FBGEMM build target and variant
-  # shellcheck disable=SC2086
-  fbgemm_build_target=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__target__)")
-  # shellcheck disable=SC2086
-  fbgemm_build_variant=$(conda run ${env_prefix} python -c "import fbgemm_gpu; print(fbgemm_gpu.__variant__)")
-  echo "[TEST] Determined FBGEMM_GPU (target : variant) from installation: (${fbgemm_build_target} : ${fbgemm_build_variant})"
-  echo "[TEST] Will be running tests specific to this target and variant ..."
+  if [ "$repo" == "" ]; then
+    echo "[TEST]: repo argument not provided, defaulting to current directory"
+    repo=$(pwd)
+  fi
+
+  __test_fbgemm_gpu_common_pre_steps  || return 1
+
+  # Go to the repo root directory
+  print_exec pushd "${repo}"          || return 1
 
   # Determine the test directories to include for testing
-  __determine_test_directories
-
-  # Set the ignored tests and PyTest args
-  __setup_fbgemm_gpu_test
-
-  # Verify that the GPUs are visible
-  __verify_pytorch_gpu_integration
+  __determine_test_directories        || return 1
 
   # Iterate through the test directories and run bulk tests
   for test_dir in "${target_directories[@]}"; do
-    cd "${test_dir}"                                    || return 1
+    print_exec pushd "${test_dir}"                      || return 1
     __run_fbgemm_gpu_tests_in_directory "${env_name}"   || return 1
-    cd -                                                || return 1
+    print_exec popd                                     || return 1
   done
+
+  print_exec popd || return 1
+  echo "[TEST] Successfully executed all FBGEMM_GPU tests"
 }
 
-
-################################################################################
-# FBGEMM_GPU Test Bulk-Combination Functions
-################################################################################
-
-test_setup_conda_environment () {
-  local env_name="$1"
-  local compiler="$2"
-  local python_version="$3"
-  local pytorch_installer="$4"
-  local pytorch_channel_version="$5"
-  local pytorch_variant_type="$6"
-  local pytorch_variant_version="$7"
-  if [ "$pytorch_variant_version" == "" ]; then
-    echo "Usage: ${FUNCNAME[0]} ENV_NAME COMPILER PYTHON_VERSION PYTORCH_INSTALLER PYTORCH_CHANNEL[/VERSION] PYTORCH_VARIANT_TYPE PYTORCH_VARIANT_VERSION"
-    echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env clang 3.13 pip test/1.0.0 cuda 12.6.3       # Setup environment with pytorch-test 1.0.0 for Clang + Python 3.13 + CUDA 12.6.3"
-    return 1
-  else
-    echo "################################################################################"
-    echo "# Setup FBGEMM-GPU Build Environment (All Steps)"
-    echo "#"
-    echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
-    echo "################################################################################"
-    echo ""
-  fi
-
-  echo "Creating the Build Environment: ${env_name} ..."
-  create_conda_environment  "${env_name}" "${python_version}"           || return 1
-
-  if [ "$pytorch_variant_type" == "cuda" ] || [ "$pytorch_variant_type" == "genai" ]; then
-    print_exec conda env config vars set -n "${env_name}" BUILD_CUDA_VERSION="${pytorch_variant_version}"
-  fi
-
-  # Install C++ compiler and build tools (all FBGEMM_GPU variants)
-  if [ "$compiler" == "gcc" ] || [ "$compiler" == "clang" ]; then
-    install_cxx_compiler  "${env_name}" "${compiler}"   || return 1
-  fi
-  install_build_tools     "${env_name}"                 || return 1
-
-  # Install CUDA tools and runtime
-  if [ "$pytorch_variant_type" == "cuda" ]; then
-    install_cuda  "${env_name}" "${pytorch_variant_version}"                                            || return 1
-    install_cudnn "${env_name}" "${HOME}/cudnn-${pytorch_variant_version}" "${pytorch_variant_version}" || return 1
-  # Install ROCm tools and runtime
-  elif [[ "$pytorch_variant_type" == "rocm" ]] && ! [[ "$(hostname)" =~ ^.*facebook.com$ ]]; then
-    install_rocm_ubuntu     "${env_name}" "${pytorch_variant_version}"  || return 1
-  fi
-
-  # Install PyTorch
-  if [ "$pytorch_installer" == "conda" ]; then
-    install_pytorch_conda     "${env_name}" "${pytorch_channel_version}" "${pytorch_variant_type}" "${pytorch_variant_version}" || return 1
-  else
-    install_pytorch_pip       "${env_name}" "${pytorch_channel_version}" "${pytorch_variant_type}"/"${pytorch_variant_version}" || return 1
-  fi
-
-  export env_name="${env_name}"
-}
-
-test_fbgemm_gpu_build_and_install () {
-  local env_name="$1"
-  local build_target_variant="$2"
+test_single_fbgemm_gpu_module () {
+  env_name="$1"
+  test_file="$2"
   local repo="$3"
-  if [ "$build_target_variant" == "" ]; then
-    echo "Usage: ${FUNCNAME[0]} ENV_NAME BUILD_TARGET_VARIANT"
+  if [ "$test_file" == "" ]; then
+    echo "Usage: ${FUNCNAME[0]} ENV_NAME TEST_FILE"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env genai/cuda   # Build and install FBGEMM-GenAI for CUDA (All Steps)"
+    echo "    ${FUNCNAME[0]} build_env tbe/training/forward_test.py       # Run all FBGEMM_GPU tests in tbe/training/forward_test.py"
     return 1
   else
     echo "################################################################################"
-    echo "# FBGEMM build + install Combo Step"
+    echo "# Test Single FBGEMM-GPU Module"
     echo "#"
     echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
     echo "################################################################################"
     echo ""
   fi
 
-  if [ "$repo" == "" ]; then
-    repo=~/FBGEMM
-  fi
-
-  # Assume we are starting from the repository root directory
-  cd "${repo}/fbgemm_gpu"                                                     || return 1
-  prepare_fbgemm_gpu_build    "${env_name}"                                   || return 1
-  build_fbgemm_gpu_package    "${env_name}" release "${build_target_variant}" || return 1
-
-  cd "${repo}"                                                                || return 1
-  install_fbgemm_gpu_wheel    "${env_name}" fbgemm_gpu/dist/*.whl             || return 1
-}
-
-test_fbgemm_gpu_build_and_install_and_run () {
-  local env_name="$1"
-  local build_target_variant="$2"
-  local repo="$3"
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
 
   if [ "$repo" == "" ]; then
-    repo=~/FBGEMM
+    echo "[TEST]: repo argument not provided, defaulting to current directory"
+    repo=$(pwd)
   fi
 
-  test_fbgemm_gpu_build_and_install "${env_name}" "${build_target_variant}" "${repo}"  || return 1
+  __test_fbgemm_gpu_common_pre_steps            || return 1
 
-  cd "${repo}"                                                                         || return 1
-  test_all_fbgemm_gpu_modules "${env_name}"                                            || return 1
-}
+  # Go to the repo root directory
+  print_exec pushd "${repo}"                    || return 1
+  run_python_test "${env_name}" "${test_file}"  || return 1
+  print_exec popd                               || return 1
 
-test_fbgemm_gpu_setup_and_pip_install () {
-  local variant_type="$1"
-  local pytorch_channel_version="$2"
-  local fbgemm_gpu_channel_version="$3"
-  local repo="$4"
-  if [ "$fbgemm_gpu_channel_version" == "" ]; then
-    echo "Usage: ${FUNCNAME[0]} ENV_NAME PYTORCH_CHANNEL[/VERSION] FBGEMM_GPU_CHANNEL[/VERSION]"
-    echo "Example(s):"
-    echo "    ${FUNCNAME[0]} test_env cpu test/2.2.0 test/0.8.0     # Run tests against all Python versions with PyTorch test/2.2.0 and FBGEMM_GPU test/0.8.0 (CPU-only)"
-    echo "    ${FUNCNAME[0]} test_env cuda test/2.3.0 test/0.8.0    # Run tests against all Python versions with PyTorch test/2.3.0 and FBGEMM_GPU test/0.8.0 (all CUDA versions)"
-    return 1
-  else
-    echo "################################################################################"
-    echo "# Run Bulk FBGEMM-GPU Testing from PIP Package Installation"
-    echo "#   (Environment Setup + Download + Install + Test)"
-    echo "#"
-    echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
-    echo "################################################################################"
-    echo ""
-  fi
-
-  if [ "$repo" == "" ]; then
-    repo=~/FBGEMM
-  fi
-
-  __single_run () {
-    local py_version="$1"
-    local variant_version="$2"
-    local repo="$3"
-
-    local env_name="test_py${py_version}_pytorch_${pytorch_channel_version}_fbgemm_${fbgemm_gpu_channel_version}_${variant_type}/${variant_version}"
-    local env_name="${env_name//\//_}"
-    test_setup_conda_environment  "${env_name}" gcc "${py_version}" pip "${pytorch_channel_version}" "${variant_type}" "${variant_version}"   || return 1
-    install_fbgemm_gpu_pip        "${env_name}" "${fbgemm_gpu_channel_version}" "${variant_type}/${variant_version}"                                    || return 1
-    cd "${repo}"                                                                                                                                        || return 1
-
-    test_all_fbgemm_gpu_modules "${env_name}"
-    local retcode=$?
-
-    echo "################################################################################"
-    echo "# RUN SUMMARY"
-    echo "#"
-    echo "# Conda Environment       : ${env_name}"
-    echo "# Python Version          : ${py_version}"
-    echo "# PyTorch Version         : ${pytorch_channel_version}"
-    echo "# FBGEMM_GPU Version      : ${fbgemm_gpu_channel_version}"
-    echo "# Variant type / Version  : ${variant_type}/${variant_version}"
-    echo "#"
-    echo "# Run Result              : $([ $retcode -eq 0 ] && echo "PASSED" || echo "FAILED")"
-    echo "################################################################################"
-
-    if [ $retcode -eq 0 ]; then
-      # Clean out environment only if there were no errors
-      conda remove -n "$env_name" -y --all
-    fi
-
-    cd - || return 1
-    return $retcode
-  }
-
-  local python_versions=(
-    3.10
-    3.11
-    3.12
-    3.13
-  )
-
-  if [ "$variant_type" == "cuda" ]; then
-    local variant_versions=(
-      12.6.3
-      12.8.1
-    )
-  elif [ "$variant_type" == "genai" ]; then
-    local variant_versions=(
-      12.6.3
-      12.8.1
-      13.0.2
-    )
-  elif [ "$variant_type" == "rocm" ]; then
-    local variant_versions=(
-      6.3
-      6.4
-    )
-  elif [ "$variant_type" == "cpu" ]; then
-    local variant_versions=(
-      "none"
-    )
-  else
-    echo "[TEST] Invalid variant type: ${variant_type}"
-    return 1
-  fi
-
-  for py_ver in "${python_versions[@]}"; do
-    for var_ver in "${variant_versions[@]}"; do
-      __single_run "${py_ver}" "${var_ver}" "${repo}" || return 1
-    done
-  done
+  echo "[TEST] Successfully executed FBGEMM_GPU test module: ${test_file}"
 }

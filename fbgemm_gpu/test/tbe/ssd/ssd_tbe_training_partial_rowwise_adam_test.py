@@ -22,7 +22,6 @@ from hypothesis import assume, given, settings, Verbosity
 
 from .. import common  # noqa E402
 from ..common import gpu_unavailable, running_in_oss
-
 from .training_common import (
     default_strategies,
     MAX_EXAMPLES,
@@ -158,7 +157,7 @@ class SSDSplitTBEPartialRowwiseAdamTest(SSDSplitTableBatchedEmbeddingsTestCommon
         split_optimizer_states = self.split_optimizer_states_(emb)
 
         for f, t in self.get_physical_table_arg_indices_(emb.feature_table_map):
-            (m1, m2) = split_optimizer_states[t]
+            m1, m2 = split_optimizer_states[t]
             # Some optimizers have non-float momentum values
             # pyre-ignore[16]
             ref_grad = emb_ref[f].weight.grad.cpu().to_dense()
@@ -504,7 +503,7 @@ class SSDSplitTBEPartialRowwiseAdamTest(SSDSplitTableBatchedEmbeddingsTestCommon
 
         # Compare optimizer states
         for f, t in self.get_physical_table_arg_indices_(emb.feature_table_map):
-            (m1, m2) = split_optimizer_states[t]
+            m1, m2 = split_optimizer_states[t]
             # Some optimizers have non-float momentum values
             # pyre-ignore[16]
             ref_grad = emb_ref[f].weight.grad.cpu().to_dense()
@@ -712,7 +711,7 @@ class SSDSplitTBEPartialRowwiseAdamTest(SSDSplitTableBatchedEmbeddingsTestCommon
         # Compare optimizer states
         table_offset = 0
         for f, t in self.get_physical_table_arg_indices_(emb.feature_table_map):
-            (m1, m2) = split_optimizer_states[t]
+            m1, m2 = split_optimizer_states[t]
             # Some optimizers have non-float momentum values
             # pyre-ignore[16]
             ref_grad = emb_ref[f].weight.grad.cpu().to_dense()

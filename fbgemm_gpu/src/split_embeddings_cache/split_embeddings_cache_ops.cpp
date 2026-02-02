@@ -77,7 +77,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
   DISPATCH_TO_META("lxu_cache_lookup", lxu_cache_lookup_meta);
 }
 
-static auto raw_embedding_streamer =
+auto raw_embedding_streamer =
     torch::class_<fbgemm_gpu::RawEmbeddingStreamer>(
         "fbgemm",
         "RawEmbeddingStreamer")
@@ -108,6 +108,7 @@ static auto raw_embedding_streamer =
                 torch::arg("indices"),
                 torch::arg("weights"),
                 torch::arg("identities"),
+                torch::arg("runtime_meta"),
                 torch::arg("count"),
                 torch::arg("require_tensor_copy"),
                 torch::arg("blocking_tensor_copy"),

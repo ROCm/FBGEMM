@@ -143,8 +143,11 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
       Params const& params, ParamsProblemShape const& params_problem_shape,
       TensorStorage& storage,
       PipelineQ& pipeline_q, typename PipelineQ::PipelineState& pipeline_q_producer_state,
-      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state) {
+      PipelineKV& pipeline_kv, typename PipelineKV::PipelineState& pipeline_kv_producer_state,
+      int splitk_size = 0,
+      int start_k_offset = 0) {
 
+    // problem_shape.klen is now the split's length (set by apply_batch)
     int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
     mask_tile_count *= 2;
 
@@ -152,6 +155,16 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
     int thread_idx = warp_idx * 32 + (threadIdx.x % 32);
 
     using X = Underscore;
+
+    // Compute start_k for this split from blk_coord
+    // start_k = split_k_idx * splitk_size (relative to the offset pointer)
+    // start_k_offset accounts for sliding window and is applied to pointer directly
+    int start_k = 0;
+    if constexpr (!cute::is_constant<0, decltype(get<1>(blk_coord))>::value) {
+      if (splitk_size > 0) {
+        start_k = get<1>(blk_coord) * splitk_size;
+      }
+    }
 
     // this one is only executed by one thread, no need to elect_one
     auto blk_coord_cache = blk_coord;
@@ -221,13 +234,19 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
     load_q(q0_index, pipeline_q_producer_state);
     ++pipeline_q_producer_state;
 
+    // For K/V, we use the full seqlen_kv from params_problem_shape for gmem tensor construction,
+    // but offset the tensor by start_k to access the correct split's data.
+    // The identity tensor for bounds checking uses coordinates relative to the split.
     auto cK_t = make_identity_tensor(select<1,2>(TileShapeQK{}));
     auto cK = make_tensor(cK_t.data(), make_layout(get<0>(cK_t.layout()), get<1>(cK_t.layout()), make_layout(_2{}, get<1>(TileShapeQK{}) * stride<0>(cK_t))));
-    auto mK = make_tensor(make_gmem_ptr(params.ptr_cache_k), select<1,2,3>(problem_shape), params.dCacheK);
-    auto gK = local_tile(mK(_, _, get<2>(blk_coord_cache)), TileShapeQK{}, make_coord(_, _, _0{}), Step<X, _1, _1>{});
+    
+    // Use params_problem_shape for gmem tensor (has full seqlen_kv)
+    // Offset the K pointer directly by start_k_offset to access the correct split's data
+    auto mK = make_tensor(make_gmem_ptr(params.ptr_cache_k + start_k_offset * get<0>(params.dCacheK)), select<1,2,3>(params_problem_shape), params.dCacheK);
+    auto gK_full = local_tile(mK(_, _, get<2>(blk_coord_cache)), TileShapeQK{}, make_coord(_, _, _0{}), Step<X, _1, _1>{});
     auto sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
 
-    auto tSgK = thr_mma_qk.partition_B(gK);
+    auto tSgK = thr_mma_qk.partition_B(gK_full);
     auto tScK = thr_mma_qk.partition_B(cK);
 
     auto tSlK = thr_mma_qk.partition_B(make_tensor((Element*) nullptr, make_ordered_layout(select<1,2>(TileShapeQK{}), Step<_1, _0>{})));
@@ -242,18 +261,25 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
     auto tKgK = thr_copy_k.partition_S(tSgK);
     auto tKcK = thr_copy_k.partition_S(tScK);
 
-    int seqlen_cache_kv = get<1>(problem_shape) - ((params.ptr_new_k != nullptr) ? 1 : 0);
-    auto limitK = append<2>(seqlen_cache_kv, _128{});
+    // Get the split's seqlen from problem_shape (this is the local split length)
+    // For sliding window + split-K, we work entirely in split-local coordinates
+    int split_klen = get<1>(problem_shape);
+    int seqlen_cache_kv = split_klen - ((params.ptr_new_k != nullptr) ? 1 : 0);
+    
+    // For limit checking within the split, use split_klen
+    // The limit coordinates are relative to the split (0-based)
+    auto limitK = append<2>(split_klen, _128{});
 
     auto cV_t = make_identity_tensor(select<1,2>(TileShapePV{}));
     auto cV = make_tensor(cV_t.data(), make_layout(get<0>(cV_t.layout()), get<1>(cV_t.layout()), make_layout(_2{}, get<2>(TileShapePV{}) * stride<1>(cV_t))));
-    auto mV = make_tensor(make_gmem_ptr(params.ptr_cache_v), select<2,1,3>(problem_shape), select<1,0,2>(params.dCacheV));
-    auto gV = local_tile(mV(_, _, get<2>(blk_coord_cache)), TileShapePV{}, make_coord(_, _0{}, _), Step<X, _1, _1>{});
+    // Offset the V pointer directly by start_k_offset to access the correct split's data
+    auto mV = make_tensor(make_gmem_ptr(params.ptr_cache_v + start_k_offset * get<0>(params.dCacheV)), select<2,1,3>(params_problem_shape), select<1,0,2>(params.dCacheV));
+    auto gV_full = local_tile(mV(_, _, get<2>(blk_coord_cache)), TileShapePV{}, make_coord(_, _0{}, _), Step<X, _1, _1>{});
     auto sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
 
     typename CollectiveMmaPV::TiledMma mma_pv;
     ThrMMA thr_mma_pv = mma_pv.get_slice(0);
-    auto tOgV = thr_mma_pv.partition_B(gV);
+    auto tOgV = thr_mma_pv.partition_B(gV_full);
     auto tOcV = thr_mma_pv.partition_B(cV);
     auto tOlV = thr_mma_pv.partition_B(make_tensor((Element*) nullptr, make_layout(select<1,2>(TileShapePV{}))));
 
@@ -270,35 +296,47 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
 
     auto limitV = select<1,0>(limitK);
 
-    int full_tiles_cache = seqlen_cache_kv / get<1>(TileShapeQK{});
+    // Compute tile indices relative to the split (not global memory)
+    // Since we work in split-local coordinates, start_k_tile should be 0
+    // and we use split_klen for bounds checking
+    int tile_k = get<1>(TileShapeQK{});
+    int start_k_tile = start_k / tile_k;
+    int full_tiles_cache = seqlen_cache_kv / tile_k;
 
     bool has_new = params.ptr_new_k != nullptr;
-    Tensor mNewK = make_tensor(make_gmem_ptr(params.ptr_new_k), select<1,2,3>(problem_shape), params.dNewK);
-    Tensor mNewV = make_tensor(make_gmem_ptr(params.ptr_new_v), select<1,2,3>(problem_shape), params.dNewV);
+    Tensor mNewK = make_tensor(make_gmem_ptr(params.ptr_new_k), select<1,2,3>(params_problem_shape), params.dNewK);
+    Tensor mNewV = make_tensor(make_gmem_ptr(params.ptr_new_v), select<1,2,3>(params_problem_shape), params.dNewV);
     Tensor gNewK = mNewK(_, _, get<2>(blk_coord));
     Tensor gNewV = mNewV(_, _, get<2>(blk_coord));
 
-    auto load_k = [&](int k_index, auto& state) {
+    // load_k and load_v now take local tile indices (0-based within split)
+    // and compute the global tile index internally
+    auto load_k = [&](int local_k_index, auto& state) {
+      int global_k_index = start_k_tile + local_k_index;  // Convert to global tile index
+      
       pipeline_kv.producer_acquire(state);
 
-      if (k_index < full_tiles_cache) {
-        copy(tiled_copy_k, tKgK(_, _, _, _, k_index), tKsK(_, _, _, _, state.index()));
+      if (local_k_index < full_tiles_cache) {
+        copy(tiled_copy_k, tKgK(_, _, _, _, global_k_index), tKsK(_, _, _, _, state.index()));
         pipeline_kv.producer_commit(state, cutlass::arch::cpasync_barrier_arrive);
       } else {
         using Vec = uint128_t;
         Vec vzero = uint128_t(0, 0);
-        auto src = recast<Vec>(tKgK(_, _, _, _, k_index));
+        auto src = recast<Vec>(tKgK(_, _, _, _, global_k_index));
         auto dst = recast<Vec>(tKsK(_, _, _, _, state.index()));
         auto src2 = recast<Vec>(gNewK);
-        auto c = tKcK(_, _, _, _, k_index);
+        auto c = tKcK(_, _, _, _, local_k_index);  // Use local index for coordinate check
         int vlen = sizeof(Vec) / sizeof(Element);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(src); i++) {
           auto cc = c(vlen*i);
           Vec* dst_ptr = &dst(i);
           const Vec* src_ptr = &src(i);
+          // Coordinate check is relative to split's klen
           bool guard = elem_less(cc, limitK);
-          if (get<0>(cc) == seqlen_cache_kv && has_new) {
+          // Check for new K: global position = start_k + local position
+          int global_k_pos = start_k + get<0>(cc);
+          if (global_k_pos == seqlen_cache_kv && has_new) {
             src_ptr = &src2(_0{}, get<1>(cc) / vlen);
             guard = true;
           }
@@ -311,28 +349,33 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
       }
     };
 
-    auto load_v = [&](int v_index, auto& state) {
+    auto load_v = [&](int local_v_index, auto& state) {
+      int global_v_index = start_k_tile + local_v_index;  // Convert to global tile index
+      
       pipeline_kv.producer_acquire(state);
 
-      if (v_index < full_tiles_cache) {
-        copy(tiled_copy_v, tVgV(_, _, _, _, v_index), tVsV(_, _, _, _, state.index()));
+      if (local_v_index < full_tiles_cache) {
+        copy(tiled_copy_v, tVgV(_, _, _, _, global_v_index), tVsV(_, _, _, _, state.index()));
         pipeline_kv.producer_commit(state, cutlass::arch::cpasync_barrier_arrive);
       } else {
         using Vec = uint128_t;
         Vec vzero = uint128_t(0, 0);
-        auto src = recast<Vec>(tVgV(_, _, _, _, v_index));
+        auto src = recast<Vec>(tVgV(_, _, _, _, global_v_index));
         auto dst = recast<Vec>(tVsV(_, _, _, _, state.index()));
         auto src2 = recast<Vec>(gNewV);
         int vlen = sizeof(Vec) / sizeof(Element);
-        auto c = tVcV(_, _, _, _, v_index);
+        auto c = tVcV(_, _, _, _, local_v_index);  // Use local index for coordinate check
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(src); i++) {
           auto cc = c(vlen*i);
           Vec* dst_ptr = &dst(i);
           const Vec* src_ptr = &src(i);
+          // Coordinate check is relative to split's klen
           bool guard = elem_less(cc, limitV);
-          if (get<1>(cc) == seqlen_cache_kv && has_new) {
+          // Check for new V: global position = start_k + local position
+          int global_v_pos = start_k + get<1>(cc);
+          if (global_v_pos == seqlen_cache_kv && has_new) {
             src_ptr = &src2(_0{}, get<0>(cc) / vlen);
             guard = true;
           }
@@ -345,7 +388,7 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
       }
     };
 
-    // K1
+    // K1 
     int k_index = 0;
     int v_index = 0;
 
@@ -376,7 +419,14 @@ struct Sm100FmhaLoadCpAsyncWarpspecialized {
     ++pipeline_kv_producer_state;
     v_index += 1;
   
-    if (has_new) {
+    // Only write new K/V to cache if this split contains the last position
+    // For split-K, we check if this split's klen reaches the end of the effective window
+    // The effective window size (after offset) is computed by the caller
+    // New K/V should only be written by the split that processes the last token
+    if (has_new && (start_k + split_klen == seqlen_cache_kv + 1)) {
+      // Write new K/V at the position right after the cache
+      auto gK = local_tile(mK(_, _, get<2>(blk_coord_cache)), TileShapeQK{}, make_coord(_, _, _0{}), Step<X, _1, _1>{});
+      auto gV = local_tile(mV(_, _, get<2>(blk_coord_cache)), TileShapePV{}, make_coord(_, _0{}, _), Step<X, _1, _1>{});
       for (int i = thread_idx; i < get<2>(TileShape{}); i += 64) {
         gK(seqlen_cache_kv, i, 0) = gNewK(0, i);
         gV(i, seqlen_cache_kv, 0) = gNewV(0, i);

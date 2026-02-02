@@ -240,7 +240,7 @@ template <
   uint32_t WEIGHT_PTR_OFFSET,
   uint32_t STEP,
   uint32_t STEP_MASK,
-  uint32_t LOAD_GROUP_SIZE // unused
+  uint32_t LOAD_GROUP_SIZE
   >
 __noinline__ __device__ void process_all_indices_small_Ls(
     long* const smem,
@@ -353,7 +353,7 @@ __noinline__ __device__ void process_all_indices_small_Ls(
             reinterpret_cast<uintptr_t>(&lxu_cache_weights[cache_idx * max_D_cache]) :
             reinterpret_cast<uintptr_t>(&weights[indices[l] * load_D]);
         }
-        if (!std::is_same<emb_t, cache_t>::value) {
+        if constexpr (!std::is_same<emb_t, cache_t>::value) {
           cache_look_up_bits = ballot_sync(cache_idx != kCacheLocationMissing);
         }
       }
@@ -580,7 +580,7 @@ __noinline__ __device__ void process_all_indices_large_Ls(
             reinterpret_cast<uintptr_t>(&lxu_cache_weights[cache_idx * max_D_cache]) :
             reinterpret_cast<uintptr_t>(&weights[indices[l] * load_D]);
         }
-        if (!std::is_same<emb_t, cache_t>::value) {
+        if constexpr (!std::is_same<emb_t, cache_t>::value) {
           cache_look_up_bits = ballot_sync(cache_idx != kCacheLocationMissing);
           // Shift cache_look_up_bits based on group_id
           cache_look_up_bits >>= static_cast<uint32_t>(threadIdx.x / LOAD_GROUP_SIZE);

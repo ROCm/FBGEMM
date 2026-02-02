@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 
+# fmt:skip
 from fbgemm_gpu.enums import create_enums
 
 try:

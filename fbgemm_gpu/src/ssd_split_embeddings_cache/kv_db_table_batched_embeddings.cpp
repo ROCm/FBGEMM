@@ -23,8 +23,8 @@ namespace {
 /// PyTorch
 inline int64_t get_maybe_uvm_scalar(const at::Tensor& tensor) {
   return tensor.scalar_type() == at::ScalarType::Long
-      ? *(tensor.data_ptr<int64_t>())
-      : *(tensor.data_ptr<int32_t>());
+      ? *(tensor.const_data_ptr<int64_t>())
+      : *(tensor.const_data_ptr<int32_t>());
 }
 }; // namespace
 
@@ -47,22 +47,22 @@ QueueItem tensor_copy(
         FBGEMM_DISPATCH_INTEGRAL_TYPES(
             indices.scalar_type(), "tensor_copy", [&] {
               using index_t = scalar_t;
-              auto indices_addr = indices.data_ptr<index_t>();
-              auto new_indices_addr = new_indices.data_ptr<index_t>();
+              auto indices_addr = indices.const_data_ptr<index_t>();
+              auto new_indices_addr = new_indices.mutable_data_ptr<index_t>();
               std::copy(
                   indices_addr,
                   indices_addr + num_sets,
                   new_indices_addr); // dst_start
 
-              auto weights_addr = weights.data_ptr<value_t>();
-              auto new_weightss_addr = new_weights.data_ptr<value_t>();
+              auto weights_addr = weights.const_data_ptr<value_t>();
+              auto new_weightss_addr = new_weights.mutable_data_ptr<value_t>();
               std::copy(
                   weights_addr,
                   weights_addr + num_sets * weights.size(1),
                   new_weightss_addr); // dst_start
             });
       });
-  *new_count.data_ptr<int64_t>() = num_sets;
+  *new_count.mutable_data_ptr<int64_t>() = num_sets;
   return QueueItem{new_indices, new_weights, new_count, mode};
 }
 
@@ -161,9 +161,8 @@ void EmbeddingKVDB::update_cache_and_storage(
   if (l2_cache_) {
     auto evicted_tuples_opt = set_cache(indices, weights, count);
     if (evicted_tuples_opt.has_value()) {
-      auto& evicted_indices = std::get<0>(evicted_tuples_opt.value());
-      auto& evicted_weights = std::get<1>(evicted_tuples_opt.value());
-      auto& evicted_count = std::get<2>(evicted_tuples_opt.value());
+      const auto& [evicted_indices, evicted_weights, evicted_count] =
+          evicted_tuples_opt.value();
 
       set_kv_db_async(evicted_indices, evicted_weights, evicted_count, mode)
           .wait();
@@ -202,9 +201,8 @@ void EmbeddingKVDB::flush() {
                    << "]no items exist in L2 cache, flush nothing";
         return;
       }
-      auto& indices = std::get<0>(res_tuple_opt.value());
-      auto& weights = std::get<1>(res_tuple_opt.value());
-      count = std::get<2>(res_tuple_opt.value());
+      const auto& [indices, weights, new_count] = res_tuple_opt.value();
+      count = new_count;
 
       if (count->item<int64_t>() > 0) {
         set_kv_db_async(
@@ -293,6 +291,7 @@ void EmbeddingKVDB::stream_cuda(
         indices,
         weights,
         std::nullopt, /*identities*/
+        std::nullopt, /*runtime_meta*/
         count,
         true, /*require_tensor_copy*/
         blocking_tensor_copy);
@@ -513,7 +512,7 @@ std::shared_ptr<CacheContext> EmbeddingKVDB::get_cache(
   auto cache_context = std::make_shared<CacheContext>(num_lookups);
   FBGEMM_DISPATCH_INTEGRAL_TYPES(indices.scalar_type(), "get_cache", [&] {
     using index_t = scalar_t;
-    auto indices_addr = indices.data_ptr<index_t>();
+    auto indices_addr = indices.const_data_ptr<index_t>();
     auto num_shards = executor_tp_->numThreads();
 
     std::vector<folly::Future<folly::Unit>> futures;
@@ -528,22 +527,32 @@ std::shared_ptr<CacheContext> EmbeddingKVDB::get_cache(
     for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
       auto f =
           folly::via(executor_tp_.get())
-              .thenValue([=, &indices_addr, &indices, &row_ids_per_shard, this](
-                             folly::Unit) {
-                for (const auto& row_id : row_ids_per_shard[shard_id]) {
-                  auto emb_idx = indices_addr[row_id];
-                  if (emb_idx < 0) {
-                    continue;
-                  }
-                  auto cached_addr_opt = l2_cache_->get(indices[row_id]);
-                  if (cached_addr_opt.has_value()) { // cache hit
-                    cache_context->cached_addr_list[row_id] =
-                        cached_addr_opt.value();
-                    indices_addr[row_id] = -1; // mark to sentinel value
-                  } else { // cache miss
-                    cache_context->num_misses += 1;
-                  }
-                }
+              .thenValue([shard_id,
+                          indices,
+                          row_ids_per_shard,
+                          cache_context,
+                          this](folly::Unit) {
+                FBGEMM_DISPATCH_INTEGRAL_TYPES(
+                    indices.scalar_type(), "get_cache_inner", [&] {
+                      using inner_index_t = scalar_t;
+                      auto inner_indices_addr =
+                          indices.mutable_data_ptr<inner_index_t>();
+                      for (const auto& row_id : row_ids_per_shard[shard_id]) {
+                        auto emb_idx = inner_indices_addr[row_id];
+                        if (emb_idx < 0) {
+                          continue;
+                        }
+                        auto cached_addr_opt = l2_cache_->get(indices[row_id]);
+                        if (cached_addr_opt.has_value()) { // cache hit
+                          cache_context->cached_addr_list[row_id] =
+                              cached_addr_opt.value();
+                          inner_indices_addr[row_id] =
+                              -1; // mark to sentinel value
+                        } else { // cache miss
+                          cache_context->num_misses += 1;
+                        }
+                      }
+                    });
               });
       futures.push_back(std::move(f));
     }
@@ -608,7 +617,7 @@ EmbeddingKVDB::set_cache(
 
   FBGEMM_DISPATCH_INTEGRAL_TYPES(indices.scalar_type(), "set_cache", [&] {
     using index_t = scalar_t;
-    auto indices_addr = indices.data_ptr<index_t>();
+    auto indices_addr = indices.const_data_ptr<index_t>();
     const int64_t num_lookups = get_maybe_uvm_scalar(count);
     auto num_shards = executor_tp_->numThreads();
 
@@ -626,23 +635,26 @@ EmbeddingKVDB::set_cache(
     for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
       auto f =
           folly::via(executor_tp_.get())
-              .thenValue([=,
-                          &indices_addr,
-                          &indices,
-                          &weights,
-                          &row_ids_per_shard,
-                          this](folly::Unit) {
-                for (const auto& row_id : row_ids_per_shard[shard_id]) {
-                  auto emb_idx = indices_addr[row_id];
-                  if (emb_idx < 0) {
-                    continue;
-                  }
-                  if (!l2_cache_->put(indices[row_id], weights[row_id])) {
-                    XLOG_EVERY_MS(ERR, 1000)
-                        << "[TBE_ID" << unique_id_
-                        << "]Failed to insert into cache, this shouldn't happen";
-                  }
-                }
+              .thenValue([shard_id, indices, weights, row_ids_per_shard, this](
+                             folly::Unit) {
+                FBGEMM_DISPATCH_INTEGRAL_TYPES(
+                    indices.scalar_type(), "set_cache_inner", [&] {
+                      using inner_index_t = scalar_t;
+                      auto inner_indices_addr =
+                          indices.const_data_ptr<inner_index_t>();
+                      for (const auto& row_id : row_ids_per_shard[shard_id]) {
+                        auto emb_idx = inner_indices_addr[row_id];
+                        if (emb_idx < 0) {
+                          continue;
+                        }
+                        if (!l2_cache_->put(indices[row_id], weights[row_id])) {
+                          XLOG_EVERY_MS(ERR, 1000)
+                              << "[TBE_ID" << unique_id_
+                              << "]Failed to insert into cache, this shouldn't "
+                                 "happen";
+                        }
+                      }
+                    });
               });
       futures.push_back(std::move(f));
     }
@@ -668,7 +680,7 @@ folly::SemiFuture<std::vector<folly::Unit>> EmbeddingKVDB::cache_memcpy(
   FBGEMM_DISPATCH_FLOAT_HALF_AND_BYTE(
       weights.scalar_type(), "cache_memcpy", [&] {
         // std::vector<folly::coro::TaskWithExecutor<void>> tasks;
-        auto weights_data_ptr = weights.data_ptr<scalar_t>();
+        auto weights_data_ptr = weights.mutable_data_ptr<scalar_t>();
         auto num_shards = executor_tp_->numThreads();
         for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
           auto f =

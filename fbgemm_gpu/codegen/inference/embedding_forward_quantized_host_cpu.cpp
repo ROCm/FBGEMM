@@ -98,10 +98,10 @@ Tensor int_nbit_split_embedding_codegen_lookup_function_cpu_impl(
     int64_t pooling_mode,
     std::optional<Tensor> indice_weights,
     int64_t output_dtype,
-    std::optional<Tensor>
-        lxu_cache_weights, // Not used, to match cache interface for CUDA op
-    std::optional<Tensor>
-        lxu_cache_locations, // Not used, to match cache interface for CUDA op
+    std::optional<Tensor> lxu_cache_weights
+    [[maybe_unused]], // Not used, to match cache interface for CUDA op
+    std::optional<Tensor> lxu_cache_locations
+    [[maybe_unused]], // Not used, to match cache interface for CUDA op
     std::optional<int64_t> row_alignment,
     std::optional<int64_t> max_float8_D,
     std::optional<int64_t> fp8_exponent_bits,
@@ -192,10 +192,8 @@ Tensor int_nbit_split_embedding_codegen_lookup_function_cpu(
     int64_t pooling_mode,
     std::optional<Tensor> indice_weights,
     int64_t output_dtype,
-    std::optional<Tensor>
-        lxu_cache_weights, // Not used, to match cache interface for CUDA op
-    std::optional<Tensor>
-        lxu_cache_locations, // Not used, to match cache interface for CUDA op
+    std::optional<Tensor> lxu_cache_weights,
+    std::optional<Tensor> lxu_cache_locations,
     std::optional<int64_t> row_alignment,
     std::optional<int64_t> max_float8_D,
     std::optional<int64_t> fp8_exponent_bits,
@@ -412,9 +410,9 @@ class PrunedMapCPU : public torch::jit::CustomClassHolder {
   void insert(Tensor indices, Tensor dense_indices, Tensor offsets, int64_t T) {
     int32_t B = (offsets.size(0) - 1) / T;
     TORCH_CHECK(B > 0);
-    const auto* indices_acc = indices.data_ptr<int32_t>();
+    const auto* indices_acc = indices.const_data_ptr<int32_t>();
     auto* dense_indices_acc = dense_indices.data_ptr<int32_t>();
-    const auto* offsets_acc = offsets.data_ptr<int32_t>();
+    const auto* offsets_acc = offsets.const_data_ptr<int32_t>();
     maps_.resize(T);
     for (const auto t : c10::irange(T)) {
       auto& map = maps_[t];
@@ -447,9 +445,9 @@ class PrunedMapCPU : public torch::jit::CustomClassHolder {
     auto dense_indices = empty_like(indices);
 
     AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "PrunedMapCPU::lookup", [&] {
-      const auto* indices_acc = indices.data_ptr<index_t>();
+      const auto* indices_acc = indices.const_data_ptr<index_t>();
       auto* dense_indices_acc = dense_indices.data_ptr<index_t>();
-      const auto* offsets_acc = offsets.data_ptr<index_t>();
+      const auto* offsets_acc = offsets.const_data_ptr<index_t>();
 
       for (const auto t : c10::irange(T)) {
         auto& map = maps_[t];
@@ -563,7 +561,7 @@ struct TensorQueue : torch::CustomClassHolder {
     const std::string key = "queue";
     Tensor size_tensor;
     size_tensor = dict.at(std::string(key + "/size")).cpu();
-    const auto* size_tensor_acc = size_tensor.data_ptr<int64_t>();
+    const auto* size_tensor_acc = size_tensor.const_data_ptr<int64_t>();
     int64_t queue_size = size_tensor_acc[0];
 
     for (const auto index : c10::irange(queue_size)) {
@@ -623,8 +621,9 @@ struct TensorQueue : torch::CustomClassHolder {
       std::tuple<std::string, std::vector<Tensor>>>
   __obj_flatten__() {
     std::vector<Tensor> queue_vec;
+    queue_vec.reserve(queue_.size());
     for (const auto& val : queue_) {
-      queue_vec.push_back(val);
+      queue_vec.emplace_back(val);
     }
     return std::make_tuple(
         std::make_tuple("init_tensor", init_tensor_),

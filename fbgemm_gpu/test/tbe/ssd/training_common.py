@@ -10,7 +10,6 @@
 import math
 import unittest
 from enum import Enum
-
 from typing import Any, Optional, Union
 
 import hypothesis.strategies as st
@@ -309,7 +308,7 @@ class SSDSplitTableBatchedEmbeddingsTestCommon(unittest.TestCase):
             ],
             dim=0,
         )
-        (indices, offsets) = get_table_batched_offsets_from_dense(indices, L, sum(Bs))
+        indices, offsets = get_table_batched_offsets_from_dense(indices, L, sum(Bs))
 
         batch_size_per_feature_per_rank = Bs_rank_feature if mixed_B else None
 

@@ -54,8 +54,8 @@ namespace kv_mem {
         (source_tensor)->numel());                                      \
     (target_container)                                                  \
         .assign(                                                        \
-            (source_tensor)->data_ptr<data_type>(),                     \
-            (source_tensor)->data_ptr<data_type>() +                    \
+            (source_tensor)->const_data_ptr<data_type>(),               \
+            (source_tensor)->const_data_ptr<data_type>() +              \
                 (source_tensor)->numel());                              \
   } while (0)
 
@@ -150,8 +150,9 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
     if (hash_size_cumsum.has_value()) {
       TORCH_CHECK_TENSOR_PROPERTIES(hash_size_cumsum, at::ScalarType::Long);
       sub_table_hash_cumsum_.assign(
-          hash_size_cumsum->data_ptr<int64_t>() + 1, // skip the first 0
-          hash_size_cumsum->data_ptr<int64_t>() + hash_size_cumsum->numel());
+          hash_size_cumsum->const_data_ptr<int64_t>() + 1, // skip the first 0
+          hash_size_cumsum->const_data_ptr<int64_t>() +
+              hash_size_cumsum->numel());
     }
     if (feature_evict_config_.has_value() &&
         feature_evict_config_.value()->trigger_mode_ !=
@@ -277,7 +278,8 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                       using index_t = scalar_t;
                       CHECK(indices.is_contiguous());
                       auto indices_data_ptr = indices.data_ptr<index_t>();
-                      auto* metadata = metadata_tensor.data_ptr<int64_t>();
+                      auto* metadata =
+                          metadata_tensor.mutable_data_ptr<int64_t>();
                       {
                         auto before_read_lock_ts =
                             facebook::WallClockUtil::NowInUsecFast();
@@ -397,7 +399,7 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                       CHECK(weights.is_contiguous());
                       CHECK_EQ(indices.size(0), weights.size(0));
                       int64_t stride = weights.size(1);
-                      auto indices_data_ptr = indices.data_ptr<index_t>();
+                      auto indices_data_ptr = indices.const_data_ptr<index_t>();
                       auto weights_data_ptr = weights.data_ptr<weight_type>();
                       {
                         auto before_write_lock_ts =
@@ -768,8 +770,9 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                       CHECK(indices.is_contiguous());
                       CHECK(engege_rates.is_contiguous());
                       CHECK_EQ(indices.size(0), engege_rates.size(0));
-                      auto indices_data_ptr = indices.data_ptr<index_t>();
-                      auto engage_rate_ptr = engege_rates.data_ptr<float>();
+                      auto indices_data_ptr = indices.const_data_ptr<index_t>();
+                      auto engage_rate_ptr =
+                          engege_rates.const_data_ptr<float>();
                       {
                         auto before_write_lock_ts =
                             facebook::WallClockUtil::NowInUsecFast();
@@ -886,8 +889,8 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       int64_t width_offset = 0,
       std::optional<int64_t> width_length = std::nullopt) {
     auto read_count = count.scalar_type() == at::ScalarType::Long
-        ? *(count.data_ptr<int64_t>())
-        : *(count.data_ptr<int32_t>());
+        ? *(count.const_data_ptr<int64_t>())
+        : *(count.const_data_ptr<int32_t>());
     read_num_counts_ += read_count;
     // assuming get is called once each iteration and only by train
     // iteration(excluding state_dict)
@@ -1407,8 +1410,8 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
           // of
           // entries.
           auto conv_count = count.scalar_type() == at::ScalarType::Long
-              ? *(count.data_ptr<int64_t>())
-              : *(count.data_ptr<int32_t>());
+              ? *(count.const_data_ptr<int64_t>())
+              : *(count.const_data_ptr<int32_t>());
           auto indices_data_ptr = indices.data_ptr<index_t>();
           // There could be negative indices, which we should skipp
           for (int i = 0; i < conv_count; i++) {

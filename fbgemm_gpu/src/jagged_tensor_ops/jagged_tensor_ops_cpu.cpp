@@ -11,6 +11,9 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <torch/library.h>
+
+#include <cstddef>
+#include <functional>
 #include "ATen/Parallel.h"
 
 #include "common.h"
@@ -45,7 +48,7 @@ inline bool walk_down_tensor_storage_tree_except_last_(
   int j_temp = flattened_jagged_idx;
 #pragma unroll
   for (int d = NUM_JAGGED_DIM - 2; d >= 0; --d) {
-    const int jagged_size = jagged_dims[d + 1];
+    const auto jagged_size = jagged_dims[d + 1];
     jagged_coords[d] = j_temp % jagged_size;
     j_temp /= jagged_size;
   }
@@ -53,8 +56,8 @@ inline bool walk_down_tensor_storage_tree_except_last_(
   bool is_zero = false;
 #pragma unroll
   for (int d = 0; d < NUM_JAGGED_DIM - 1; ++d) {
-    const int begin = x_offsets[d][offset];
-    const int end = x_offsets[d][offset + 1];
+    const auto begin = x_offsets[d][offset];
+    const auto end = x_offsets[d][offset + 1];
     if (jagged_coords[d] >= end - begin) {
       is_zero = true;
       break;
@@ -122,7 +125,7 @@ void jagged_dense_elementwise_dense_output_kernel_(
       " != NUM_JAGGED_DIM, ",
       NUM_JAGGED_DIM);
 
-  const int outer_dense_size = y.size(0);
+  const auto outer_dense_size = y.size(0);
   TORCH_CHECK(
       outer_dense_size == x_offsets[0].numel() - 1,
       "outer_dense_size, ",
@@ -131,7 +134,7 @@ void jagged_dense_elementwise_dense_output_kernel_(
       x_offsets[0].numel() - 1);
   TORCH_CHECK(
       !NO_INNER_DENSE || y.size(-1) == 1, "y.size(-1), ", y.size(-1), " != 1");
-  const int inner_dense_size = NO_INNER_DENSE ? 1 : y.size(-1);
+  const auto inner_dense_size = NO_INNER_DENSE ? 1 : y.size(-1);
   TORCH_CHECK(
       inner_dense_size == x_values.size(-1),
       "inner_dense_size, ",
@@ -143,9 +146,9 @@ void jagged_dense_elementwise_dense_output_kernel_(
     return;
   }
 
-  const int jagged_folded_size =
-      y.numel() / (outer_dense_size * inner_dense_size);
-  const int jagged_innermost_size = y.size(-2);
+  const auto jagged_folded_size =
+      y.numel() / (static_cast<int64_t>(outer_dense_size * inner_dense_size));
+  const auto jagged_innermost_size = y.size(-2);
 
   // Canonicalize y and output to 3D, collapsing jagged dimensions.
   const Tensor y_reshaped = y.view({y.size(0), -1, y.size(-1)});
@@ -173,10 +176,12 @@ void jagged_dense_elementwise_dense_output_kernel_(
       // jagged dimension.
       int jiidx = 0;
       if (!is_zero) {
-        const int begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
-        const int end =
+        const auto begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
+        const auto end =
             x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base + 1];
-        for (; jiidx < std::min(end - begin, jagged_innermost_size); ++jiidx) {
+        for (; jiidx <
+             std::min(end - begin, static_cast<index_t>(jagged_innermost_size));
+             ++jiidx) {
           int jidx = joidx * jagged_innermost_size + jiidx;
           if (NO_INNER_DENSE) {
             output_accessor[oidx][jidx][0] =
@@ -227,7 +232,7 @@ void jagged_dense_elementwise_dense_output_(
         index_t>(x_values, x_offsets, y, output, f, padding_value); \
   }
 
-  const int num_jagged_dim = y.dim() - 2;
+  const auto num_jagged_dim = y.dim() - 2;
   JAGGED_TENSOR_DISPATCH_DIMS();
 
 #undef INVOKE_KERNEL_WITH_DIM
@@ -269,7 +274,7 @@ void jagged_dense_elementwise_jagged_output_kernel_(
       " != NUM_JAGGED_DIM, ",
       NUM_JAGGED_DIM);
 
-  const int outer_dense_size = y.size(0);
+  const auto outer_dense_size = y.size(0);
   TORCH_CHECK(
       outer_dense_size == x_offsets[0].numel() - 1,
       "outer_dense_size, ",
@@ -278,7 +283,7 @@ void jagged_dense_elementwise_jagged_output_kernel_(
       x_offsets[0].numel() - 1);
   TORCH_CHECK(
       !NO_INNER_DENSE || y.size(-1) == 1, "y.size(-1), ", y.size(-1), " != 1");
-  const int inner_dense_size = NO_INNER_DENSE ? 1 : y.size(-1);
+  const auto inner_dense_size = NO_INNER_DENSE ? 1 : y.size(-1);
   TORCH_CHECK(
       inner_dense_size == x_values.size(-1),
       "inner_dense_size, ",
@@ -290,9 +295,9 @@ void jagged_dense_elementwise_jagged_output_kernel_(
     return;
   }
 
-  const int jagged_folded_size =
-      y.numel() / (outer_dense_size * inner_dense_size);
-  const int jagged_innermost_size = y.size(-2);
+  const auto jagged_folded_size =
+      y.numel() / (static_cast<int64_t>(outer_dense_size * inner_dense_size));
+  const auto jagged_innermost_size = y.size(-2);
 
   // Canonicalize y to 3D, collapsing jagged dimensions.
   Tensor y_reshaped = y.view({y.size(0), -1, y.size(-1)});
@@ -317,11 +322,11 @@ void jagged_dense_elementwise_jagged_output_kernel_(
       // As a perf optimization, a separate loop level for the inner-most
       // jagged dimension.
       if (!is_zero) {
-        const int begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
-        const int end =
+        const auto begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
+        const auto end =
             x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base + 1];
-        for (int jiidx = 0;
-             jiidx < std::min(end - begin, jagged_innermost_size);
+        for (int jiidx = 0; jiidx <
+             std::min(end - begin, static_cast<index_t>(jagged_innermost_size));
              ++jiidx) {
           int jidx = joidx * jagged_innermost_size + jiidx;
           if (NO_INNER_DENSE) {
@@ -467,7 +472,8 @@ Tensor dense_to_jagged_forward(
   if (total_L.has_value()) {
     total_L_computed = total_L.value();
   } else {
-    total_L_computed = (int64_t)offsets.back().max().item<int64_t>();
+    total_L_computed =
+        static_cast<int64_t>(offsets.back().max().item<int64_t>());
   }
   auto values = at::empty_symint({total_L_computed, D}, dense.options());
   auto output = at::zeros_symint({total_L_computed, D}, dense.options());
@@ -526,7 +532,7 @@ void jagged_jagged_elementwise_dense_output_kernel_(
       " != NUM_JAGGED_DIM, ",
       NUM_JAGGED_DIM);
 
-  const int outer_dense_size = output.size(0);
+  const auto outer_dense_size = output.size(0);
   TORCH_CHECK(
       outer_dense_size == x_offsets[0].numel() - 1,
       "outer_dense_size, ",
@@ -534,7 +540,7 @@ void jagged_jagged_elementwise_dense_output_kernel_(
       " != x_offsets[0].numel() - 1, ",
       x_offsets[0].numel() - 1);
   TORCH_CHECK(!NO_INNER_DENSE || output.size(-1) == 1);
-  const int inner_dense_size = NO_INNER_DENSE ? 1 : output.size(-1);
+  const auto inner_dense_size = NO_INNER_DENSE ? 1 : output.size(-1);
   TORCH_CHECK(
       inner_dense_size == x_values.size(-1),
       "inner_dense_size, ",
@@ -546,9 +552,9 @@ void jagged_jagged_elementwise_dense_output_kernel_(
     return;
   }
 
-  const int jagged_folded_size =
-      output.numel() / (outer_dense_size * inner_dense_size);
-  const int jagged_innermost_size = output.size(-2);
+  const auto jagged_folded_size = output.numel() /
+      (static_cast<int64_t>(outer_dense_size * inner_dense_size));
+  const auto jagged_innermost_size = output.size(-2);
 
   // Canonicalize output to 3D, collapsing jagged dimensions.
   Tensor output_reshaped = output.view({output.size(0), -1, output.size(-1)});
@@ -575,10 +581,12 @@ void jagged_jagged_elementwise_dense_output_kernel_(
       // jagged dimension.
       int jiidx = 0;
       if (!is_zero) {
-        const int begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
-        const int end =
+        const auto begin = x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base];
+        const auto end =
             x_offsets_accessors[NUM_JAGGED_DIM - 1][offset_base + 1];
-        for (; jiidx < std::min(end - begin, jagged_innermost_size); ++jiidx) {
+        for (; jiidx <
+             std::min(end - begin, static_cast<index_t>(jagged_innermost_size));
+             ++jiidx) {
           int jidx = joidx * jagged_innermost_size + jiidx;
           if (NO_INNER_DENSE) {
             output_accessor[oidx][jidx][0] =
@@ -627,7 +635,7 @@ void jagged_jagged_elementwise_dense_output_(
         index_t>(x_values, x_offsets, y_values, output, f, padding_value); \
   }
 
-  const int num_jagged_dim = output.dim() - 2;
+  const auto num_jagged_dim = output.dim() - 2;
   JAGGED_TENSOR_DISPATCH_DIMS();
 
 #undef INVOKE_KERNEL_WITH_DIM
@@ -661,14 +669,14 @@ std::tuple<Tensor, Tensor> jagged_dense_elementwise_mul_backward(
             x_offsets,
             y,
             x_values_grad,
-            [](scalar_t x, scalar_t y) -> scalar_t { return x * y; });
+            std::multiplies<scalar_t>());
 
         jagged_jagged_elementwise_dense_output_<scalar_t>(
             grad_output,
             x_offsets,
             x_values,
             y_grad,
-            [](scalar_t x, scalar_t y) -> scalar_t { return x * y; });
+            std::multiplies<scalar_t>());
       });
 
   return {x_values_grad, y_grad};
@@ -694,14 +702,15 @@ void dense_vec_jagged_2d_bmm(
     const pta::TensorAccessor<scalar_t, 2>& a_values,
     const pta::TensorAccessor<index_t, 1>& a_offsets,
     pta::TensorAccessor<scalar_t, 2> output) {
-  const int B = a_offsets.size(0) - 1;
-  const int H = v.size(0) / B;
-  const int max_L = v.size(1);
-  const int D = output.size(1);
+  const auto B = a_offsets.size(0) - 1;
+  const auto H = v.size(0) / B;
+  const auto max_L = v.size(1);
+  const auto D = output.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = a_offsets[b];
-    const int row_end = a_offsets[b + 1];
-    const int length = std::min(row_end - row_start, max_L);
+    const auto row_start = a_offsets[b];
+    const auto row_end = a_offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
     if (length == 0) {
       for (const auto h : c10::irange(H)) {
         for (const auto d : c10::irange(D)) {
@@ -731,14 +740,15 @@ void dense_vec_jagged_2d_transposed_bmm(
     const pta::TensorAccessor<scalar_t, 2>& a_values,
     const pta::TensorAccessor<index_t, 1>& a_offsets,
     pta::TensorAccessor<scalar_t, 2> output) {
-  const int B = a_offsets.size(0) - 1;
-  const int H = v.size(0) / B;
-  const int max_L = output.size(1);
-  const int D = v.size(1);
+  const auto B = a_offsets.size(0) - 1;
+  const auto H = v.size(0) / B;
+  const auto max_L = output.size(1);
+  const auto D = v.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = a_offsets[b];
-    const int row_end = a_offsets[b + 1];
-    const int length = std::min(row_end - row_start, max_L);
+    const auto row_start = a_offsets[b];
+    const auto row_end = a_offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
 
     if (D == 0) {
       for (const auto h : c10::irange(H)) {
@@ -771,16 +781,16 @@ void outer_prod_jagged_2d_output(
     const pta::TensorAccessor<scalar_t, 2>& y,
     const pta::TensorAccessor<index_t, 1>& offsets,
     pta::TensorAccessor<scalar_t, 2> output_values) {
-  const int B = offsets.size(0) - 1;
-  const int H = x.size(0) / B;
-  const int max_L = x.size(1);
-  const int D = y.size(1);
+  const auto B = offsets.size(0) - 1;
+  const auto H = x.size(0) / B;
+  const auto max_L = x.size(1);
+  const auto D = y.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = offsets[b];
-    const int row_end = offsets[b + 1];
-    const int length = row_end - row_start;
+    const auto row_start = offsets[b];
+    const auto row_end = offsets[b + 1];
+    const auto length = row_end - row_start;
     for (const auto h : c10::irange(H)) {
-      for (int l = 0; l < std::min(length, max_L); ++l) {
+      for (int l = 0; l < std::min(length, static_cast<index_t>(max_L)); ++l) {
         for (const auto d : c10::irange(D)) {
           output_values[row_start + l][h * D + d] =
               x[b * H + h][l] * y[b * H + h][d];
@@ -798,16 +808,16 @@ Tensor batched_dense_vec_jagged_2d_mul_forward(
   TENSOR_ON_CPU(a_values);
   TENSOR_ON_CPU(a_offsets);
 
-  const int B = a_offsets.numel() - 1;
+  const auto B = a_offsets.numel() - 1;
   TORCH_CHECK(
       B == 0 || v.size(0) % B == 0,
       "B, ",
       B,
       " doesn't divide v.size(0), ",
       v.size(0));
-  const int H = B == 0 ? 1 : v.size(0) / B;
-  const int D = a_values.size(-1) / H;
-  auto output = at::empty({B * H, D}, v.options());
+  const auto H = B == 0 ? 1 : v.size(0) / B;
+  const auto D = a_values.size(-1) / H;
+  auto output = at::empty({static_cast<long>(B * H), D}, v.options());
 
   if (B > 0 && D > 0) {
     const auto func_name = "batched_dense_vec_jagged_2d_mul_forward";
@@ -837,8 +847,8 @@ std::tuple<Tensor, Tensor> batched_dense_vec_jagged_2d_mul_backward(
   Tensor a_values_grad = at::zeros_like(a_values);
   Tensor v_grad = at::empty_like(v);
 
-  const int B = a_offsets.numel() - 1;
-  const int D = grad_output.size(-1);
+  const auto B = a_offsets.numel() - 1;
+  const auto D = grad_output.size(-1);
 
   if (B > 0 && D > 0) {
     const auto func_name = "batched_dense_vec_jagged_2d_mul_backward";
@@ -1004,12 +1014,16 @@ std::tuple<Tensor, Tensor> masked_select_jagged_1d(
               const int32_t num_outputs = mask.sum().item<int32_t>();
               masked_values = at::empty({num_outputs}, values.options());
 
-              const auto values_ptr = values_contiguous->data_ptr<scalar_t>();
-              const auto lengths_ptr = lengths_contiguous->data_ptr<index_t>();
-              const auto mask_ptr = mask_contiguous->data_ptr<bool>();
+              const auto values_ptr =
+                  values_contiguous->const_data_ptr<scalar_t>();
+              const auto lengths_ptr =
+                  lengths_contiguous->const_data_ptr<index_t>();
+              const auto mask_ptr = mask_contiguous->const_data_ptr<bool>();
 
-              auto masked_values_ptr = masked_values.data_ptr<scalar_t>();
-              auto masked_lengths_ptr = masked_lengths.data_ptr<index_t>();
+              auto masked_values_ptr =
+                  masked_values.mutable_data_ptr<scalar_t>();
+              auto masked_lengths_ptr =
+                  masked_lengths.mutable_data_ptr<index_t>();
 
               int64_t input_offset = 0;
               int64_t output_offset = 0;
@@ -1045,7 +1059,7 @@ jagged_2d_to_dense_forward_cpu(Tensor values, Tensor offsets, int64_t max_L) {
       /*padding_value=*/0);
 }
 
-std::vector<Tensor> stacked_jagged_1d_to_dense_cpu(
+static std::vector<Tensor> stacked_jagged_1d_to_dense_cpu(
     Tensor values,
     Tensor lengths,
     const std::vector<int64_t>& offset_per_key,
@@ -1065,8 +1079,10 @@ std::vector<Tensor> stacked_jagged_1d_to_dense_cpu(
     AT_DISPATCH_INDEX_TYPES(
         lengths_contig.scalar_type(), "length_to_offset_cpu_kernel", [&] {
           index_t cumsum = 0;
-          const auto* input_ptr = &(lengths_contig.data_ptr<index_t>()[t * B]);
-          auto* output_ptr = offsets.data_ptr<index_t>() + 1;
+          const auto* input_ptr =
+              &(lengths_contig
+                    .const_data_ptr<index_t>()[static_cast<ptrdiff_t>(t * B)]);
+          auto* output_ptr = offsets.mutable_data_ptr<index_t>() + 1;
           for (const auto i : c10::irange(B)) {
             cumsum += input_ptr[i];
             output_ptr[i] = cumsum;
@@ -1104,8 +1120,10 @@ std::vector<Tensor> stacked_jagged_2d_to_dense_cpu(
     AT_DISPATCH_INDEX_TYPES(
         lengths_contig.scalar_type(), "length_to_offset_cpu_kernel", [&] {
           index_t cumsum = 0;
-          const auto* input_ptr = &(lengths_contig.data_ptr<index_t>()[t * B]);
-          auto* output_ptr = offsets.data_ptr<index_t>() + 1;
+          const auto* input_ptr =
+              &(lengths_contig
+                    .const_data_ptr<index_t>()[static_cast<ptrdiff_t>(t * B)]);
+          auto* output_ptr = offsets.mutable_data_ptr<index_t>() + 1;
           for (const auto i : c10::irange(B)) {
             cumsum += input_ptr[i];
             output_ptr[i] = cumsum;
@@ -1300,7 +1318,7 @@ void jagged_index_add_2d_kernel(
       auto& lock = locks[output_offset];
       while (lock.test_and_set(std::memory_order_acquire)) {
         // For C++20
-#if defined(__cpp_lib_atomic_flag_test)
+#ifdef __cpp_lib_atomic_flag_test
         while (lock.test(std::memory_order_relaxed))
 #endif
           ;
@@ -1360,12 +1378,13 @@ void jagged_softmax_kernel(
     const at::TensorAccessor<index_t, 1>& offsets,
     at::TensorAccessor<scalar_t, 2> output,
     const int64_t max_L) {
-  const int B = offsets.size(0) - 1;
-  const int D = values.size(1);
+  const auto B = offsets.size(0) - 1;
+  const auto D = values.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = offsets[b];
-    const int row_end = offsets[b + 1];
-    const int length = std::min(row_end - row_start, (int)max_L);
+    const auto row_start = offsets[b];
+    const auto row_end = offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
 
     if (length == 0)
       continue;
@@ -1395,8 +1414,8 @@ Tensor jagged_softmax_forward(
     const int64_t max_L) {
   TENSOR_ON_CPU(values);
   TENSOR_ON_CPU(offsets);
-  const int B = offsets.numel() - 1;
-  const int D = values.size(1);
+  const auto B = offsets.numel() - 1;
+  const auto D = values.size(1);
   auto output = at::empty_like(values);
 
   if (B > 0 && D > 0) {
@@ -1422,12 +1441,13 @@ void jagged_softmax_backward_kernel(
     const at::TensorAccessor<index_t, 1>& offsets,
     at::TensorAccessor<scalar_t, 2> grad_input,
     const int64_t max_L) {
-  const int B = offsets.size(0) - 1;
-  const int D = grad_output.size(1);
+  const auto B = offsets.size(0) - 1;
+  const auto D = grad_output.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = offsets[b];
-    const int row_end = offsets[b + 1];
-    const int length = std::min(row_end - row_start, (int)max_L);
+    const auto row_start = offsets[b];
+    const auto row_end = offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
     if (length == 0)
       continue;
     for (const auto d : c10::irange(D)) {
@@ -1453,8 +1473,8 @@ Tensor jagged_softmax_backward(
   TENSOR_ON_CPU(grad_output);
   TENSOR_ON_CPU(output);
   TENSOR_ON_CPU(offsets);
-  const int B = offsets.numel() - 1;
-  const int D = grad_output.size(1);
+  const auto B = offsets.numel() - 1;
+  const auto D = grad_output.size(1);
   auto grad_input = at::empty_like(grad_output);
 
   if (B > 0 && D > 0) {
@@ -1483,13 +1503,14 @@ void jagged_jagged_bmm_kernel(
     const at::TensorAccessor<index_t, 1>& offsets,
     at::TensorAccessor<scalar_t, 3> output,
     const int64_t max_L) {
-  const int B = offsets.size(0) - 1;
-  const int M = x_values.size(1);
-  const int N = y_values.size(1);
+  const auto B = offsets.size(0) - 1;
+  const auto M = x_values.size(1);
+  const auto N = y_values.size(1);
   for (const auto b : c10::irange(B)) {
-    const int row_start = offsets[b];
-    const int row_end = offsets[b + 1];
-    const int length = std::min(row_end - row_start, (int)max_L);
+    const auto row_start = offsets[b];
+    const auto row_end = offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
     for (const auto m : c10::irange(M)) {
       for (const auto n : c10::irange(N)) {
         at::acc_type<scalar_t, true> acc = 0;
@@ -1510,9 +1531,9 @@ Tensor jagged_jagged_bmm_forward(
   TENSOR_ON_CPU(x_values);
   TENSOR_ON_CPU(y_values);
   TENSOR_ON_CPU(offsets);
-  const int B = offsets.size(0) - 1;
-  const int M = x_values.size(-1);
-  const int N = y_values.size(-1);
+  const auto B = offsets.size(0) - 1;
+  const auto M = x_values.size(-1);
+  const auto N = y_values.size(-1);
   auto output = at::zeros({B, M, N}, x_values.options());
   if (B > 0 && M > 0 && N > 0) {
     AT_DISPATCH_INDEX_TYPES(
@@ -1540,13 +1561,14 @@ void jagged_dense_bmm_kernel(
     at::TensorAccessor<scalar_t, 2> output,
     const int64_t max_L) {
   // [sum_B, K] x [B, K, N] -> [B, L, N] -> [sum_B, N]
-  const int B = x_offsets.size(0) - 1;
-  const int K = x_values.size(1);
-  const int N = y.size(2);
+  const auto B = x_offsets.size(0) - 1;
+  const auto K = x_values.size(1);
+  const auto N = y.size(2);
   for (const auto b : c10::irange(B)) {
-    const int row_start = x_offsets[b];
-    const int row_end = x_offsets[b + 1];
-    const int length = std::min(row_end - row_start, (int)max_L);
+    const auto row_start = x_offsets[b];
+    const auto row_end = x_offsets[b + 1];
+    const auto length =
+        std::min(row_end - row_start, static_cast<index_t>(max_L));
     for (const auto l : c10::irange(length)) {
       for (const auto n : c10::irange(N)) {
         at::acc_type<scalar_t, true> acc = 0;
@@ -1567,10 +1589,10 @@ Tensor jagged_dense_bmm_forward(
   TENSOR_ON_CPU(x_values);
   TENSOR_ON_CPU(x_offsets);
   TENSOR_ON_CPU(y);
-  const int B = x_offsets.size(0) - 1;
-  const int M = x_values.size(-1);
-  const int N = y.size(-1);
-  const int total_L = x_values.size(0);
+  const auto B = x_offsets.size(0) - 1;
+  const auto M = x_values.size(-1);
+  const auto N = y.size(-1);
+  const auto total_L = x_values.size(0);
   auto output = at::zeros({total_L, N}, x_values.options());
   if (B > 0 && M > 0 && N > 0) {
     AT_DISPATCH_INDEX_TYPES(
@@ -1693,9 +1715,9 @@ Tensor get_source_mask_cpu(
   // Generate the mask
   AT_DISPATCH_INDEX_TYPES(
       num_sources.scalar_type(), "get_source_mask_cpu", [&] {
-        const index_t* num_sources_data = num_sources.data_ptr<index_t>();
-        const index_t* num_targets_data = num_targets.data_ptr<index_t>();
-        bool* output_data = output.data_ptr<bool>();
+        const index_t* num_sources_data = num_sources.const_data_ptr<index_t>();
+        const index_t* num_targets_data = num_targets.const_data_ptr<index_t>();
+        bool* output_data = output.mutable_data_ptr<bool>();
 
         int64_t offset = 0;
         for (int64_t i = 0; i < batch_size; ++i) {
@@ -1711,6 +1733,50 @@ Tensor get_source_mask_cpu(
           offset += n_targets;
         }
       });
+
+  return output;
+}
+
+static Tensor repeat_arange_cpu(const Tensor& lengths) {
+  TENSOR_ON_CPU(lengths);
+
+  const auto batch_size = lengths.size(0);
+
+  if (batch_size == 0) {
+    return at::empty({0}, lengths.options());
+  }
+
+  // Compute total output size
+  int64_t output_size = 0;
+  AT_DISPATCH_INDEX_TYPES(lengths.scalar_type(), "repeat_arange_cpu_size", [&] {
+    const index_t* lengths_data = lengths.const_data_ptr<index_t>();
+    for (int64_t i = 0; i < batch_size; ++i) {
+      output_size += static_cast<int64_t>(lengths_data[i]);
+    }
+  });
+
+  if (output_size == 0) {
+    return at::empty({0}, lengths.options());
+  }
+
+  // Create output tensor
+  Tensor output = at::empty({output_size}, lengths.options());
+
+  // Generate the repeated arange
+  AT_DISPATCH_INDEX_TYPES(lengths.scalar_type(), "repeat_arange_cpu", [&] {
+    const index_t* lengths_data = lengths.const_data_ptr<index_t>();
+    index_t* output_data = output.data_ptr<index_t>();
+
+    int64_t offset = 0;
+    for (int64_t i = 0; i < batch_size; ++i) {
+      const index_t length = lengths_data[i];
+      // Fill with 0, 1, 2, ..., length-1
+      for (index_t j = 0; j < length; ++j) {
+        output_data[offset + j] = j;
+      }
+      offset += length;
+    }
+  });
 
   return output;
 }
@@ -1859,6 +1925,7 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "jagged_acc_weights_and_counts(Tensor weights, Tensor reverse_indices, int num_unique_indices) -> Tensor");
   m.def(
       "get_source_mask(Tensor num_sources, Tensor num_targets, SymInt output_size) -> Tensor");
+  m.def("repeat_arange(Tensor lengths) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
@@ -1930,6 +1997,7 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
       "jagged_acc_weights_and_counts",
       fbgemm_gpu::jagged_acc_weights_and_counts_cpu);
   DISPATCH_TO_CPU("get_source_mask", fbgemm_gpu::get_source_mask_cpu);
+  DISPATCH_TO_CPU("repeat_arange", fbgemm_gpu::repeat_arange_cpu);
 }
 
 TORCH_LIBRARY_IMPL(fbgemm, CompositeExplicitAutograd, m) {

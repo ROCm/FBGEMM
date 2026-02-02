@@ -149,12 +149,13 @@ void dram_kv_embedding_inplace_update_cpu(
   auto embedding_log_inplace_update_stats_method =
       tbe_module->find_method("log_inplace_update_stats");
 
-  const uint8_t* weights_tys_ptr = weights_tys.data_ptr<uint8_t>();
-  const int32_t* D_offsets_ptr = D_offsets.data_ptr<int32_t>();
-  const uint8_t* update_weights_ptr = update_weights.data_ptr<uint8_t>();
-  const int32_t* update_table_idx_ptr = update_table_idx.data_ptr<int32_t>();
-  const int64_t* update_row_idx_ptr = update_row_idx.data_ptr<int64_t>();
-  const int64_t* update_offsets_ptr = update_offsets.data_ptr<int64_t>();
+  const uint8_t* weights_tys_ptr = weights_tys.const_data_ptr<uint8_t>();
+  const int32_t* D_offsets_ptr = D_offsets.const_data_ptr<int32_t>();
+  uint8_t* update_weights_ptr = update_weights.mutable_data_ptr<uint8_t>();
+  const int32_t* update_table_idx_ptr =
+      update_table_idx.const_data_ptr<int32_t>();
+  const int64_t* update_row_idx_ptr = update_row_idx.const_data_ptr<int64_t>();
+  const int64_t* update_offsets_ptr = update_offsets.const_data_ptr<int64_t>();
 
   int64_t window_start = 0;
   while (window_start < N) {
@@ -172,22 +173,24 @@ void dram_kv_embedding_inplace_update_cpu(
     int32_t D_bytes =
         nbit::padded_row_size_in_bytes(D, weight_ty, row_alignment);
 
-    uint8_t* batched_weights_ptr = const_cast<uint8_t*>(
-        update_weights_ptr + update_offsets_ptr[window_start]);
+    uint8_t* batched_weights_ptr =
+        update_weights_ptr + update_offsets_ptr[window_start];
     auto weights_tensor = at::from_blob(
         batched_weights_ptr,
         {window_size, D_bytes},
         at::TensorOptions().dtype(at::kByte));
 
-    int64_t* row_ids_ptr =
-        const_cast<int64_t*>(update_row_idx_ptr + window_start);
+    const int64_t* row_ids_ptr = update_row_idx_ptr + window_start;
     auto row_id_tensor = at::from_blob(
-        row_ids_ptr, {window_size}, at::TensorOptions().dtype(at::kLong));
+        const_cast<int64_t*>(row_ids_ptr),
+        {window_size},
+        at::TensorOptions().dtype(at::kLong));
 
     (*embedding_inplace_update_method)(
         {cur_table, row_id_tensor, weights_tensor});
     window_start = window_end;
   }
+
   if (embedding_log_inplace_update_stats_method.has_value()) {
     (*embedding_log_inplace_update_stats_method)({});
   }

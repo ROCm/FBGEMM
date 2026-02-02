@@ -111,6 +111,16 @@ else(MSVC)
   set(MSVC_BOOL False)
 endif(MSVC)
 
+# Set defaults for GCC and GCC+AArch64 builds
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -fno-trapping-math")
+  set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -fno-trapping-math")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+    set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -ftree-vectorize")
+    set(CMAKE_CXX_FLAGS_INIT "${CMAKE_CXX_FLAGS_INIT} -ftree-vectorize")
+  endif()
+endif()
+
 ################################################################################
 # GNU F2H_IEEE Support
 ################################################################################
@@ -153,13 +163,6 @@ if(NOT MSVC)
     src/fp32/FbgemmFP32UKernelsAvx512_256.cc
     PROPERTIES COMPILE_FLAGS "-masm=intel")
 
-  # Workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80947
-  if(CMAKE_COMPILER_IS_GNUCXX AND (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.3.0))
-    set_source_files_properties(
-      src/GenerateKernelU8S8S32ACC32.cc
-      src/GenerateKernelDirectConvU8S8S32ACC32.cc
-      PROPERTIES COMPILE_FLAGS "-Wno-attributes")
-  endif()
 endif()
 
 set(fbgemm_arm_defs)
@@ -314,9 +317,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
     SRCS
       ${FBGEMM_NEON_SRCS}
     CC_FLAGS
-      -ftree-vectorize
-      -fno-trapping-math
-      -Wignored-qualifiers
       ${fbgemm_fml_flags}
     DEFINITIONS
       ${fbgemm_arm_defs}
@@ -369,9 +369,6 @@ if(FBGEMM_BUILD_SVE)
     SRCS
       ${FBGEMM_SVE_SRCS}
     CC_FLAGS
-      -ftree-vectorize
-      -fno-trapping-math
-      -Wignored-qualifiers
       -Wno-inline-asm
       -Wno-asm-operand-widths
       ${fbgemm_sve_flags}
@@ -405,8 +402,6 @@ if(NOT DISABLE_FBGEMM_AUTOVEC)
       OBJECT
     SRCS
       ${FBGEMM_AUTOVEC_SRCS}
-    CC_FLAGS
-      -ftree-vectorize
     ENABLE_IPO
       ${FBGEMM_USE_IPO}
     DEPS

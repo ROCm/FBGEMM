@@ -124,7 +124,7 @@ AdjacencyMatrix<Node> get_intermediate_node(
     return
         [=](Node src, Node dst) { return assignments[dst * world_size + src]; };
   } else {
-    return [](Node, Node) { return -1; };
+    return [](Node /* src */, Node /* dst */) { return -1; };
   }
 }
 
@@ -195,7 +195,7 @@ void all_to_one(
       get_intermediate_node(fbgemm_gpu::get_nvlink_matrix());
   for (const auto i : c10::irange(input_tensors.size())) {
     const auto& src = input_tensors.at(i);
-    Node src_device_id = src.get_device();
+    auto src_device_id = src.get_device();
     auto intermediate_node =
         intermediate_nodes(src_device_id, target_device_index);
     if (intermediate_node != -1) {
@@ -225,9 +225,9 @@ void all_to_one(
            .transfer_cuda_event =
                std::make_unique<GPUEvent>(cudaEventDisableTiming)});
       AT_CUDA_CHECK(cudaMemcpy2DAsync(
-          dst.data_ptr(),
+          dst.mutable_data_ptr(),
           dst.stride(0) * dst.element_size(),
-          src.data_ptr(),
+          src.const_data_ptr(),
           src.stride(0) * src.element_size(),
           src.size(1) * src.element_size(),
           src.size(0),
@@ -282,9 +282,9 @@ void all_to_one(
       auto& dst = output_tensors[i];
       // on source device, launch memcpy.
       AT_CUDA_CHECK(cudaMemcpy2DAsync(
-          dst.data_ptr(),
+          dst.mutable_data_ptr(),
           dst.stride(0) * dst.element_size(),
-          src.data_ptr(),
+          src.const_data_ptr(),
           src.stride(0) * src.element_size(),
           src.size(1) * src.element_size(),
           src.size(0),
@@ -316,9 +316,9 @@ void all_to_one(
     auto& dst = output_tensors.at(output_index);
     // on source device, launch memcpy.
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
-        dst.data_ptr(),
+        dst.mutable_data_ptr(),
         dst.stride(0) * dst.element_size(),
-        src.data_ptr(),
+        src.const_data_ptr(),
         src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
@@ -335,9 +335,9 @@ void all_to_one(
         // single device memcpy, not that src_device == dst_device.
         auto copy_stream = getCurrentGPUStream(target_device_index);
         AT_CUDA_CHECK(cudaMemcpy2DAsync(
-            dst.data_ptr(),
+            dst.mutable_data_ptr(),
             dst.stride(0) * dst.element_size(),
-            src.data_ptr(),
+            src.const_data_ptr(),
             src.stride(0) * src.element_size(),
             src.size(1) * src.element_size(),
             src.size(0),
@@ -350,7 +350,6 @@ void all_to_one(
   // wait for cross-device copies to complete.
   for (const auto device_id : c10::irange(num_gpus)) {
     if (device_id != target_device_index) {
-      auto src_device = at::Device(at::kCUDA, device_id);
       // record stream event
       auto copy_stream = getCurrentGPUStream(device_id);
 
@@ -457,9 +456,9 @@ Tensor sum_reduce_to_one(
     // on source device, launch memcpy.
     auto& dst = copied_tensors[i];
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
-        dst.data_ptr(),
+        dst.mutable_data_ptr(),
         dst.stride(0) * dst.element_size(),
-        src.data_ptr(),
+        src.const_data_ptr(),
         src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),
@@ -538,9 +537,9 @@ Tensor sum_reduce_to_one(
 
     auto& dst = copied_tensors[i];
     AT_CUDA_CHECK(cudaMemcpy2DAsync(
-        dst.data_ptr(),
+        dst.mutable_data_ptr(),
         dst.stride(0) * dst.element_size(),
-        src.data_ptr(),
+        src.const_data_ptr(),
         src.stride(0) * src.element_size(),
         src.size(1) * src.element_size(),
         src.size(0),

@@ -16,7 +16,6 @@ import unittest
 from itertools import accumulate
 
 import fbgemm_gpu  # noqa E402
-
 import hypothesis.strategies as st
 import numpy as np
 import torch
@@ -39,7 +38,6 @@ else:
 from fbgemm_gpu.split_table_batched_embeddings_ops_training_common import (
     generate_vbe_metadata,
 )
-
 
 VERBOSITY: Verbosity = Verbosity.verbose
 

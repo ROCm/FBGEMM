@@ -153,6 +153,8 @@ struct Sm100FmhaGenKernelWarpspecialized {
     ProblemShapeIn problem_shape;
     const int* seqlen_kv;
     const int* cache_batch_idx;
+    int splitk_size = 0;
+    int window_size = -1;  // If > 0, attend to last window_size tokens only
 
     const Element* ptr_q;  // 1 x D x (H x B)
     StrideQOrig dQ;
@@ -167,6 +169,9 @@ struct Sm100FmhaGenKernelWarpspecialized {
     StrideCacheV dCacheV;
     ElementOut* ptr_o;     // 1 x D x (H x B)
     StrideOOrig dO;
+
+    ElementAcc* ptr_LSE; // (B, H_K, H_R)
+    cute::Stride<int, int, cute::_1> dLSE; // stride: (H_K*H_R, H_R, 1)
 
     cutlass::KernelHardwareInfo hw_info;
 
@@ -222,11 +227,17 @@ struct Sm100FmhaGenKernelWarpspecialized {
         args.ptr_cache_k, args.dCacheK,
         args.ptr_cache_v, args.dCacheV,
       },
-      args.scale_softmax
+      args.scale_softmax,
+      args.splitk_size,
+      1.0f, 1.0f, 1.0f,  // scale_q, scale_k, scale_v
+      1.0f,              // inv_scale_o
+      args.window_size   // sliding window size
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {
       args.ptr_o, dO,
+        args.ptr_LSE,
+        args.dLSE,
     };
 
     return Params{
@@ -234,17 +245,74 @@ struct Sm100FmhaGenKernelWarpspecialized {
         args.seqlen_kv,
         CollectiveMainloop::to_underlying_arguments(problem_shape, mainloop_args, workspace),
         CollectiveEpilogue::to_underlying_arguments(problem_shape, epilogue_args, workspace),
-        TileScheduler::to_underlying_arguments(problem_shape, args.hw_info, ClusterShape{}, TileShape{})
+        TileScheduler::to_underlying_arguments(problem_shape, args.hw_info, ClusterShape{}, TileShape{}, args.splitk_size, args.window_size)
     };
   }
 
-  CUTLASS_DEVICE auto apply_batch(const Params &params, ProblemShape const& problem_shape, int batch_idx) {
+  template<class BlkCoord>
+  CUTLASS_DEVICE auto apply_batch(const Params &params, ProblemShape const& problem_shape, BlkCoord const& blk_coord) {
+    int batch_idx = get<2,1>(blk_coord);
     ProblemShape result = problem_shape;
-    get<1>(result) = params.seqlen_kv[batch_idx];
+    
+    int seqlen_kv = params.seqlen_kv[batch_idx];
     if (params.mainloop.load.ptr_new_k != nullptr) {
-      get<1>(result) += 1;
+      seqlen_kv += 1;
     }
+
+    // Cap at window_size if specified (sliding window attention)
+    int effective_seqlen = seqlen_kv;
+    if (params.mainloop.window_size > 0 && params.mainloop.window_size < seqlen_kv) {
+      effective_seqlen = params.mainloop.window_size;
+    }
+    
+    // For split-K: compute the split's klen
+    int splitk_size = params.mainloop.splitk_size;
+    if constexpr (!cute::is_constant<0, decltype(get<1>(blk_coord))>::value) {
+      // Split-K mode: blk_coord has split_k_idx as an int
+      if (splitk_size > 0) {
+        int split_k_idx = get<1>(blk_coord);
+        int start_k = split_k_idx * splitk_size;
+        int end_k = cute::min(start_k + splitk_size, effective_seqlen);
+        // Handle case where start_k >= effective_seqlen (split has no work)
+        get<1>(result) = cute::max(0, end_k - start_k);
+      } else {
+        get<1>(result) = effective_seqlen;
+      }
+    } else {
+      // Non-split-K mode: use effective sequence length
+      get<1>(result) = effective_seqlen;
+    }
+    
     return result;
+  }
+
+  // Computes the global K/V offset for sliding window
+  // Only called by Load warp
+  template<class BlkCoord>
+  CUTLASS_DEVICE int get_window_start_offset(
+      const Params& params,
+      BlkCoord const& blk_coord) {
+
+    // If window disabled, no offset
+    if (params.mainloop.window_size <= 0) {
+      return 0;
+    }
+
+    int batch_idx = get<2, 1>(blk_coord);
+    int batch_seqlen_kv = params.seqlen_kv[batch_idx];
+
+    // Add 1 for new K/V if present
+    if (params.mainloop.load.ptr_new_k != nullptr) {
+      batch_seqlen_kv += 1;
+    }
+
+    // If window covers entire sequence, no offset
+    if (params.mainloop.window_size >= batch_seqlen_kv) {
+      return 0;
+    }
+
+    // Offset = batch_seqlen - window_size
+    return batch_seqlen_kv - params.mainloop.window_size;
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
@@ -427,9 +495,15 @@ struct Sm100FmhaGenKernelWarpspecialized {
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape = apply_batch(params,
-            params.problem_shape, get<2,1>(blk_coord));
+            params.problem_shape, blk_coord);
 
+        // Skip if Q tile is out of bounds
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        // Skip if there is no K/V sequence to attend to (seqlen_kv = 0 and no new K/V)
+        if (get<1>(logical_problem_shape) == 0) {
           continue;
         }
 
@@ -450,16 +524,31 @@ struct Sm100FmhaGenKernelWarpspecialized {
     else if (role == WarpRole::Correction) {
       cutlass::arch::warpgroup_reg_dealloc<NumRegsCorrection>();
 
+      // Track if any tile was valid (for lazy TMEM deallocation)
+      bool has_valid_tile = false;
+
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape = apply_batch(params,
-            params.problem_shape, get<2,1>(blk_coord));
+            params.problem_shape, blk_coord);
 
+        // Skip if Q tile is out of bounds
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
+
+        // Handle empty splits (seqlen_kv = 0 for this split)
+        // For varlen batches where seqlen_kv < max_seqlen_k, some splits may have no valid K/V data.
+        // We must write neutral values (zeros for output, -inf for LSE) so merge produces correct results.
+        if (get<1>(logical_problem_shape) == 0) {
+          mainloop.write_empty_split(blk_coord, params.mainloop, params.problem_shape, epilogue);
+          continue;
+        }
+
+        // This block has a tile with valid work
+        has_valid_tile = true;
 
         mainloop.correction(
           blk_coord,
@@ -475,31 +564,49 @@ struct Sm100FmhaGenKernelWarpspecialized {
 
       }
 
+      // Lazy TMEM deallocation: Only free TMEM if it was allocated.
+      // For empty splits (klen=0), MMA warp didn't allocate TMEM, so we skip freeing.
+      // For non-empty splits, pipeline synchronization with MMA ensures the
+      // tmem_base_ptr write is visible before we read it here.
       if constexpr (NumWarpsEpilogue == 0) {
         static_assert(NumWarpsCorrection == 1);
 
-        uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
-        tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        if (has_valid_tile) {
+          uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+          tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        }
       }
 
     }
     else if (role == WarpRole::MMA) {
       warpgroup_reg_set<NumRegsOther>();
 
-      tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
-      __syncwarp();
+      // Track if any tile was valid (for lazy TMEM allocation)
+      bool has_valid_tile = false;
 
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape = apply_batch(params,
-            params.problem_shape, get<2,1>(blk_coord));
+            params.problem_shape, blk_coord);
 
+        // Skip if Q tile is out of bounds
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
 
+        // Skip if there is no K/V sequence to attend to (seqlen_kv = 0 and no new K/V)
+        if (get<1>(logical_problem_shape) == 0) {
+          continue;
+        }
+
+        // Lazy TMEM allocation: Only allocate on first valid tile
+        if (!has_valid_tile) {
+          has_valid_tile = true;
+          tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+          __syncwarp();
+        }
 
         mainloop.mma(
           blk_coord,
@@ -523,18 +630,28 @@ struct Sm100FmhaGenKernelWarpspecialized {
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape = apply_batch(params,
-            params.problem_shape, get<2,1>(blk_coord));
+            params.problem_shape, blk_coord);
 
+        // Skip if Q tile is out of bounds
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
+
+        // Skip if there is no K/V sequence to attend to (seqlen_kv = 0 and no new K/V)
+        if (get<1>(logical_problem_shape) == 0) {
+          continue;
+        }
+
+        // Compute window offset for sliding window attention
+        int start_k_offset = get_window_start_offset(params, blk_coord);
 
         mainloop.load(
           blk_coord, logical_problem_shape,
           params.mainloop, params.problem_shape,
           shared_storage.mainloop,
           pipeline_load_q, pipeline_load_q_producer_state,
-          pipeline_load_kv, pipeline_load_kv_producer_state
+          pipeline_load_kv, pipeline_load_kv_producer_state,
+          start_k_offset
         );
 
       }
@@ -547,9 +664,15 @@ struct Sm100FmhaGenKernelWarpspecialized {
         auto blk_coord = tile_scheduler.get_block_coord();
 
         auto logical_problem_shape = apply_batch(params,
-            params.problem_shape, get<2,1>(blk_coord));
+            params.problem_shape, blk_coord);
 
+        // Skip if Q tile is out of bounds
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+          continue;
+        }
+
+        // Skip if there is no K/V sequence to attend to (seqlen_kv = 0 and no new K/V)
+        if (get<1>(logical_problem_shape) == 0) {
           continue;
         }
 

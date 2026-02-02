@@ -87,8 +87,9 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       // All columns are the same
       if constexpr (USE_SMALL_EMB_DIM) {
         // Small embedding: pack multiple rows per warp
-        int rows_per_warp = COLS_PER_WARP / num_cols;
-        auto warps_per_member = (num_work_rows + rows_per_warp - 1) / rows_per_warp;
+        const auto rows_per_warp = COLS_PER_WARP / num_cols;
+        const auto warps_per_member =
+            DIV_ROUND_UP(num_work_rows, rows_per_warp);
         member_id = warp_id / warps_per_member;
         member_warp_id = warp_id % warps_per_member;
       } else {
@@ -101,7 +102,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     if constexpr (USE_SMALL_EMB_DIM) {
       // Small embedding dimension: pack multiple rows per warp
       // Each warp processes 'rows_per_warp' rows
-      int rows_per_warp = COLS_PER_WARP / num_cols;
+      const auto rows_per_warp = COLS_PER_WARP / num_cols;
       int64_t start_row = member_warp_id * rows_per_warp;
       
       // Since we are processing multiple rows within the warp, we need to

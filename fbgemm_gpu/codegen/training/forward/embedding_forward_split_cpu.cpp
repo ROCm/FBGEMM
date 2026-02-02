@@ -67,25 +67,24 @@ void split_embedding_forward_cpu_kernel(
 
   const auto D_offsets_data = D_offsets.accessor<int, 1>();
   const auto weights_offsets_data = weights_offsets.accessor<int64_t, 1>();
-  const auto indices_data = indices.data_ptr<index_t>();
-  const auto offsets_data = offsets.data_ptr<offset_t>();
+  const auto indices_data = indices.const_data_ptr<index_t>();
+  const auto offsets_data = offsets.const_data_ptr<offset_t>();
   const auto hash_size_cumsum_data = hash_size_cumsum.accessor<int64_t, 1>();
 
-  const auto weights_data = weights.data_ptr<weights_t>();
+  const auto weights_data = weights.const_data_ptr<weights_t>();
   // If indice_weights not defined, then this accessor won't be used.
   // The else condition is just to make compiler happy
   const auto indice_weights_data = indice_weights.defined()
-      ? indice_weights.data_ptr<ind_weights_t>()
+      ? indice_weights.const_data_ptr<ind_weights_t>()
       : nullptr;
 
-  auto output_data = output.data_ptr<output_t>();
+  auto output_data = output.mutable_data_ptr<output_t>();
   auto output_stride = output.size(1);
 
-  constexpr bool use_fbgemm = (std::is_same<weights_t, float>::value ||
-                               std::is_same<weights_t, at::Half>::value ||
-                               std::is_same<weights_t, uint8_t>::value) &&
-      std::is_same<output_t, float>::value &&
-      std::is_same<ind_weights_t, float>::value;
+  constexpr bool use_fbgemm = (std::is_same_v<weights_t, float> ||
+                               std::is_same_v<weights_t, at::Half> ||
+                               std::is_same_v<weights_t, uint8_t>) &&
+      std::is_same_v<output_t, float> && std::is_same_v<ind_weights_t, float>;
 
   at::parallel_for(0, B, 0, [&](int64_t b_begin, int64_t b_end) {
     for (const auto t : c10::irange(T)) {
@@ -103,7 +102,7 @@ void split_embedding_forward_cpu_kernel(
       bool success = true;
       if (use_fbgemm) {
         using fbgemm_weight_t = typename std::conditional<
-            std::is_same<weights_t, at::Half>::value,
+            std::is_same_v<weights_t, at::Half>,
             fbgemm::float16,
             weights_t>::type;
         auto kernel = fbgemm::GenerateEmbeddingSpMDMWithStrides<
@@ -222,7 +221,7 @@ Tensor split_embedding_codegen_forward_cpu(
         FBGEMM_DISPATCH_FLOAT_HALF_AND_BYTE(
             weights.scalar_type(), "split_embedding_cpu_forward_2", [&] {
               using ind_weights_t = std::conditional<
-                  std::is_same<scalar_t, double>::value,
+                  std::is_same_v<scalar_t, double>,
                   double,
                   float>::type;
 

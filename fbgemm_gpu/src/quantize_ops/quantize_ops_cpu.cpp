@@ -46,11 +46,11 @@ Tensor& _float_to_fused8bitrowwise_cpu_out_t(
   output_dims[last_dim] = output_columns;
   at::native::resize_(output, output_dims, std::nullopt);
 
-  const auto input_data = static_cast<input_t*>(
-      input.data_ptr()); // input.data_ptr<input_t>(); -> Yields
-                         // unresolved data_ptr symbol.
+  const auto input_data = static_cast<const input_t*>(
+      input.const_data_ptr()); // input.const_data_ptr<input_t>(); -> Yields
+                               // unresolved data_ptr symbol.
   fbgemm::FloatOrHalfToFused8BitRowwiseQuantizedSBFloat<input_t>(
-      input_data, nrows, ncols, output.data_ptr<uint8_t>());
+      input_data, nrows, ncols, output.mutable_data_ptr<uint8_t>());
 
   return output;
 }
@@ -84,12 +84,12 @@ Tensor& _fused8bitrowwise_to_float_cpu_out_t(
   at::native::resize_(output, output_dims, std::nullopt);
 
   auto output_data = static_cast<output_t*>(
-      output.data_ptr()); // output.data_ptr<output_t>(); -> Yields
-                          // unresolved data_ptr symbol.
+      output.mutable_data_ptr()); // output.mutable_data_ptr<output_t>(); ->
+                                  // Yields unresolved data_ptr symbol.
   fbgemm::Fused8BitRowwiseQuantizedSBFloatToFloatOrHalf<
       output_t,
       is_uint16_t_of_type_bf16>(
-      input.data_ptr<uint8_t>(),
+      input.const_data_ptr<uint8_t>(),
       nrows,
       ncols,
       output_data,
@@ -121,15 +121,15 @@ Tensor _float_to_fusednbitrowwise_cpu(
       {nrows, output_columns},
       input.options().dtype(at::kByte)); // at::kBytes for uint8_t
 
-  const auto input_data = static_cast<input_t*>(
-      input.data_ptr()); // input.data_ptr<input_t>(); -> Yields
-                         // unresolved data_ptr symbol.
+  const auto input_data = static_cast<const input_t*>(
+      input.const_data_ptr()); // input.const_data_ptr<input_t>(); -> Yields
+                               // unresolved data_ptr symbol.
   fbgemm::FloatOrHalfToFusedNBitRowwiseQuantizedSBHalf<input_t>(
       bit_rate,
       input_data,
       nrows,
       ncols,
-      output.data_ptr<uint8_t>(),
+      output.mutable_data_ptr<uint8_t>(),
       rowwise_min_max);
 
   return output;
@@ -162,11 +162,11 @@ Tensor _fusednbitrowwise_to_float_cpu(
   }
 
   auto output_data = static_cast<output_t*>(
-      output.data_ptr()); // output.data_ptr<output_t>(); -> Yields
-                          // unresolved data_ptr symbol.
+      output.mutable_data_ptr()); // output.mutable_data_ptr<output_t>(); ->
+                                  // Yields unresolved data_ptr symbol.
 
   fbgemm::FusedNBitRowwiseQuantizedSBHalfToFloatOrHalf<output_t>(
-      bit_rate, input.data_ptr<uint8_t>(), nrows, ncols, output_data);
+      bit_rate, input.const_data_ptr<uint8_t>(), nrows, ncols, output_data);
 
   return output;
 }
@@ -209,8 +209,8 @@ Tensor _fusednbitrowwise_sbfront_to_float_or_half_cpu(
   using output_ty = std::
       conditional_t<std::is_same_v<output_t, float>, float, fbgemm::float16>;
   output_ty* output_data = static_cast<output_ty*>(
-      output.data_ptr()); // output.data_ptr<output_t>(); -> Yields
-                          // unresolved data_ptr symbol.
+      output.mutable_data_ptr()); // output.mutable_data_ptr<output_t>(); ->
+                                  // Yields unresolved data_ptr symbol.
 
   constexpr bool is_uint16_t_of_type_bf16 =
       std::is_same_v<output_t, at::BFloat16>;
@@ -218,7 +218,7 @@ Tensor _fusednbitrowwise_sbfront_to_float_or_half_cpu(
       output_ty,
       is_uint16_t_of_type_bf16>(
       bit_rate,
-      input.data_ptr<uint8_t>(),
+      input.const_data_ptr<uint8_t>(),
       nrows,
       ncols,
       output_data,
@@ -432,7 +432,7 @@ Tensor fusednbitrowwise_to_float_or_half_cpu(
     const Tensor& input,
     const int64_t bit_rate,
     const int64_t output_dtype,
-    [[maybe_unused]] const bool scale_bias_last) {
+    const bool scale_bias_last [[maybe_unused]]) {
   Tensor output;
 
   SparseType output_sparse_dtype = static_cast<SparseType>(output_dtype);
@@ -497,12 +497,12 @@ static Tensor float_or_half_to_fusednbitrowwise_cpu_with_rowwise_min_max(
       [&] {
         if constexpr (std::is_same_v<scalar_t, float>) {
           const auto rowwise_min_max_data =
-              rowwise_min_max_contig->data_ptr<float>();
+              rowwise_min_max_contig->const_data_ptr<float>();
           output = _float_to_fusednbitrowwise_cpu<float>(
               input, bit_rate, rowwise_min_max_data);
         } else { // scalar_t = at::Half
-          const auto rowwise_min_max_data =
-              static_cast<fbgemm::float16*>(rowwise_min_max_contig->data_ptr());
+          const auto rowwise_min_max_data = static_cast<const fbgemm::float16*>(
+              rowwise_min_max_contig->const_data_ptr());
           output = _float_to_fusednbitrowwise_cpu<fbgemm::float16>(
               input, bit_rate, rowwise_min_max_data);
         }
@@ -566,10 +566,10 @@ at::Tensor _float_to_hfp8_cpu(
   auto output = at::empty({nrows, ncols}, input.options().dtype(at::kByte));
 
   FloatToFP8Quantized_ref(
-      input.data_ptr<float>(),
+      input.const_data_ptr<float>(),
       nrows,
       ncols,
-      output.data_ptr<uint8_t>(),
+      output.mutable_data_ptr<uint8_t>(),
       ebits,
       exponent_bias,
       max_pos);
@@ -593,10 +593,10 @@ at::Tensor _hfp8_to_float_cpu(
       input.options().dtype(at::kFloat)); //
 
   FP8QuantizedToFloat_ref(
-      input.data_ptr<uint8_t>(),
+      input.const_data_ptr<uint8_t>(),
       nrows,
       ncols,
-      output.data_ptr<float>(),
+      output.mutable_data_ptr<float>(),
       ebits,
       exponent_bias);
 
@@ -663,7 +663,8 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "PaddedFP8RowwiseQuantizedToFloat(Tensor input, bool forward, int row_dim, int output_last_dim=-1, int output_dtype=0) -> Tensor");
   m.def(
       "quantize_mx_cuda(Tensor input, int scale_bits, int elem_ebits, int elem_mbits, float elem_max_norm, int mx_group_size, bool flush_fp32_subnorms=False, int rounding_mode=0) -> Tensor");
-  m.def("dequantize_mx_cuda(Tensor input, int mx_group_size) -> Tensor");
+  m.def(
+      "dequantize_mx_cuda(Tensor input, int mx_group_size, int output_dtype=0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(fbgemm, QuantizedCPU, m) {

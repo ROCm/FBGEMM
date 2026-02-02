@@ -101,8 +101,8 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
     {%- endif %}
     {%- if not dense %}
     const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits> sorted_{{ locs_or_addrs_tensor }},
-    const bool use_uniq_cache_locations,
-    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    const bool use_uniq_cache_locations [[maybe_unused]],
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets [[maybe_unused]],
     {%- endif %}
     {%- if weighted %}
     const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
@@ -113,7 +113,7 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
     {%- else %}
     pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> grad_dev_weights,
     {%- if optimizer == "none" %}
-    const int32_t max_D,
+    const int32_t max_D [[maybe_unused]],
     {%- endif %}
     {%- endif %} // if not dense and optimizer != "none"
     {%- if vbe %}
@@ -140,7 +140,7 @@ batch_index_select_dim0_codegen_backward_kernel_cta_per_row(
     const float gwd_lower_bound,
     {%- endif %}
     {%- if ssd %}
-    const bool enable_optimizer_offloading,
+    const bool enable_optimizer_offloading [[maybe_unused]],
     {%- endif %}
     {%- if is_index_select %}
     const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
@@ -192,8 +192,8 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     {%- endif %}
     {%- if not dense %}
     const pta::PackedTensorAccessor32<{{ locs_or_addrs_type }}, 1, at::RestrictPtrTraits> sorted_{{ locs_or_addrs_tensor }},
-    const bool use_uniq_cache_locations,
-    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    const bool use_uniq_cache_locations [[maybe_unused]],
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets [[maybe_unused]],
     {%- endif %}
     {%- if weighted %}
     const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
@@ -226,7 +226,7 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row(
     const float gwd_lower_bound,
     {%- endif %}
     {%- if ssd %}
-    const bool enable_optimizer_offloading,
+    const bool enable_optimizer_offloading [[maybe_unused]],
     {%- endif %}
     {%- if is_index_select %}
     const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> grad_offsets,
@@ -275,8 +275,8 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     {%- endif %}
     {%- if not dense %}
     const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> sorted_lxu_cache_locations,
-    const bool use_uniq_cache_locations,
-    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets,
+    const bool use_uniq_cache_locations [[maybe_unused]],
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> table_unique_indices_offsets [[maybe_unused]],
     {%- endif %}
     {%- if weighted %}
     const pta::PackedTensorAccessor32<at::acc_type<cache_t, true>, 1, at::RestrictPtrTraits> sorted_indice_weights,
@@ -555,7 +555,7 @@ Tensor {{ embedding_cuda_op }}(
     const Tensor& {{ locs_or_addrs_tensor }},
     {%- endif %}
     {%- if not is_index_select %}
-    const int64_t unused_,
+    const int64_t unused_ [[maybe_unused]],
     {%- endif %}
     const int64_t max_segment_length_per_warp,
     {%- if not dense %}
@@ -987,11 +987,25 @@ Tensor {{ embedding_cuda_op }}(
                 auto num_long_run_ids = at::zeros({1}, indices.options().dtype(at::kInt));
 
                 const bool use_deterministic_algorithms = at::globalContext().deterministicAlgorithms();
+
                 {% if is_rocm %}
                     const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 4096;
                 {% else %}
-                    const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : 1024;
+                    //optimize for B200
+                    const auto device_properties = at::cuda::getCurrentDeviceProperties();
+                    int default_segment_length = 1024;
+                    const bool b200_feature_enabled = (device_properties->major >= 10) && fbgemm_gpu::config::is_feature_enabled(fbgemm_gpu::config::FeatureGateName::TBE_USE_TUNED_SEGMENT_LENGTHS_CTA_B200);
+                    if (b200_feature_enabled) {
+                      default_segment_length = 4096;
+                    }
+                    // Debug logging - remove after verification
+                    TORCH_WARN_ONCE("TBE B200 optimization: device_major=", device_properties->major,
+                                    ", feature_enabled=", b200_feature_enabled,
+                                    ", segment_length=", default_segment_length);
+                    const int max_segment_length_per_cta = use_deterministic_algorithms ? INT_MAX : default_segment_length;
+
                 {%- endif %}
+
                 Tensor long_run_id_to_really_long_run_ids;
                 if (use_deterministic_algorithms) {
                     long_run_id_to_really_long_run_ids =
@@ -1236,8 +1250,9 @@ Tensor {{ embedding_cuda_op }}(
 
                     constexpr bool supported_weights_type = std::is_same_v<emb_t, float> || std::is_same_v<emb_t, at::Half>;
                     constexpr bool supported_grad_type = std::is_same_v<grad_t, float> || std::is_same_v<grad_t, at::Half>;
+                    const bool cached = uvm_weights.numel() > 0 || lxu_cache_weights.numel() > 0;
 
-                    if (use_hip_kernel && !mixed_D && supported_weights_type && supported_grad_type && rocm::is_supported_cdna())
+                    if (use_hip_kernel && !mixed_D && !cached && supported_weights_type && supported_grad_type && rocm::is_supported_cdna())
                     {
                         constexpr int segments_per_workgroup = 4;
                         {%- for kDimSize in [64, 128, 160, 192, 256, 320] %}

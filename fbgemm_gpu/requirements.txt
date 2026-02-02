@@ -24,8 +24,8 @@ parameterized
 pyre-extensions
 pyyaml
 scikit-build
-setuptools==75.1.0
-setuptools_git_versioning
+setuptools==78.1.1
+setuptools_git_versioning>=3.0.0
 tabulate
 patchelf
 fairscale

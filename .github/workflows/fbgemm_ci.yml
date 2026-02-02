@@ -65,7 +65,7 @@ jobs:
       run: yum update -y; yum install -y binutils findutils git pciutils sudo wget which
 
     - name: Checkout the Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -76,7 +76,7 @@ jobs:
       run: . $PRELUDE; setup_miniconda $HOME/miniconda
 
     - name: Create Conda Environment
-      run: . $PRELUDE; create_conda_environment $BUILD_ENV 3.13
+      run: . $PRELUDE; create_conda_environment $BUILD_ENV 3.14
 
     - name: Set GCC version
       if: matrix.compiler.name == 'gcc'
@@ -115,7 +115,7 @@ jobs:
 
     steps:
     - name: Checkout the Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -157,7 +157,7 @@ jobs:
       run: yum update -y; yum install -y binutils findutils git pciutils sudo wget which
 
     - name: Checkout the Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -168,7 +168,7 @@ jobs:
       run: . $PRELUDE; setup_miniconda $HOME/miniconda
 
     - name: Create Conda Environment
-      run: . $PRELUDE; create_conda_environment $BUILD_ENV 3.13
+      run: . $PRELUDE; create_conda_environment $BUILD_ENV 3.14
 
     - name: Install C/C++ Compilers
       run: . $PRELUDE; GCC_VERSION=10.4.0 install_cxx_compiler $BUILD_ENV ${{ matrix.compiler }}
@@ -198,7 +198,7 @@ jobs:
 
     steps:
     - name: Checkout the Repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 

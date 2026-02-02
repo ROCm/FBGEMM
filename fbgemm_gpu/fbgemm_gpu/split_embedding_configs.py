@@ -13,6 +13,7 @@ from typing import Any, Dict  # noqa: F401
 
 import torch
 
+# fmt:skip
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     EmbeddingLocation,
     SplitState,
@@ -230,7 +231,7 @@ class EmbOptimType(enum.Enum):
         """
         Returns the split planning for the optimizer states
         """
-        (rows, _) = zip(*embedding_specs)
+        rows, _ = zip(*embedding_specs)
         T_ = len(embedding_specs)
 
         # This is the cumulative row counts for rowwise states
@@ -311,6 +312,40 @@ def sparse_type_to_int(sparse_type: "SparseType") -> int:
         SparseType.MX4.value: 7,
         SparseType.NFP8.value: 8,
     }[sparse_type.value]
+
+
+def sparse_type_int_to_dtype(ty: int) -> torch.dtype:
+    """
+    TorchScript-compatible function to convert an SparseType enum as integer) to torch.dtype.
+
+    This is a standalone function equivalent to SparseType.from_int(dtype_int).as_dtype() that works
+    with TorchScript. TorchScript does not support @staticmethod on Enum classes,
+    so this function provides a workaround.
+    """
+    if ty == 0:  # fp32
+        return torch.float32
+    elif ty == 1:  # fp16
+        return torch.float16
+    elif ty == 2:  # int8
+        return torch.uint8
+    elif ty == 3:  # int4
+        return torch.quint4x2
+    elif ty == 4:  # int2
+        return torch.quint2x4
+    elif ty == 5:  # bf16
+        return torch.bfloat16
+    elif ty == 6:  # fp8
+        return torch.uint8
+    elif ty == 7:  # mx4
+        return torch.uint8
+    elif ty == 9:
+        return (
+            torch.float8_e4m3fnuz
+            if torch.version.hip is not None
+            else torch.float8_e4m3fn
+        )
+    else:  # Invalid is 7 or non enumerated.
+        raise ValueError(f"Unsupported sparse type: {ty}")
 
 
 @enum.unique

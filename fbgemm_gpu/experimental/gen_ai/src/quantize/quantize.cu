@@ -495,7 +495,6 @@ __global__ void scaleMatrixRowwise2(
     at::PhiloxCudaState stochastic_rounding_philox_args) {
   auto stoc_rounding_state = StochasticRoundingRNGState(
       stochastic_rounding_philox_args, threadIdx.x + blockIdx.x * blockDim.x);
-  auto input_scal = static_cast<float>(input_scale[0]);
 
   auto vec_output = reinterpret_cast<__nv_fp8x4_e4m3*>(&output[0]);
   auto vec_input = reinterpret_cast<const bfx4*>(&input[0]);
@@ -820,7 +819,7 @@ at::Tensor get_fp8_per_tensor_scale(
   const auto stream = at::cuda::getCurrentCUDAStream();
   invokeComputeScale(
       reinterpret_cast<float*>(scale.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
       input.numel(),
       input.size(-1),
       input.size(0),
@@ -867,7 +866,7 @@ at::Tensor quantize_fp8_per_tensor_fixed_scale(
   invokeQuantizeMatrix(
       reinterpret_cast<__nv_fp8_e4m3*>(quantized_input.data_ptr()),
       reinterpret_cast<float*>(scale.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
       input.numel(),
       input.size(-1),
       stochastic_rounding,
@@ -927,7 +926,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
     }
     invokeComputeScale(
         reinterpret_cast<float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
         input.numel(),
         input.size(-1),
         total_elements_per_slice,
@@ -940,7 +939,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
       invokeQuantizeMatrix(
           quantized_input_ptr,
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           stochastic_rounding,
@@ -949,7 +948,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
       invokeQuantizeMatrix(
           quantized_input_ptr,
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const float*>(input.data_ptr()),
+          reinterpret_cast<const float*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           stochastic_rounding,
@@ -958,7 +957,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
   } else {
     invokeComputeScale(
         reinterpret_cast<float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
         input.numel(),
         input.size(-1),
         -1,
@@ -971,7 +970,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
       invokeQuantizeMatrix(
           quantized_input_ptr,
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           stochastic_rounding,
@@ -980,7 +979,7 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
       invokeQuantizeMatrix(
           quantized_input_ptr,
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const float*>(input.data_ptr()),
+          reinterpret_cast<const float*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           stochastic_rounding,
@@ -1329,7 +1328,8 @@ std::vector<at::Tensor> quantize_fp8_per_row(
   // optional upper‑bound pointer
   const float* scale_ub_ptr = nullptr;
   if (scale_ub.has_value()) {
-    scale_ub_ptr = reinterpret_cast<const float*>(scale_ub.value().data_ptr());
+    scale_ub_ptr =
+        reinterpret_cast<const float*>(scale_ub.value().const_data_ptr());
   }
   // launch parameters
   const int threads = 128; // 128 threads / block
@@ -1342,7 +1342,7 @@ std::vector<at::Tensor> quantize_fp8_per_row(
         <<<grid, block, shmem_bytes, stream>>>(
             reinterpret_cast<__nv_fp8_e4m3*>(quantized.data_ptr()),
             reinterpret_cast<float*>(scales.data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
             static_cast<int>(K),
             scale_ub_ptr);
   } else {
@@ -1350,7 +1350,7 @@ std::vector<at::Tensor> quantize_fp8_per_row(
         <<<grid, block, shmem_bytes, stream>>>(
             reinterpret_cast<__nv_fp8_e5m2*>(quantized.data_ptr()),
             reinterpret_cast<float*>(scales.data_ptr()),
-            reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
             static_cast<int>(K),
             scale_ub_ptr);
   }
@@ -1374,9 +1374,11 @@ std::vector<at::Tensor> quantize_fp8_per_col(
   auto _st = input.scalar_type();
   TORCH_CHECK(_st == torch::kBFloat16, "Invalid datatype. input must be BF16");
   std::vector<long int> quantized_input_shape;
+  quantized_input_shape.reserve(input.dim());
   for (int i = 0; i < input.dim(); i++)
     quantized_input_shape.push_back(input.size(i));
   std::vector<int64_t> scale_shape;
+  scale_shape.reserve(input.dim() - 1);
   for (int i = 1; i < input.dim(); i++)
     scale_shape.push_back(input.size(i));
 
@@ -1401,7 +1403,7 @@ std::vector<at::Tensor> quantize_fp8_per_col(
   invokeComputeScalesAndQuantizeMatrixCol(
       quantized_input_ptr,
       reinterpret_cast<float*>(scales.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
       input.numel(),
       input.size(-1),
       stream);
@@ -2108,7 +2110,7 @@ std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
     if (!static_scales.has_value()) {
       invokeComputeFP4GlobalAmax(
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           total_elements_per_slice,
@@ -2120,8 +2122,8 @@ std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
     }
     fp4_fused_amax_quantize(
         quantized_input_ptr,
-        reinterpret_cast<const float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const float*>(scales.const_data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
         input.numel(),
         16,
         stream);
@@ -2129,7 +2131,7 @@ std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
     if (!static_scales.has_value()) {
       invokeComputeFP4GlobalAmax(
           reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
           input.numel(),
           input.size(-1),
           -1,
@@ -2141,8 +2143,8 @@ std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
     }
     fp4_fused_amax_quantize(
         quantized_input_ptr,
-        reinterpret_cast<const float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const float*>(scales.const_data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr()),
         input.numel(),
         16,
         stream);
@@ -2165,9 +2167,9 @@ void scaled_fp4_quant(
   int multiProcessorCount =
       get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
 
-  auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
+  auto input_sf_ptr = static_cast<float const*>(input_sf.const_data_ptr());
   auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
-  auto output_ptr = static_cast<int64_t*>(output.data_ptr());
+  auto output_ptr = static_cast<int64_t*>(output.mutable_data_ptr());
   at::cuda::CUDAGuard device_guard{(char)input.get_device()};
   auto stream = at::cuda::getStreamFromPool(false, input.get_device());
   if (stream == nullptr) {
@@ -2179,7 +2181,7 @@ void scaled_fp4_quant(
 
   switch (input.scalar_type()) {
     case torch::kHalf: {
-      auto input_ptr = reinterpret_cast<half const*>(input.data_ptr());
+      auto input_ptr = reinterpret_cast<half const*>(input.const_data_ptr());
       invokeFP4Quantization(
           m,
           n,
@@ -2193,7 +2195,8 @@ void scaled_fp4_quant(
       break;
     }
     case torch::kBFloat16: {
-      auto input_ptr = reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr());
+      auto input_ptr =
+          reinterpret_cast<__nv_bfloat16 const*>(input.const_data_ptr());
       invokeFP4Quantization(
           m,
           n,

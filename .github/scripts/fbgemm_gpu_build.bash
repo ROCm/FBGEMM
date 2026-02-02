@@ -222,13 +222,17 @@ __configure_fbgemm_gpu_build_rocm () {
     # the value set to 0), we are building in Nova.  Nova machines take much
     # longer time to build FBGEMM_GPU for ROCm, so we have to limit to just the
     # latest model.
-    echo "[BUILD] Building in Nova environment, ignoring the provided PYTORCH_ROCM_ARCH list and limiting ROCm targets ..."
+    echo "[BUILD] Building in Nova environment, which is resource-constrained - will be ignoring the provided PYTORCH_ROCM_ARCH list and limiting ROCm targets ..."
     local arch_list="gfx942"
 
   else
     # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
     # sufficient resources, so we can build for more AMD Instinct architectures.
-    local arch_list="gfx908,gfx90a,gfx942"
+    if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
+      local arch_list="gfx908,gfx90a,gfx942,gfx950"
+    else
+      local arch_list="gfx908,gfx90a,gfx942"
+    fi
   fi
 
   echo "[BUILD] Setting the following ROCm targets: ${arch_list}"
@@ -298,17 +302,29 @@ __configure_fbgemm_gpu_build_cuda () {
         # NOTE: Compiling 9.0a code will fail if sm_80 output is also is also
         # enabled, bc the code relies on the following function that is not
         # supported in sm_80:
+        #
         #   float4 atomicAdd(float4* address, float4 val);
-        local arch_list="8.0;9.0a;10.0a;12.0a"
+        #
+        # See:
+        #   https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html?highlight=atomicAdd#atomicadd
+        local arch_list="9.0a;10.0a;12.0a"
       else
         # NOTE: HSTU requires sm_75 or higher
-        local arch_list="8.0;9.0a"
+        local arch_list="9.0a"
       fi
 
     elif  [[ $cuda_version_nvcc == *"V13.0"* ]] ||
           [[ $cuda_version_nvcc == *"V12.9"* ]] ||
           [[ $cuda_version_nvcc == *"V12.8"* ]]; then
-      local arch_list="8.0;9.0a;10.0a;12.0a"
+      # NOTE: If we reach this point, then we are building the package for
+      # publishing to PyPI
+      if [ "${PYPI_PUBLISH_CHANNEL:-}" = "release" ]; then
+        # FBGEMM non-nightly releases can be built with a different version of
+        # CUDA, which migh result in a larger binary size than what PyPI allows.
+        local arch_list="8.0;9.0a;10.0a"
+      else
+        local arch_list="8.0;9.0a;10.0a;12.0a"
+      fi
 
     elif  [[ $cuda_version_nvcc == *"V12.6"* ]] ||
           [[ $cuda_version_nvcc == *"V12.4"* ]] ||
@@ -463,7 +479,7 @@ __build_fbgemm_gpu_set_python_tag () {
   # shellcheck disable=SC2206
   local python_version_arr=(${python_version[1]//./ })
 
-  # Set the python tag (e.g. Python 3.13 --> py313)
+  # Set the python tag (e.g. Python 3.14 --> py314)
   export python_tag="py${python_version_arr[0]}${python_version_arr[1]}"
   echo "[BUILD] Extracted and set Python tag: ${python_tag}"
 }

@@ -15,12 +15,10 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from fbgemm_gpu.split_embedding_utils import round_up
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     GlobalWeightDecayDefinition,
 )
-
 from hypothesis import given, settings
 
 from .backward_adagrad_common import (  # noqa
@@ -43,7 +41,6 @@ from .backward_adagrad_common import (  # noqa
     st,
     WeightDecayMode,
 )
-
 
 # Set up test strategy
 test_st: dict[str, Any] = {
@@ -303,7 +300,7 @@ def execute_global_weight_decay(  # noqa C901
     ]
 
     x = torch.cat([x.contiguous().flatten() for x in xs], dim=0)
-    (indices, offsets) = get_table_batched_offsets_from_dense(x, L=L, total_B=sum(Bs))
+    indices, offsets = get_table_batched_offsets_from_dense(x, L=L, total_B=sum(Bs))
     indices = indices.to(device)
     offsets = offsets.to(device)
 

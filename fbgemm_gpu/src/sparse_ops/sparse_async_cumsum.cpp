@@ -47,8 +47,8 @@ void asynchronous_exclusive_cumsum_cpu_out(Tensor& t_out, const Tensor& t_in) {
       [&] {
         exclusive_scan_ptrs_cpu(
             t_in_contig->numel(),
-            t_in_contig->data_ptr<scalar_t>(),
-            t_out.data_ptr<scalar_t>());
+            t_in_contig->const_data_ptr<scalar_t>(),
+            t_out.mutable_data_ptr<scalar_t>());
       });
 }
 
@@ -71,9 +71,9 @@ Tensor asynchronous_inclusive_cumsum_cpu(const Tensor& t_in) {
       "asynchronous_inclusive_cumsum_cpu_kernel",
       [&] {
         scalar_t cumsum = 0;
-        const auto* input_ptr = t_in_contig->data_ptr<scalar_t>();
+        const auto* input_ptr = t_in_contig->const_data_ptr<scalar_t>();
         const auto N = t_in_contig->numel();
-        auto* output_ptr = output.data_ptr<scalar_t>();
+        auto* output_ptr = output.mutable_data_ptr<scalar_t>();
 
         for (const auto i : c10::irange(N)) {
           cumsum += input_ptr[i];
@@ -89,7 +89,6 @@ Tensor asynchronous_complete_cumsum_cpu_out(Tensor& t_out, const Tensor& t_in) {
   const auto num_dims = t_in.dim();
   TORCH_CHECK(num_dims == 1 || num_dims == 2);
   const auto t_in_contig = t_in.expect_contiguous();
-  const auto t_out_contig = t_out.expect_contiguous();
 
   FBGEMM_DISPATCH_ALL_TYPES(
       t_in_contig->scalar_type(),
@@ -97,16 +96,19 @@ Tensor asynchronous_complete_cumsum_cpu_out(Tensor& t_out, const Tensor& t_in) {
       [&] {
         if (num_dims == 1) {
           const auto N = t_in_contig->numel();
-          t_out.data_ptr<scalar_t>()[N] = exclusive_scan_ptrs_cpu(
-              N, t_in_contig->data_ptr<scalar_t>(), t_out.data_ptr<scalar_t>());
+          t_out.mutable_data_ptr<scalar_t>()[N] = exclusive_scan_ptrs_cpu(
+              N,
+              t_in_contig->const_data_ptr<scalar_t>(),
+              t_out.mutable_data_ptr<scalar_t>());
         } else {
           const auto num_vecs = t_in_contig->size(0);
           const auto N = t_in_contig->size(1);
           at::parallel_for(0, num_vecs, 1, [&](int64_t start, int64_t end) {
             for (const auto i : c10::irange(start, end)) {
-              scalar_t* out_ptr = t_out.data_ptr<scalar_t>() + i * (N + 1);
+              scalar_t* out_ptr =
+                  t_out.mutable_data_ptr<scalar_t>() + i * (N + 1);
               out_ptr[N] = exclusive_scan_ptrs_cpu(
-                  N, t_in_contig->data_ptr<scalar_t>() + i * N, out_ptr);
+                  N, t_in_contig->const_data_ptr<scalar_t>() + i * N, out_ptr);
             }
           });
         }

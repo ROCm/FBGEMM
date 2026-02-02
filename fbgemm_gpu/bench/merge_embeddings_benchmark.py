@@ -24,7 +24,6 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
-
 from torch import Tensor
 
 # pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
@@ -58,7 +57,7 @@ def get_table_batched_offsets_from_dense(
     # pyre-fixme[2]: Parameter must be annotated.
     gpu_num,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    (T, B, L) = merged_indices.size()
+    T, B, L = merged_indices.size()
     lengths = np.ones((T, B)) * L
     flat_lengths = lengths.flatten()
     return (
@@ -89,7 +88,7 @@ def generate_requests(
             dtype=torch.int32,
         )
         # each bag is usually sorted
-        (all_indices, _) = torch.sort(all_indices)
+        all_indices, _ = torch.sort(all_indices)
         all_indices = all_indices.reshape(T, B * L)
 
         rs.append(

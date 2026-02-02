@@ -67,7 +67,7 @@ DLL_PUBLIC Tensor pack_segments_backward_cuda(
   Tensor unpacked_tensor; // The output tensor
 
   AT_DISPATCH_INDEX_TYPES(lengths.scalar_type(), "unpack_segments_cuda", [&] {
-    const auto* const lengths_data = lengths.data_ptr<index_t>();
+    const auto* const lengths_data = lengths.const_data_ptr<index_t>();
 
     // Create output tensor of appropriate dimensions
     auto shape = data_contig->sizes().vec();
@@ -89,8 +89,8 @@ DLL_PUBLIC Tensor pack_segments_backward_cuda(
           const auto num_seq = lengths.size(0);
           const auto cell_size = data_contig->numel() /
               (data_contig->size(0) * data_contig->size(1));
-          const auto* const data_ptr = data_contig->data_ptr<scalar_t>();
-          auto* const out_data = unpacked_tensor.data_ptr<scalar_t>();
+          const auto* const data_ptr = data_contig->const_data_ptr<scalar_t>();
+          auto* const out_data = unpacked_tensor.mutable_data_ptr<scalar_t>();
 
           FBGEMM_LAUNCH_KERNEL(
               (unpack_segments_cuda_kernel<index_t, scalar_t>),

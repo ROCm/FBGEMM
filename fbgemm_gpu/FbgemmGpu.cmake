@@ -24,6 +24,7 @@ set(tbe_eeg_cpu_sources
   src/tbe/eeg/indices_generator.cpp)
 
 set(fbgemm_gpu_sources_cpu_static
+    src/intraining_embedding_pruning_ops/intraining_embedding_pruning_cpu.cpp
     src/memory_utils/memory_utils.cpp
     src/memory_utils/memory_utils_ops.cpp
     src/merge_pooled_embedding_ops/merge_pooled_embedding_ops_cpu.cpp
@@ -95,6 +96,7 @@ if(NOT FBGEMM_BUILD_VARIANT STREQUAL BUILD_VARIANT_CPU)
       src/jagged_tensor_ops/jagged_to_padded_dense_forward.cu
       src/jagged_tensor_ops/jagged_unique_indices.cu
       src/jagged_tensor_ops/keyed_jagged_index_select_dim1.cu
+      src/jagged_tensor_ops/repeat_arange.cu
       src/layout_transform_ops/layout_transform_ops.cu
       src/metric_ops/metric_ops.cu
       src/permute_pooled_embedding_ops/permute_pooled_embedding_ops_split.cu

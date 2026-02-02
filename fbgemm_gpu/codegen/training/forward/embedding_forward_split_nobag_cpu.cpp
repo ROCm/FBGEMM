@@ -38,15 +38,13 @@ void split_embedding_nobag_codegen_forward_cpu_kernel(
     const Tensor& offsets,
     const Tensor& output) {
   TORCH_CHECK(weights.is_contiguous());
-  Tensor indices_contig = indices.contiguous();
-  Tensor offsets_contig = offsets.contiguous();
 
   const auto weights_offsets_data = weights_offsets.accessor<int64_t, 1>();
   const auto hash_size_cumsum_data = hash_size_cumsum.accessor<int64_t, 1>();
-  const auto indices_data = indices.data_ptr<index_t>();
-  const auto offsets_data = offsets.data_ptr<offset_t>();
-  const auto weights_data = weights.data_ptr<weights_t>();
-  auto output_data = output.data_ptr<output_t>();
+  const auto indices_data = indices.const_data_ptr<index_t>();
+  const auto offsets_data = offsets.const_data_ptr<offset_t>();
+  const auto weights_data = weights.const_data_ptr<weights_t>();
+  auto output_data = output.mutable_data_ptr<output_t>();
 
   int64_t T = weights_offsets.size(0);
   int64_t B = (offsets.size(0) - 1) / T;
@@ -55,7 +53,7 @@ void split_embedding_nobag_codegen_forward_cpu_kernel(
   at::parallel_for(0, T, 0, [&](int64_t t_begin, int64_t t_end) {
     for (const auto t : c10::irange(t_begin, t_end)) {
       int64_t hash_size = 0;
-      int64_t t_temp = static_cast<int64_t>(t) + 1;
+      int64_t t_temp = t + 1;
       do {
         hash_size = hash_size_cumsum_data[t_temp] - hash_size_cumsum_data[t];
         ++t_temp;

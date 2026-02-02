@@ -9,10 +9,8 @@ import abc
 
 import fbgemm_gpu.experimental.gen_ai  # noqa: F401
 import numpy as np
-
 import torch
 import triton  # @manual=//triton:triton
-
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -26,7 +24,6 @@ from fbgemm_gpu.experimental.gemm.triton_gemm.fp4_quantize import (
     triton_scale_nvfp4_quant_rms,
     triton_scale_nvfp4_quant_silu,
 )
-
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
     get_fp8_constants,
     matmul_fp8_block,
@@ -143,6 +140,8 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
         args_list = [args]
         for _ in range(copy_cnt):
             args_list.append(copy.deepcopy(args))
+
+        torch.cuda.synchronize()
 
         def rotating_buffer_fn(fn, args_list, copy_cnt):
             for i in range(copy_cnt):

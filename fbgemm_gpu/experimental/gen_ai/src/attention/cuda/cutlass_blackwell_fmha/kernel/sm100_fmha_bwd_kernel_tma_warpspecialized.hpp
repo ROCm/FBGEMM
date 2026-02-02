@@ -378,7 +378,7 @@ struct Sm100FmhaBwdKernelTmaWarpSpecialized {
         std::is_base_of_v<cutlass::fmha::collective::LocalMask<true>, Mask> ||
         std::is_base_of_v<cutlass::fmha::collective::LocalMask<false>, Mask>) {
       int offset = 0;
-      if (std::is_base_of_v<cutlass::fmha::collective::CausalMask<false>, Mask> 
+      if constexpr (std::is_base_of_v<cutlass::fmha::collective::CausalMask<false>, Mask>
     || std::is_base_of_v<cutlass::fmha::collective::LocalMask<false>, Mask>){
       offset = (get<1>(problem_shape) - get<0>(problem_shape));
         }
@@ -1561,7 +1561,6 @@ struct Sm100FmhaBwdKernelTmaWarpSpecialized {
     auto block_tma = mainloop_params.tma_red_dq.get_slice(_0{});
 
     Tensor tDQsDQ = block_tma.partition_S(sDQ);
-    Tensor tDQcDQ = block_tma.partition_S(cDQ);
     Tensor tDQgDQ = block_tma.partition_D(gDQ);
 
     int lane_predicate = (threadIdx.x % (kNumReduceWarps * NumThreadsPerWarp)) == 0;
