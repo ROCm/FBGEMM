@@ -3512,9 +3512,9 @@ torch::autograd::variable_list group_index_select_dim0(
   auto res = forward_op.call(
     all_indices_input_tensor, static_cast<int64_t>(group_size));
 #ifdef USE_ROCM
-  TORCH_CHECK(res.size() >= group_size + 4);  // ROCm: +4 tensors (2 args, 2 saved_data)
+  TORCH_CHECK(res.size() >= group_size + 2);  // ROCm: >= to handle both CPU (+2) and GPU (+4)
 #else
-  TORCH_CHECK(res.size() >= group_size + 2);  // CUDA: +2 tensors (1 args, 1 saved_data)
+  TORCH_CHECK(res.size() == group_size + 2);  // CUDA: +2 tensors (1 args, 1 saved_data)
 #endif
   // only return the outputs (the first group_size elements)
   res.resize(group_size);
@@ -3627,9 +3627,9 @@ torch::autograd::variable_list GroupIndexSelectDim0Op::forward(
           .typed<decltype(group_index_select_dim0_forward_impl_cpu)>();
   auto result = forward_op.call(all_indices_input, group_size);
 #ifdef USE_ROCM
-  TORCH_CHECK(static_cast<int64_t>(result.size()) >= group_size + 4);  // ROCm: +4 tensors
+  TORCH_CHECK(static_cast<int64_t>(result.size()) >= group_size + 2);  // ROCm: >= to handle both CPU (+2) and GPU (+4)
 #else
-  TORCH_CHECK(static_cast<int64_t>(result.size()) >= group_size + 2);  // CUDA: +2 tensors
+  TORCH_CHECK(static_cast<int64_t>(result.size()) == group_size + 2);  // CUDA: +2 tensors
 #endif
   ctx->saved_data["group_size"] = group_size;
 
@@ -3677,9 +3677,9 @@ torch::autograd::variable_list GroupIndexSelectDim0Op::backward(
 
   const auto saved_tensors = ctx->get_saved_variables();
 #ifdef USE_ROCM
-  TORCH_CHECK(saved_tensors.size() >= group_size + 5);  // ROCm: indices + 4 tensors + fwd_input
+  TORCH_CHECK(saved_tensors.size() >= group_size + 3);  // ROCm: >= to handle both CPU (+3) and GPU (+5)
 #else
-  TORCH_CHECK(saved_tensors.size() >= group_size + 3);  // CUDA: indices + 2 tensors + fwd_input
+  TORCH_CHECK(saved_tensors.size() == group_size + 3);  // CUDA: indices + 2 tensors + fwd_input
 #endif
   std::vector<c10::SymInt> output_shape_group;
   int i = 0;
