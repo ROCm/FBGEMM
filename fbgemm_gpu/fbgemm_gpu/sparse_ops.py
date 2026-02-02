@@ -982,23 +982,37 @@ def group_index_select_dim0_gpu_impl_abstract(
     # divide by 2 since sizeof(int64_t) / sizeof(int32_t) = 2
     args_tensor_numel = 4 * group_size + 1 + int(math.ceil(group_size / 2))
 
-    ret.append(
-        # sizeof(int64_t) = 8, torch.uint8 = at::kByte
-        input_group[0].new_empty(
-            args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+    # Runtime check for ROCm vs CUDA
+    is_rocm = torch.version.hip is not None
+
+    if is_rocm:
+        # ROCm: Allocate dual args_tensors and saved_data tensors
+        ret.append(
+            # sizeof(int64_t) = 8, torch.uint8 = at::kByte
+            input_group[0].new_empty(
+                args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+            )
         )
-    )
 
-    ret.append(
-        # sizeof(int64_t) = 8, torch.uint8 = at::kByte
-        input_group[0].new_empty(
-            args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+        ret.append(
+            # sizeof(int64_t) = 8, torch.uint8 = at::kByte
+            input_group[0].new_empty(
+                args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+            )
         )
-    )
 
-    ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
-    ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+        ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+        ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+    else:
+        # CUDA: Allocate single args_tensor and saved_data tensor
+        ret.append(
+            # sizeof(int64_t) = 8, torch.uint8 = at::kByte
+            input_group[0].new_empty(
+                args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+            )
+        )
 
+        ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
 
     return ret
 
