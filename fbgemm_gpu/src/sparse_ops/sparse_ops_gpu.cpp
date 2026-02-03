@@ -277,6 +277,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
     int64_t* input_ptrs = nullptr;
     int64_t* output_ptrs = nullptr;
     int64_t* indices_ptrs = nullptr;
+    int64_t* sorted_indices_ptrs = nullptr;
+    int64_t* reverse_indices_ptrs = nullptr;
     int64_t* warp_offsets_group = nullptr;
     int32_t* num_cols_group = nullptr;
     int64_t total_warps = 0;
@@ -289,6 +291,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       &small.input_ptrs,
       &small.output_ptrs,
       &small.indices_ptrs,
+      &small.sorted_indices_ptrs,
+      &small.reverse_indices_ptrs,
       &small.warp_offsets_group,
       &small.num_cols_group,
       reinterpret_cast<int64_t*>(args_tensor_small.mutable_data_ptr()),
@@ -298,6 +302,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       &large.input_ptrs,
       &large.output_ptrs,
       &large.indices_ptrs,
+      &large.sorted_indices_ptrs,
+      &large.reverse_indices_ptrs,
       &large.warp_offsets_group,
       &large.num_cols_group,
       reinterpret_cast<int64_t*>(args_tensor_large.mutable_data_ptr()),
@@ -608,6 +614,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         small.input_ptrs,
         small.output_ptrs,
         small.indices_ptrs,
+        /*sorted_indices_ptrs=*/nullptr,    // Forward pass doesn't use sorting yet
+        /*reverse_indices_ptrs=*/nullptr,   // Forward pass doesn't use sorting yet
         small.warp_offsets_group,
         small.num_cols_group,
         first_input.scalar_type(),
@@ -618,6 +626,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         small.count,
         /*use_index_select=*/true,
         use_var_cols_small,
+        use_contiguous_warps,
         /*use_small_emb_dim=*/true);
   }
 
@@ -626,6 +635,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         large.input_ptrs,
         large.output_ptrs,
         large.indices_ptrs,
+        /*sorted_indices_ptrs=*/nullptr,    // Forward pass doesn't use sorting yet
+        /*reverse_indices_ptrs=*/nullptr,   // Forward pass doesn't use sorting yet
         large.warp_offsets_group,
         large.num_cols_group,
         first_input.scalar_type(),
@@ -636,6 +647,7 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
         large.count,
         /*use_index_select=*/true,
         use_var_cols_large,
+        use_contiguous_warps,
         /*use_small_emb_dim=*/false);
   }
 
