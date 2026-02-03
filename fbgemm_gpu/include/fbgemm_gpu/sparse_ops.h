@@ -1090,7 +1090,11 @@ void group_index_select_or_add_cuda(
     const int group_size,
     const bool use_index_select,
     const bool use_var_cols,
-    const bool use_contiguous_warps);
+    const bool use_contiguous_warps
+#ifdef USE_ROCM
+    ,const bool use_small_emb_dim
+#endif
+);
 
 int get_group_index_select_cols_per_warp();
 

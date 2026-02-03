@@ -41,16 +41,30 @@ int get_group_index_select_unroll_factor() {
   return GROUP_INDEX_SELECT_UNROLL_FACTOR;
 }
 
+#ifdef USE_ROCM
 template <
     typename index_t,
     typename scalar_t,
     bool USE_INDEX_SELECT,
     bool USE_VAR_COLS,
-    bool USE_CONTIGUOUS_WARPS, 
+    bool USE_CONTIGUOUS_WARPS,
+    bool USE_SORTED_INDICES,
+    bool USE_SMALL_EMB_DIM,
+    int UNROLL_FACTOR,
+    int COLS_PER_WARP,
+    int LOG_COLS_PER_WARP>
+#else
+template <
+    typename index_t,
+    typename scalar_t,
+    bool USE_INDEX_SELECT,
+    bool USE_VAR_COLS,
+    bool USE_CONTIGUOUS_WARPS,
     bool USE_SORTED_INDICES,
     int UNROLL_FACTOR,
     int COLS_PER_WARP,
     int LOG_COLS_PER_WARP>
+#endif
 __global__
 __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     const int64_t* input_ptrs,
@@ -70,6 +84,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
   }
 
+  // Contiguous warps optimization (available for both CUDA and ROCm)
   int64_t start_warp_id = 0;
   int64_t warp_end = 0;
   int64_t warp_stride = 0;
@@ -109,61 +124,65 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       member_warp_id = warp_id - warp_offsets_group[member_id];
     } else {
       // All columns are the same
-      member_id = warp_id / (warps_per_row * num_work_rows);
-      member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
 #ifdef USE_ROCM
-      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-        // Need to ensure that [member_id] and [member_warp_id] are calculated
-        // correctly for the small embedding dimension path below
+      if constexpr (USE_SMALL_EMB_DIM) {
+        // Small embedding: pack multiple rows per warp
         const auto rows_per_warp = COLS_PER_WARP / num_cols;
         const auto warps_per_member =
             DIV_ROUND_UP(num_work_rows, rows_per_warp);
         member_id = warp_id / warps_per_member;
         member_warp_id = warp_id % warps_per_member;
+      } else {
+#endif
+        // Large embedding: one or more warps per row
+        member_id = warp_id / (warps_per_row * num_work_rows);
+        member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
+#ifdef USE_ROCM
       }
-#endif // USE_ROCM
+#endif
     }
 
+    // Sorted indices support (available for both CUDA and ROCm)
     const int64_t* reverse_indices = USE_SORTED_INDICES
         ? reinterpret_cast<int64_t*>(reverse_indices_ptrs[member_id])
         : nullptr;
 
 #ifdef USE_ROCM
-    if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-      // Optimized path for small embedding dimensions
+    if constexpr (USE_SMALL_EMB_DIM) {
+      // Small embedding dimension: pack multiple rows per warp
       // Each warp processes 'rows_per_warp' rows
       const auto rows_per_warp = COLS_PER_WARP / num_cols;
       const int64_t start_row = member_warp_id * rows_per_warp;
 
       // Since we are processing multiple rows within the warp, we need to
       // map each lane to a specific row, in addition to the column
-      const auto local_row = (threadIdx.x * UNROLL_FACTOR) /
+      const auto local_row = (threadIdx.x * UNROLL_FACTOR) / 
           num_cols; // the row ID within the set of rows handled by this warp
       const auto col_offset = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-      const auto sorted_row = start_row + local_row;
+      const auto sorted_row = start_row + local_row; // the actual row within the table processed by this lane
 
-      // local_row may be out of bounds for the last few lanes in the warp if
+      // sorted_row may be out of bounds for the last few lanes in the warp if
       // [COLS_PER_WARP % num_cols != 0] and we also need to confirm that we are
       // within num_work_rows. For the sorted-indices path we also need to guard
       // reverse_indices reads to avoid OOB accesses when extra warps are idle.
       if (local_row < rows_per_warp && sorted_row < num_work_rows) {
-        const int64_t current_row = USE_SORTED_INDICES ? reverse_indices[sorted_row]
-                      // the actual row within the table processed by this lane
-                               : sorted_row;
+        // Apply reverse mapping if using sorted indices
+        const int64_t current_row = USE_SORTED_INDICES ? reverse_indices[sorted_row] : sorted_row;
+
         scalar_t* input =
             reinterpret_cast<scalar_t*>(input_ptrs[member_id]) + col_offset;
         scalar_t* output =
             reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
         index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+        // For sorted indices, use sorted_row to index into indices array
         const auto indices_row = USE_SORTED_INDICES ? sorted_row : current_row;
         const index_t idx = indices[indices_row];
 #pragma unroll
         for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
           // Compile time conditional
           if constexpr (USE_INDEX_SELECT) {
-            output[current_row * num_cols + i] =
-                LDG(&input[idx * num_cols + i]);
+            output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
           } else {
             gpuAtomicAddNoReturn(
                 &output[idx * num_cols + i], input[current_row * num_cols + i]);
@@ -171,12 +190,11 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         }
       }
     } else {
-      // Large embedding dimensions use >= 1 warp per row
-      // which is the default codepath for non-ROCm as well
-#endif // USE_ROCM
+#endif
+      // Large embedding dimension: one or more warps per row
+      // Sorted indices support (available for both CUDA and ROCm)
       const auto sorted_row = member_warp_id / warps_per_row;
-      const auto row =
-            USE_SORTED_INDICES ? reverse_indices[sorted_row] : sorted_row;
+      const auto row = USE_SORTED_INDICES ? reverse_indices[sorted_row] : sorted_row;
       const auto col_offset =
           ((member_warp_id % warps_per_row) << LOG_COLS_PER_WARP) +
           (threadIdx.x * UNROLL_FACTOR);
@@ -185,9 +203,10 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       scalar_t* output =
           reinterpret_cast<scalar_t*>(output_ptrs[member_id]) + col_offset;
 
-        index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
-        const auto indices_row = USE_SORTED_INDICES ? sorted_row : row;
-        const index_t idx = indices[indices_row];
+      index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
+      // For sorted indices, use sorted_row to index into indices array
+      const auto indices_row = USE_SORTED_INDICES ? sorted_row : row;
+      const index_t idx = indices[indices_row];
 #pragma unroll
       for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
         // Compile time conditional
@@ -200,7 +219,7 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       }
 #ifdef USE_ROCM
     }
-#endif // USE_ROCM
+#endif
   }
 }
 
@@ -220,7 +239,11 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
     const int group_size,
     const bool use_index_select,
     const bool use_var_cols,
-    const bool use_contiguous_warps) {
+    const bool use_contiguous_warps
+#ifdef USE_ROCM
+    ,const bool use_small_emb_dim
+#endif
+) {
   if (group_size == 0) {
     return;
   }
@@ -237,12 +260,23 @@ DLL_PUBLIC void group_index_select_or_add_cuda(
       max_grid_size);
   dim3 block_size(EMULATED_WARP_SIZE, num_warps_per_threadblock, 1);
 
-auto invoke_group_index_select_or_add = [&]<typename index_t,
-                                            typename scalar_t,
-                                            bool USE_INDEX_SELECT,
-                                            bool USE_VAR_COLS,
-                                            bool USE_CONTIGUOUS_WARPS,
-                                            bool USE_SORTED_INDICES>() {
+  // Lambda for kernel invocation with compile-time template parameters
+#ifdef USE_ROCM
+  auto invoke_group_index_select_or_add = [&]<typename index_t,
+                                              typename scalar_t,
+                                              bool USE_INDEX_SELECT,
+                                              bool USE_VAR_COLS,
+                                              bool USE_CONTIGUOUS_WARPS,
+                                              bool USE_SORTED_INDICES,
+                                              bool USE_SMALL_EMB_DIM>() {
+#else
+  auto invoke_group_index_select_or_add = [&]<typename index_t,
+                                              typename scalar_t,
+                                              bool USE_INDEX_SELECT,
+                                              bool USE_VAR_COLS,
+                                              bool USE_CONTIGUOUS_WARPS,
+                                              bool USE_SORTED_INDICES>() {
+#endif
     FBGEMM_LAUNCH_KERNEL(
         (group_index_select_or_add_2d_kernel<
             index_t,
@@ -251,6 +285,9 @@ auto invoke_group_index_select_or_add = [&]<typename index_t,
             USE_VAR_COLS,
             USE_CONTIGUOUS_WARPS,
             USE_SORTED_INDICES,
+#ifdef USE_ROCM
+            USE_SMALL_EMB_DIM,
+#endif
             GROUP_INDEX_SELECT_UNROLL_FACTOR,
             GROUP_INDEX_SELECT_COLS_PER_WARP,
             GROUP_INDEX_SELECT_LOG_COLS_PER_WARP>),
@@ -267,7 +304,7 @@ auto invoke_group_index_select_or_add = [&]<typename index_t,
         num_work_rows,
         group_size);
   };
-  
+
   using bool_variant_t = std::variant<std::true_type, std::false_type>;
 
   auto get_bool_type = [](const bool var) -> bool_variant_t {
@@ -282,28 +319,56 @@ auto invoke_group_index_select_or_add = [&]<typename index_t,
   const bool_variant_t use_var_cols_variant = get_bool_type(use_var_cols);
   const bool_variant_t use_contiguous_warps_variant = get_bool_type(use_contiguous_warps);
   const bool_variant_t use_sorted_indices_variant = get_bool_type(use_sorted_indices);
+#ifdef USE_ROCM
+  const bool_variant_t use_small_emb_dim_variant = get_bool_type(use_small_emb_dim);
+#endif
 
   AT_DISPATCH_INDEX_TYPES(
       indices_scalar_type, "group_index_select_2d_wrapper_1", [&] {
         FBGEMM_DISPATCH_FLOATING_TYPES(
             input_scalar_type, "group_index_select_2d_wrapper_2", [&] {
+#ifdef USE_ROCM
+              // ROCm: Dispatch with USE_SMALL_EMB_DIM variant
               std::visit(
-                  [&](auto use_index_select_arg, 
+                  [&](auto use_index_select_arg,
+                      auto use_var_cols_arg,
+                      auto use_contiguous_warps_arg,
+                      auto use_sorted_indices_arg,
+                      auto use_small_emb_dim_arg) {
+                    invoke_group_index_select_or_add.template operator()<
+                        index_t,
+                        scalar_t,
+                        use_index_select_arg.value,
+                        use_var_cols_arg.value,
+                        use_contiguous_warps_arg.value,
+                        use_sorted_indices_arg.value,
+                        use_small_emb_dim_arg.value>();
+                  },
+                  use_index_select_variant,
+                  use_var_cols_variant,
+                  use_contiguous_warps_variant,
+                  use_sorted_indices_variant,
+                  use_small_emb_dim_variant);
+#else
+              // CUDA: Dispatch without USE_SMALL_EMB_DIM
+              std::visit(
+                  [&](auto use_index_select_arg,
                       auto use_var_cols_arg,
                       auto use_contiguous_warps_arg,
                       auto use_sorted_indices_arg) {
                     invoke_group_index_select_or_add.template operator()<
-                        index_t, 
-                        scalar_t, 
+                        index_t,
+                        scalar_t,
                         use_index_select_arg.value,
-                        use_var_cols_arg.value, 
+                        use_var_cols_arg.value,
                         use_contiguous_warps_arg.value,
                         use_sorted_indices_arg.value>();
                   },
-                  use_index_select_variant, 
+                  use_index_select_variant,
                   use_var_cols_variant,
-                  use_contiguous_warps_variant, 
+                  use_contiguous_warps_variant,
                   use_sorted_indices_variant);
+#endif
             });
       });
 }
