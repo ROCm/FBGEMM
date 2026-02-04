@@ -924,6 +924,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   // that the contiguous tensors will outlive the kernel computation
   std::vector<c10::MaybeOwned<at::Tensor>> grad_output_contigs;
   grad_output_contigs.reserve(group_size);
+#endif
 
 #ifdef USE_ROCM
   const int cols_per_warp = get_group_index_select_cols_per_warp();
