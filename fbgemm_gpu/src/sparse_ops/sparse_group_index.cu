@@ -42,6 +42,35 @@ int get_group_index_select_unroll_factor() {
 }
 
 template <typename T>
+__device__ inline T shfl_down_scalar(const T val, const int offset) {
+    // 32-bit types (Float, Int32)
+    if constexpr (sizeof(T) == 4) {
+        float v = *reinterpret_cast<const float*>(&val);
+        v = __shfl_down(v, offset);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 64-bit types (Double, Int64)
+    else if constexpr (sizeof(T) == 8) {
+        double v = *reinterpret_cast<const double*>(&val);
+        v = __shfl_down(v, offset);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 16-bit types (Half, BFloat16)
+    else if constexpr (sizeof(T) == 2) {
+        // Cast 16 bits to short, promote to int for the shuffle
+        unsigned short v = *reinterpret_cast<const unsigned short*>(&val);
+        int iv = static_cast<int>(v);
+        iv = __shfl_down(iv, offset);
+        unsigned short ret = static_cast<unsigned short>(iv);
+        return *reinterpret_cast<T*>(&ret);
+    }
+    else {
+        // Fallback or error
+        return val; 
+    }
+}
+
+template <typename T>
 __device__ inline T shfl_scalar(const T val, const int srcLane) {
     // 32-bit types (Float, Int32)
     if constexpr (sizeof(T) == 4) {
@@ -239,22 +268,19 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
 
             auto my_value = input[current_row * num_cols + i];
 
-            scalar_t group_sum = 0;
+            scalar_t group_sum = my_value;
 
-            // Accumulate values from all the peer lanes
-            while(peer_mask) {
-              // Selecting the smallest present lane in the peer group
-              int peer_lane = __ffsll(peer_mask) - 1;
+            #pragma unroll
+            for (int offset = 1; offset < 64; offset *= 2) {
+                // Pull value from the neighbor "offset" away
+                scalar_t other_val = shfl_down_scalar<scalar_t>(group_sum, offset);
 
-              // Extract the value from the peer lane
-              auto peer_value = shfl_scalar<scalar_t>(my_value, peer_lane);
-
-              if(threadIdx.x == leader_lane) {
-                group_sum += peer_value;
-              }
-
-              // Remove the selected lane from the peer mask
-              peer_mask ^= (1ULL << peer_lane);
+                // Check if the neighbor is actually in our peer group.
+                // We do this by checking if the bit corresponding to (lane + offset)
+                // is set in OUR peer_mask.
+                if (peer_mask & (1ULL << (threadIdx.x + offset))) {
+                    group_sum += other_val;
+                }
             }
 
             // Only the leader lane performs the global atomic add
