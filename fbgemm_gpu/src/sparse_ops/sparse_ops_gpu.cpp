@@ -537,6 +537,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
             &small.input_ptrs,
             &small.output_ptrs,
             &small.indices_ptrs,
+            &small.sorted_indices_ptrs,
+            &small.reverse_indices_ptrs,
             &small.warp_offsets_group,
             &small.num_cols_group,
             reinterpret_cast<int64_t*>(args_tensor_small.mutable_data_ptr()),
@@ -553,6 +555,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
             &large.input_ptrs,
             &large.output_ptrs,
             &large.indices_ptrs,
+            &large.sorted_indices_ptrs,
+            &large.reverse_indices_ptrs,
             &large.warp_offsets_group,
             &large.num_cols_group,
             reinterpret_cast<int64_t*>(args_tensor_large.mutable_data_ptr()),
@@ -812,7 +816,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
     }
   }
   // all_input size =  group_size * 2 (from grads, indices)
-  // + 1 args_tensor + 1 saved_data + 1 first input
+  // + 1 args_tensor + 1 saved_data + 1 sorted + 1 reverse + 1 first input
   const int64_t group_size = (all_inputs.size() - 5) / 2;
 
   const Tensor& fwd_input = all_inputs[2 * group_size + 4];
@@ -915,16 +919,14 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
   // Unpack sorted/reverse indices pointers (available for both CUDA and ROCm)
   int64_t* sorted_indices_ptrs = args_tensor.data_ptr<int64_t>() + 3 * group_size;
   int64_t* reverse_indices_ptrs = args_tensor.data_ptr<int64_t>() + 4 * group_size;
+#endif
 
+  // Common variables for gradient computation (both platforms)
   int64_t group_grad_input_numel = 0;
   std::vector<int64_t> grad_input_numels;
   grad_input_numels.reserve(group_size);
-
-  // We need to store contiguous gradients outside the for-loop to guarantee
-  // that the contiguous tensors will outlive the kernel computation
   std::vector<c10::MaybeOwned<at::Tensor>> grad_output_contigs;
   grad_output_contigs.reserve(group_size);
-#endif
 
 #ifdef USE_ROCM
   const int cols_per_warp = get_group_index_select_cols_per_warp();
