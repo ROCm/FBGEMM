@@ -19,7 +19,7 @@ namespace fbgemm_gpu {
 #ifdef USE_ROCM
 // The wave size is forced to be 32 on ROCm devices in favor
 // of granularity losses reduction.
-constexpr int EMULATED_WARP_SIZE = 32;
+constexpr int EMULATED_WARP_SIZE = 64;
 #else
 constexpr int EMULATED_WARP_SIZE = kWarpSize;
 #endif
@@ -39,6 +39,35 @@ int get_group_index_select_cols_per_warp() {
 
 int get_group_index_select_unroll_factor() {
   return GROUP_INDEX_SELECT_UNROLL_FACTOR;
+}
+
+template <typename T>
+__device__ inline T shfl_scalar(const T val, const int srcLane) {
+    // 32-bit types (Float, Int32)
+    if constexpr (sizeof(T) == 4) {
+        float v = *reinterpret_cast<const float*>(&val);
+        v = __shfl(v, srcLane);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 64-bit types (Double, Int64)
+    else if constexpr (sizeof(T) == 8) {
+        double v = *reinterpret_cast<const double*>(&val);
+        v = __shfl(v, srcLane);
+        return *reinterpret_cast<T*>(&v);
+    } 
+    // 16-bit types (Half, BFloat16)
+    else if constexpr (sizeof(T) == 2) {
+        // Cast 16 bits to short, promote to int for the shuffle
+        unsigned short v = *reinterpret_cast<const unsigned short*>(&val);
+        int iv = static_cast<int>(v);
+        iv = __shfl(iv, srcLane);
+        unsigned short ret = static_cast<unsigned short>(iv);
+        return *reinterpret_cast<T*>(&ret);
+    }
+    else {
+        // Fallback or error
+        return val; 
+    }
 }
 
 #ifdef USE_ROCM
@@ -178,14 +207,62 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
         // For sorted indices, use sorted_row to index into indices array
         const auto indices_row = USE_SORTED_INDICES ? sorted_row : current_row;
         const index_t idx = indices[indices_row];
+
+        // Determine all the other lanes that are working on the same column
+        auto col_mask = __match_any_sync(__activemask(), col_offset);
+
+        // Determing all the other lanes that are working on the same index
+        uint64_t index_mask = 0;
+
+        if constexpr (sizeof(index_t) == 8) {
+            // Safe to treat as 64-bit
+            unsigned long long idx_val = *reinterpret_cast<const unsigned long long*>(&idx);
+            index_mask = __match_any_sync(__activemask(), idx_val);
+        } else {
+            // It is 32-bit (or smaller), treat as 32-bit int
+            unsigned int idx_val = static_cast<unsigned int>(idx);
+            index_mask = __match_any_sync(__activemask(), idx_val);
+        }
+
 #pragma unroll
         for (int i = 0; i < UNROLL_FACTOR && col_offset + i < num_cols; i++) {
           // Compile time conditional
           if constexpr (USE_INDEX_SELECT) {
             output[current_row * num_cols + i] = LDG(&input[idx * num_cols + i]);
           } else {
-            gpuAtomicAddNoReturn(
-                &output[idx * num_cols + i], input[current_row * num_cols + i]);
+            // The lanes that will write to the same output location are the intersection
+            auto peer_mask = col_mask & index_mask;
+
+            // Within the peer group, we select a leader to add-up the values from all the peers
+            // and perform the final global atomic add at the output location
+            auto leader_lane = __ffsll(peer_mask) - 1; // ffsll returns 1-based index
+
+            auto my_value = input[current_row * num_cols + i];
+
+            scalar_t group_sum = 0;
+
+            // Accumulate values from all the peer lanes
+            while(peer_mask) {
+              // Selecting the smallest present lane in the peer group
+              int peer_lane = __ffsll(peer_mask) - 1;
+
+              // Extract the value from the peer lane
+              auto peer_value = shfl_scalar<scalar_t>(my_value, peer_lane);
+
+              if(threadIdx.x == leader_lane) {
+                group_sum += peer_value;
+              }
+
+              // Remove the selected lane from the peer mask
+              peer_mask ^= (1ULL << peer_lane);
+            }
+
+            // Only the leader lane performs the global atomic add
+            if(threadIdx.x == leader_lane) {
+              gpuAtomicAddNoReturn(
+                  &output[idx * num_cols + i], 
+                  group_sum);
+            }
           }
         }
       }
