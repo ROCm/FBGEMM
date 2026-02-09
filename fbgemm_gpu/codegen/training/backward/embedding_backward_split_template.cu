@@ -1422,9 +1422,9 @@ Tensor {{ embedding_cuda_op }}(
                                 {{ ph_name + "_ph_t" }},
                                 {%- endfor %}
                                 1,
-                                32,
+                                8,
                                 false>;
-                            blockSize = dim3(32, num_warp_per_row_groups);
+                            blockSize = dim3(8, num_warp_per_row_groups);
                         }
                     }
                     {%- endif %}
