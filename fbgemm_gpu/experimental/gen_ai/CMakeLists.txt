@@ -158,8 +158,12 @@ gpu_cpp_library(
   HIPCC_FLAGS
     # Below flags are required for strong CK performance
     # on certain kernel instances
-    -mllvm
-    -enable-post-misched=0
+    #-mllvm
+    # Reduce register spillage on certain kernels
+    # Probably should be "--amdgpu-mode-register=1"
+    #-amdgpu-coerce-illegal-types=1
+    #-mllvm
+    #-enable-post-misched=0
     -mllvm
     -greedy-reverse-local-assignment=1
     -fhip-new-launch-api)

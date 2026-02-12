@@ -76,24 +76,33 @@ __device__ half llvm_amdgcn_raw_buffer_load_fp16(
     int32_t voffset,
     int32_t soffset = 0,
     int32_t glc_slc = 0)
-#if ROCM_VERSION_MAJOR >= 7
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3) 
+    __asm("llvm.amdgcn.raw.buffer.load.i16.v4i32");
+#elif ROCM_VERSION_MAJOR == 7
     __asm("llvm.amdgcn.raw.buffer.load.i16");
 #else
     __asm("llvm.amdgcn.raw.buffer.load.f16");
-#endif
+#endif // ROCM_VERSION_MAJOR >= 7 
 
 __device__ float llvm_amdgcn_raw_buffer_load_fp32(
     int32x4_t srsrc,
     int32_t voffset,
     int32_t soffset = 0,
-    int32_t glc_slc = 0) __asm("llvm.amdgcn.raw.buffer.load.f32");
+    int32_t glc_slc = 0)
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3) 
+    __asm("llvm.amdgcn.raw.buffer.load.f32.v4i32");
+#else
+    __asm("llvm.amdgcn.raw.buffer.load.f32");
+#endif
 
 __device__ half2 llvm_amdgcn_raw_buffer_load_fp16x2(
     int32x4_t srsrc,
     int32_t voffset,
     int32_t soffset = 0,
     int32_t glc_slc = 0)
-#if ROCM_VERSION_MAJOR >= 7
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3)
+    __asm("llvm.amdgcn.raw.buffer.load.i32.v4i32");
+#elif ROCM_VERSION_MAJOR == 7
     __asm("llvm.amdgcn.raw.buffer.load.i32");
 #else
     __asm("llvm.amdgcn.raw.buffer.load.v2f16");
@@ -105,7 +114,9 @@ __device__ void llvm_amdgcn_raw_buffer_store_fp16(
     int32_t voffset,
     int32_t soffset = 0,
     int32_t glc_slc = 0)
-#if ROCM_VERSION_MAJOR >= 7
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3)
+    __asm("llvm.amdgcn.raw.buffer.store.i16.v4i32");
+#elif ROCM_VERSION_MAJOR == 7
     __asm("llvm.amdgcn.raw.buffer.store.i16");
 #else
     __asm("llvm.amdgcn.raw.buffer.store.f16");
@@ -117,7 +128,9 @@ __device__ void llvm_amdgcn_raw_buffer_store_fp16x2(
     int32_t voffset,
     int32_t soffset = 0,
     int32_t glc_slc = 0)
-#if ROCM_VERSION_MAJOR >= 7
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3)
+    __asm("llvm.amdgcn.raw.buffer.store.i32.v4i32");
+#elif ROCM_VERSION_MAJOR == 7
     __asm("llvm.amdgcn.raw.buffer.store.i32");
 #else
     __asm("llvm.amdgcn.raw.buffer.store.v2f16");
@@ -128,7 +141,12 @@ __device__ void llvm_amdgcn_raw_buffer_store_fp32(
     int32x4_t rsrc,
     int32_t voffset,
     int32_t soffset = 0,
-    int32_t glc_slc = 0) __asm("llvm.amdgcn.raw.buffer.store.f32");
+    int32_t glc_slc = 0)
+#if ROCM_VERSION_MAJOR > 7 || (ROCM_VERSION_MAJOR == 7 && ROCM_VERSION_MINOR >= 3) 
+    __asm("llvm.amdgcn.raw.buffer.store.f32.v4i32");
+#else
+    __asm("llvm.amdgcn.raw.buffer.store.f32");
+#endif
 
 __device__ void llvm_amdgcn_raw_buffer_store_fp32x2(
     floatx2_t vdata,

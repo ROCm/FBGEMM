@@ -1,0 +1,57 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index da5a86523..366de2bb9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -271,10 +271,10 @@ if(NOT WIN32 AND ${hip_VERSION_FLAT} GREATER 600140090)
+   endif()
+ endif()
+ set(check-coerce)
+-check_cxx_compiler_flag(" -mllvm -amdgpu-coerce-illegal-types=1" check-coerce)
++check_cxx_compiler_flag(" -mllvm" check-coerce)
+ if(NOT WIN32 AND check-coerce AND ${hip_VERSION_FLAT} GREATER 600241132)
+-   message(STATUS "Adding the amdgpu-coerce-illegal-types=1")
+-   add_compile_options("SHELL: -mllvm -amdgpu-coerce-illegal-types=1")
++   message(STATUS "Adding the ")
++   add_compile_options("SHELL: -mllvm ")
+ endif()
+ if(NOT WIN32 AND ${hip_VERSION_FLAT} GREATER 600241132)
+    message(STATUS "Adding -amdgpu-early-inline-all=true and -amdgpu-function-calls=false")
+diff --git a/include/ck/ck.hpp b/include/ck/ck.hpp
+index 794c6f4e2..d026d7265 100644
+--- a/include/ck/ck.hpp
++++ b/include/ck/ck.hpp
+@@ -69,7 +69,7 @@
+     defined(__gfx1152__) || defined(__gfx11_generic__)
+ #define __gfx11__
+ #endif
+-#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx12_generic__)
++#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx12_generic__) || defined(__gfx1250__)
+ #define __gfx12__
+ #endif
+ 
+diff --git a/include/ck/utility/inner_product.hpp b/include/ck/utility/inner_product.hpp
+index 65efaf388..401d56af0 100644
+--- a/include/ck/utility/inner_product.hpp
++++ b/include/ck/utility/inner_product.hpp
+@@ -99,7 +99,7 @@ __device__ void inner_product<half2_t, half2_t, float>(const half2_t& a, const h
+                  : "=v"(c)
+                  : "v"(a), "v"(b), "0"(c));
+ #else
+-    c = __builtin_amdgcn_fdot2(a, b, c, false);
++    // c = __builtin_amdgcn_fdot2(a, b, c, false);
+ #endif
+ #else
+     const vector_type<half_t, 2> a_vector{a};
+diff --git a/include/ck/utility/inner_product_dpp8.hpp b/include/ck/utility/inner_product_dpp8.hpp
+index f079e2ca6..5812a16ce 100644
+--- a/include/ck/utility/inner_product_dpp8.hpp
++++ b/include/ck/utility/inner_product_dpp8.hpp
+@@ -102,7 +102,7 @@ __device__ void intrinsic_fdot2_impl(const half2_t& a, const half2_t& b, float&
+     constexpr int sel_mask = get_dpp_sel_mask_broadcast<SrcLaneIdx>();
+     const half2_t val_from_other_lane =
+         bit_cast<half2_t>(__builtin_amdgcn_mov_dpp8(bit_cast<int>(a), sel_mask));
+-    c = __builtin_amdgcn_fdot2(val_from_other_lane, b, c, false);
++    // c = __builtin_amdgcn_fdot2(val_from_other_lane, b, c, false);
+ }
+ 
+ /**
