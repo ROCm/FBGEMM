@@ -1412,6 +1412,13 @@ Tensor {{ embedding_cuda_op }}(
                              kThreadGroupSize,
                              kUseVecBlocking>;
                         if (max_D <= 128) {
+                            constexpr auto thread_group_size = 8; // best performance
+                            constexpr auto vector_width = 4;
+                            constexpr auto fixed_max_vecs_per_thread = [](auto thread_group_size, auto vector_width) {
+                              const auto max_D = 128;
+                              return max_D / vector_width / thread_group_size;
+                            }(thread_group_size, vector_width);
+                            printf("thread_group_size = %d, fixed_max_vecs_per_thread = %d", thread_group_size, fixed_max_vecs_per_thread);
                             backward_warp_per_row_kernel =
                             {{ hip_mixed_d_warp_kernel }}
                                 <emb_t,
@@ -1421,10 +1428,10 @@ Tensor {{ embedding_cuda_op }}(
                                 {%- for ph_name in args.placeholder_tensor_names %}
                                 {{ ph_name + "_ph_t" }},
                                 {%- endfor %}
-                                1,
-                                8,
+                                fixed_max_vecs_per_thread,
+                                thread_group_size,
                                 false>;
-                            blockSize = dim3(8, num_warp_per_row_groups);
+                            blockSize = dim3(thread_group_size, num_warp_per_row_groups);
                         }
                     }
                     {%- endif %}

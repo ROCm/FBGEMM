@@ -32,6 +32,9 @@ DEVICE_INLINE __device__ T subwarp_reduce_add(T value) {
         value += __shfl_xor(value, 4, 8);
     } else if (kThreadGroupSize == 16) {
         // Reduce across 4 groups of 16 threads
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+          printf("%s, %d, kThreadGroupSize = %d\n", __FILE__, __LINE__, kThreadGroupSize);
+        }
         value += __shfl_xor(value, 1, 16);
         value += __shfl_xor(value, 2, 16);
         value += __shfl_xor(value, 4, 16);

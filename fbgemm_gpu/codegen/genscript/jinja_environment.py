@@ -70,7 +70,7 @@ env.globals["items_per_warp"] = 128 if args.is_rocm is False else 256
 
 # The fixed max vectors per thread for different kernels.  The numbers were
 # derived from empirical studies
-env.globals["fixed_max_vecs_per_thread"] = {"backward": 2, "backward_indice_weights": 6}
+env.globals["fixed_max_vecs_per_thread"] = {"backward": 9, "backward_indice_weights": 6}
 
 env.globals["dense"] = False
 env.globals["is_rocm"] = args.is_rocm
@@ -177,6 +177,13 @@ def get_max_vecs_template_configs(
     # Generate configs for the full-warp templates
     for v in range(1, fixed_max_vecs_per_thread + 1):
         configs.append((v, warp_size, "false"))
+    configs.append((2, 16, "false"))
+    configs.append((4, 16, "false"))
+    configs.append((8, 16, "false"))
+    configs.append((2, 8, "false"))
+    configs.append((4, 8, "false"))
+    configs.append((8, 8, "false"))
+    configs.append((16, 8, "false"))
 
     return configs
 
