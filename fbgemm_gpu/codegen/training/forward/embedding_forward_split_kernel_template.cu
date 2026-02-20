@@ -34,6 +34,7 @@
 {%- set locs_or_addrs_idx = "row_idx" if ssd else "cache_idx" %}
 
 #include "fbgemm_gpu/embedding_forward_template_helpers.cuh"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 {%- if is_rocm %}
 #include "fbgemm_gpu/utils/rocm/weight_row.h"
@@ -940,11 +941,12 @@ batch_index_select_dim0_codegen_forward_kernel
 {%- set max_forward_embedding_dim =
       legacy_max_embedding_dim if has_experimental else max_embedding_dim
 %}
+#if defined(ROCM_WAVE64)
 {%- for use_cache in (["true", "false"] if not dense else ["NULL"]) %}
 {%- for (kMaxVecsPerThread, kThreadGroupSize, use_blocking)
     in get_max_vecs_template_configs(
-        items_per_warp,
-        fixed_max_vecs_per_thread=max_forward_embedding_dim // items_per_warp,
+        items_per_wave64,
+        fixed_max_vecs_per_thread=max_forward_embedding_dim // items_per_wave64,
         use_subwarp_shuffle=use_subwarp_shuffle,
         use_vec_blocking=False,
     )
@@ -961,6 +963,29 @@ batch_index_select_dim0_codegen_forward_kernel
     {%- endif %}
 {%- endfor %}
 {%- endfor %}
+#else
+{%- for use_cache in (["true", "false"] if not dense else ["NULL"]) %}
+{%- for (kMaxVecsPerThread, kThreadGroupSize, use_blocking)
+    in get_max_vecs_template_configs(
+        items_per_warp32,
+        fixed_max_vecs_per_thread=max_forward_embedding_dim // items_per_warp32,
+        use_subwarp_shuffle=use_subwarp_shuffle,
+        use_vec_blocking=False,
+    )
+%}
+    {#-/* nobag does not have kMaxVecsPerThread as a template arg */#}
+    {%- if not nobag or kMaxVecsPerThread <= 1 %}
+        {{
+           bulk_template_instantiations(
+               use_cache,
+               kMaxVecsPerThread,
+               kThreadGroupSize
+           )
+        }}
+    {%- endif %}
+{%- endfor %}
+{%- endfor %}
+#endif // defined(ROCM_WAVE64)
 {%- endmacro %}
 
 ////////////////////////////////////////////////////////////////////////////////

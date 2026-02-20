@@ -43,6 +43,7 @@
 {%- endif %}
 #include "fbgemm_gpu/utils/cuda_utilities.cuh"
 #include "fbgemm_gpu/utils/kernel_launcher.cuh"
+#include "fbgemm_gpu/utils/warp_size.h"
 #include "fbgemm_gpu/embedding_forward_template_helpers.cuh"
 #include "fbgemm_gpu/split_embeddings_cache_cuda.cuh"
 
@@ -231,13 +232,14 @@ batch_index_select_dim0_codegen_forward_kernel(
     max_forward_embedding_dim
   )
 %}
-  {%- set fixed_max_vecs_per_thread = max_forward_embedding_dim // items_per_warp%}
+#if defined(ROCM_WAVE64)
+  {%- set fixed_max_vecs_per_thread = max_forward_embedding_dim // items_per_wave64%}
 #ifdef FBGEMM_USE_SUBWARP_SHUFFLE
 #define {{ dispatch_macro_name }}(MAX_D, ...) \
   [&] {                                        \
     {{
        dispatch_non_vec_blocking_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread,
            use_subwarp_shuffle=True)
     -}}
@@ -249,14 +251,42 @@ batch_index_select_dim0_codegen_forward_kernel(
   [&] {                                        \
     {{
        dispatch_non_vec_blocking_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread,
            use_subwarp_shuffle=False)
     -}}
     return;                                    \
   }()
 
-#endif
+#endif // ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+#else
+  {%- set fixed_max_vecs_per_thread = max_forward_embedding_dim // items_per_warp32%}
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+#define {{ dispatch_macro_name }}(MAX_D, ...) \
+  [&] {                                        \
+    {{
+       dispatch_non_vec_blocking_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread,
+           use_subwarp_shuffle=True)
+    -}}
+    return;                                    \
+  }()
+
+#else
+#define {{ dispatch_macro_name }}(MAX_D, ...) \
+  [&] {                                        \
+    {{
+       dispatch_non_vec_blocking_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread,
+           use_subwarp_shuffle=False)
+    -}}
+    return;                                    \
+  }()
+
+#endif // ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+#endif // defined(ROCM_WAVE64)
 {% endmacro %}
 
 {#-

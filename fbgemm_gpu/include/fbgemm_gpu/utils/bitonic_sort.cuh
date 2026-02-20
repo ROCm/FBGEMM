@@ -9,6 +9,7 @@
 #pragma once
 
 #include "fbgemm_gpu/utils/cuda_prelude.cuh"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 namespace fbgemm_gpu {
 
@@ -89,7 +90,7 @@ inline __device__ void warpBitonicMergeLE16(K& k, V& v) {
 template <typename K, typename V, bool Dir, typename Comp>
 struct BitonicSort {
   static inline __device__ void sort(K k[1], V v[1]) {
-#ifdef USE_ROCM
+#if defined(ROCM_WAVE64)
     static_assert(fbgemm_gpu::kWarpSize == 64, "unexpected warp size");
 #else
     static_assert(fbgemm_gpu::kWarpSize == 32, "unexpected warp size");

@@ -21,6 +21,8 @@
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 #endif
 #include <cassert>
+
+#include "fbgemm_gpu/utils/warp_size.h"
 #ifdef USE_ROCM
 #include "fbgemm_gpu/rocm/split_embeddings_common.h"
 #endif
@@ -60,13 +62,6 @@ namespace fbgemm_gpu {
 
 #define DIV_ROUND_UP(a, b) (a + b - 1) / b
 
-// Warp size
-#ifdef USE_ROCM
-static constexpr int32_t kWarpSize = 64;
-#else
-static constexpr int32_t kWarpSize = 32;
-#endif
-
 // Max thread num in one thread block
 static constexpr int32_t kMaxThreads = 1024;
 
@@ -77,7 +72,7 @@ static constexpr int32_t kMaxBlockYDim = 65535;
 static constexpr int32_t kMaxBlockZDim = 65535;
 
 // Full warp mask
-#if defined(USE_ROCM)
+#if defined(ROCM_WAVE64)
 static constexpr uint64_t kFullWarpMask = 0xff'ff'ff'ff'ff'ff'ff'ff;
 #else
 static constexpr uint32_t kFullWarpMask = 0xff'ff'ff'ff;

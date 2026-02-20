@@ -28,6 +28,7 @@
 #include "fbgemm_gpu/utils/kernel_launcher.cuh"
 #include "fbgemm_gpu/utils/ops_utils.h"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 {%- if is_rocm %}
 #include "fbgemm_gpu/rocm/cdna_guard.h"
@@ -380,16 +381,29 @@ using namespace embedding_ops;
   and kUseVecBlocking are fixed to kWarpSize, {{ fixed_max_vecs_per_thread["backward"] }},
   and true.
 */
+#if defined(ROCM_WAVE64)
 #define DISPATCH_OPTIMAL_KERNEL(MAX_D, ...)                                     \
   [&] {                                                                         \
     const int max_vecs_per_thread =                                             \
-      (max_D + {{ items_per_warp }} - 1) / {{ items_per_warp }};                \
+      (max_D + {{ items_per_wave64 }} - 1) / {{ items_per_wave64 }};            \
     constexpr int kThreadGroupSize = kWarpSize;                                 \
     constexpr int kFixedMaxVecsPerThread =                                      \
       {{ fixed_max_vecs_per_thread["backward"] }};                              \
     constexpr bool kUseVecBlocking = true;                                      \
     return __VA_ARGS__();                                                       \
   }()
+#else
+#define DISPATCH_OPTIMAL_KERNEL(MAX_D, ...)                                     \
+  [&] {                                                                         \
+    const int max_vecs_per_thread =                                             \
+      (max_D + {{ items_per_warp32 }} - 1) / {{ items_per_warp32 }};            \
+    constexpr int kThreadGroupSize = kWarpSize;                                 \
+    constexpr int kFixedMaxVecsPerThread =                                      \
+      {{ fixed_max_vecs_per_thread["backward"] }};                              \
+    constexpr bool kUseVecBlocking = true;                                      \
+    return __VA_ARGS__();                                                       \
+  }()
+#endif // defined(ROCM_WAVE64)
 
 {%- else %}
 
@@ -400,12 +414,13 @@ using namespace embedding_ops;
   Please see dispatch_optimal_kernel in
   codegen/embedding_common_code_generator.py for more details
 */
+#if defined(ROCM_WAVE64)
 #ifdef FBGEMM_USE_SUBWARP_SHUFFLE
 #define DISPATCH_OPTIMAL_KERNEL(MAX_D, ...)                                   \
   [&] {                                                                       \
     {{
        dispatch_optimal_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread["backward"],
            use_subwarp_shuffle=True)
     -}}
@@ -416,13 +431,36 @@ using namespace embedding_ops;
   [&] {                                                                       \
     {{
        dispatch_optimal_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread["backward"],
            use_subwarp_shuffle=False)
     -}}
   }()
+#endif // ifdef FBGEMM_USE_SUBWARP_SUFFLE
+#else
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+#define DISPATCH_OPTIMAL_KERNEL(MAX_D, ...)                                   \
+  [&] {                                                                       \
+    {{
+       dispatch_optimal_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread["backward"],
+           use_subwarp_shuffle=True)
+    -}}
+  }()
 
-#endif
+#else
+#define DISPATCH_OPTIMAL_KERNEL(MAX_D, ...)                                   \
+  [&] {                                                                       \
+    {{
+       dispatch_optimal_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread["backward"],
+           use_subwarp_shuffle=False)
+    -}}
+  }()
+#endif // ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+#endif // defined(ROCM_WAVE64)
 
 {%- endif %}
 

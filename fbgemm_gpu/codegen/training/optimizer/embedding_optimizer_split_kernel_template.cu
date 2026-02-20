@@ -109,16 +109,26 @@ void split_{{ optimizer }}_update_kernel(
 {%- for cache_type in ['float', 'at::Half'] %}
 {%- for ph_type_combo in args.placeholder_type_combos %}
 
-{%- set tuples = [] %}
-{%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_warp // 4) + 1) %}
+{%- set tuples_for_warp32 = [] %}
+{%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_warp32 // 4) + 1) %}
 {%- if kMaxElemPerThread in [1, 2] or kMaxElemPerThread % 4 == 0 %}
     {%- set t0 = [ (kMaxElemPerThread // 4), 1 ] | max if not nobag else "NULL" %}
     {%- set t1 = [ 4 // kMaxElemPerThread, 1] | max %}
-    {%- set temp = tuples.append((t0, "(kWarpSize / " ~ t1 ~ ")" if use_subwarp else "kWarpSize")) %}
+    {%- set temp = tuples_for_warp32.append((t0, "(kWarpSize / " ~ t1 ~ ")" if use_subwarp else "kWarpSize")) %}
 {%- endif %}
 {%- endfor %}
 
-{%- for (kMaxVecsPerThread, kThreadGroupSize) in tuples | unique %}
+{%- set tuples_for_wave64 = [] %}
+{%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_wave64 // 4) + 1) %}
+{%- if kMaxElemPerThread in [1, 2] or kMaxElemPerThread % 4 == 0 %}
+    {%- set t0 = [ (kMaxElemPerThread // 4), 1 ] | max if not nobag else "NULL" %}
+    {%- set t1 = [ 4 // kMaxElemPerThread, 1] | max %}
+    {%- set temp = tuples_for_wave64.append((t0, "(kWarpSize / " ~ t1 ~ ")" if use_subwarp else "kWarpSize")) %}
+{%- endif %}
+{%- endfor %}
+
+#if defined(ROCM_WAVE64)
+{%- for (kMaxVecsPerThread, kThreadGroupSize) in tuples_for_wave64 | unique %}
 template __global__ __launch_bounds__(kMaxThreads)
 void split_{{ optimizer }}_update_kernel
 < {{ emb_type }},
@@ -152,6 +162,42 @@ void split_{{ optimizer }}_update_kernel
     }});
 
 {%- endfor %} // for (kMaxVecsPerThread, kThreadGroupSize)
+#else
+{%- for (kMaxVecsPerThread, kThreadGroupSize) in tuples_for_warp32 | unique %}
+template __global__ __launch_bounds__(kMaxThreads)
+void split_{{ optimizer }}_update_kernel
+< {{ emb_type }},
+  {{ cache_type }},
+  {%- for ph_name in args.placeholder_tensor_names %}
+  {{ ph_type_combo[ph_name] }},
+  {%- endfor %}
+  {{ kMaxVecsPerThread }},
+  {{ kThreadGroupSize }},
+  4 // VEC_WIDTH
+>(
+    pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> dev_weights,
+    pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> uvm_weights,
+    pta::PackedTensorAccessor64<{{ cache_type }}, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor64<{{ emb_type }}, 1, at::RestrictPtrTraits> grad_dev_weights,
+    // grad_dev_indices is equivalent to sorted_linear_indices_run
+    const pta::PackedTensorAccessor64<int64_t, 1, at::RestrictPtrTraits> grad_dev_indices,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        weights_placements,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>
+        sorted_lxu_cache_locations,
+    const int32_t max_D,
+    bool stochastic_rounding,
+    at::PhiloxCudaState stochastic_rounding_philox_args,
+    {{ args.split_kernel_args_no_defaults |
+         replace_pta_namespace() |
+         replace_placeholder_types(ph_type_combo) |
+         join(",\n    ") |
+         replace("cache_t", cache_type)
+    }});
+
+{%- endfor %} // for (kMaxVecsPerThread, kThreadGroupSize)
+#endif // defined(ROCM_WAVE64)
 {%- endfor %} // for ph_type_combo
 {%- endfor %} // for cache_type
 {%- endfor %} // for emb_type

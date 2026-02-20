@@ -43,6 +43,7 @@
 
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
+#include "fbgemm_gpu/utils/warp_size.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
 {%- if optimizer != "none" and not dense %}
 #include "gen_embedding_optimizer_{{ optimizer }}_{{ mdesc }}_device_kernel.cuh"
@@ -494,10 +495,11 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
 
 {%- else %}
 
+#if defined(ROCM_WAVE64)
 {%- macro instantiate_templates(use_subwarp_shuffle) %}
 {%- for (kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking)
     in get_max_vecs_template_configs(
-        items_per_warp,
+        items_per_wave64,
         fixed_max_vecs_per_thread["backward"],
         use_subwarp_shuffle,
         use_vec_blocking=True,
@@ -512,6 +514,26 @@ batch_index_select_dim0_codegen_backward_kernel_warp_per_row
     }}
 {%- endfor %}
 {%- endmacro %}
+#else
+{%- macro instantiate_templates(use_subwarp_shuffle) %}
+{%- for (kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking)
+    in get_max_vecs_template_configs(
+        items_per_warp32,
+        fixed_max_vecs_per_thread["backward"],
+        use_subwarp_shuffle,
+        use_vec_blocking=True,
+    )
+%}
+    {{
+      bulk_template_instantiations(
+        kFixedMaxVecsPerThread,
+        kThreadGroupSize,
+        kUseVecBlocking,
+      )
+    }}
+{%- endfor %}
+{%- endmacro %}
+#endif // defined(ROCM_WAVE64)
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -787,10 +809,11 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     {%- endfor %}
 {%- endmacro %}
 
+#if defined(ROCM_WAVE64)
 {%- macro hip_instantiate_templates(use_subwarp_shuffle) %}
 {%- for (kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking)
     in get_max_vecs_template_configs(
-        items_per_warp,
+        items_per_wave64,
         fixed_max_vecs_per_thread["backward"],
         use_subwarp_shuffle,
         use_vec_blocking=True,
@@ -805,6 +828,26 @@ hip_split_embedding{{ ndesc }}_backward_codegen_{{ optimizer }}_{{ wdesc }}{{ vd
     }}
 {%- endfor %}
 {%- endmacro %}
+#else
+{%- macro hip_instantiate_templates(use_subwarp_shuffle) %}
+{%- for (kFixedMaxVecsPerThread, kThreadGroupSize, kUseVecBlocking)
+    in get_max_vecs_template_configs(
+        items_per_warp32,
+        fixed_max_vecs_per_thread["backward"],
+        use_subwarp_shuffle,
+        use_vec_blocking=True,
+    )
+%}
+    {{
+      hip_bulk_template_instantiations(
+        kFixedMaxVecsPerThread,
+        kThreadGroupSize,
+        kUseVecBlocking,
+      )
+    }}
+{%- endfor %}
+{%- endmacro %}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 #ifdef FBGEMM_USE_SUBWARP_SHUFFLE

@@ -22,6 +22,7 @@
 #include "fbgemm_gpu/utils/tensor_utils.h"
 #include "fbgemm_gpu/utils/assert_macros.h"
 #include "fbgemm_gpu/utils/kernel_launcher.cuh"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 {%- if is_rocm %}
 #include "fbgemm_gpu/rocm/cdna_guard.h"
@@ -30,11 +31,12 @@
 using Tensor = at::Tensor;
 using namespace fbgemm_gpu;
 
+#if defined(ROCM_WAVE64)
 #define DISPATCH_NON_VEC_BLOCKING_KERNEL(MAX_D, ...) \
   [&] {                                              \
     {{
        dispatch_non_vec_blocking_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread["backward_indice_weights"],
            use_subwarp_shuffle=False,
        )
@@ -45,11 +47,33 @@ using namespace fbgemm_gpu;
   [&] {                                              \
     {{
        dispatch_vec_blocking_kernel(
-           items_per_warp,
+           items_per_wave64,
            fixed_max_vecs_per_thread["backward_indice_weights"],
        )
     -}}
   }()
+#else
+#define DISPATCH_NON_VEC_BLOCKING_KERNEL(MAX_D, ...) \
+  [&] {                                              \
+    {{
+       dispatch_non_vec_blocking_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread["backward_indice_weights"],
+           use_subwarp_shuffle=False,
+       )
+    -}}
+  }()
+
+#define DISPATCH_VEC_BLOCKING_KERNEL(MAX_D, ...)     \
+  [&] {                                              \
+    {{
+       dispatch_vec_blocking_kernel(
+           items_per_warp32,
+           fixed_max_vecs_per_thread["backward_indice_weights"],
+       )
+    -}}
+  }()
+#endif // defined(ROCM_WAVE64)
 
 {%- for vbe in ([True, False]) %}
 {%- set vdesc = "_vbe" if vbe else "" %}

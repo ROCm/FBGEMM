@@ -10,6 +10,7 @@
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
 #include "fbgemm_gpu/utils/kernel_launcher.cuh"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 using Tensor = at::Tensor;
 using namespace fbgemm_gpu;
@@ -162,9 +163,10 @@ void split_embedding_{{ optimizer }}_update(
                     at::check_generator<at::CUDAGeneratorImpl>(gen)
                         ->philox_cuda_state(4);
             }
-            {%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_warp // 4) + 1) %}
+#if defined(ROCM_WAVE64)
+            {%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_wave64 // 4) + 1) %}
             {%- if kMaxElemPerThread in [1, 2] or kMaxElemPerThread % 4 == 0 %}
-            if (max_D <= {{ items_per_warp // 4 * kMaxElemPerThread }}) {
+            if (max_D <= {{ items_per_wave64 // 4 * kMaxElemPerThread }}) {
                 // hipcc can't use max in constexpr
                 constexpr int kMaxVecsPerThread = {{ kMaxElemPerThread }} / 4 >= 1 ? {{ kMaxElemPerThread }} / 4 : 1;
                 // If max_D is small, use fewer number of threads than kWarpSize.
@@ -215,6 +217,61 @@ void split_embedding_{{ optimizer }}_update(
             }
             {%- endif %}
             {%- endfor %}
+#else
+            {%- for kMaxElemPerThread in range(1, legacy_max_embedding_dim // (items_per_warp32 // 4) + 1) %}
+            {%- if kMaxElemPerThread in [1, 2] or kMaxElemPerThread % 4 == 0 %}
+            if (max_D <= {{ items_per_warp32 // 4 * kMaxElemPerThread }}) {
+                // hipcc can't use max in constexpr
+                constexpr int kMaxVecsPerThread = {{ kMaxElemPerThread }} / 4 >= 1 ? {{ kMaxElemPerThread }} / 4 : 1;
+                // If max_D is small, use fewer number of threads than kWarpSize.
+#ifdef FBGEMM_USE_SUBWARP_SHUFFLE
+                constexpr int kThreadGroupSize = kWarpSize / std::max(4 / {{ kMaxElemPerThread }}, 1);
+#else
+                constexpr int kThreadGroupSize = kWarpSize;
+#endif
+
+                DISPATCH_PLACEHOLDER_TYPES(
+                  {%- for ph_name in args.placeholder_tensor_names %}
+                  {{ ph_name + "_dev" }}.scalar_type(),
+                  {%- endfor %}
+                  "split_embedding_{{ optimizer }}_update_placeholder_type_kernel",
+                  [&] {
+                    FBGEMM_LAUNCH_KERNEL(
+                        (split_{{ optimizer }}_update_kernel<
+                            emb_t,
+                            cache_t,
+                            {%- for ph_name in args.placeholder_tensor_names %}
+                            {{ ph_name + "_ph_t" }},
+                            {%- endfor %}
+                            kMaxVecsPerThread,
+                            kThreadGroupSize,
+                            4>),
+                        div_round_up(grad_dev_indices.numel(), kMaxThreads / kThreadGroupSize),
+                        dim3(kThreadGroupSize, kMaxThreads / kThreadGroupSize, 1),
+                        0, // Shared memory is not needed because uint8_t is not supported
+                        at::cuda::getCurrentCUDAStream(),
+                        PTA_B(dev_weights, emb_t, 1, 64),
+                        PTA_B(uvm_weights, emb_t, 1, 64),
+                        PTA_B(lxu_cache_weights, cache_t, 2, 64),
+                        PTA_B(flatten_grad_dev_weights, emb_t, 1, 64),
+                        PTA_B(flatten_grad_dev_indices, int64_t, 1, 64),
+                        PTA_B(weights_placements, int32_t, 1, 32),
+                        PTA_B(weights_offsets, int64_t, 1, 32),
+                        // Use weights_placements instead of
+                        // sorted_lxu_cache_locations because LXU cache is not
+                        // supported right now
+                        PTA_B(weights_placements, int32_t, 1, 32),
+                        max_D,
+                        stochastic_rounding,
+                        rng_engine_inputs,
+                        {{ args.split_kernel_arg_constructors | make_pta_acc_builder_format() | join(", ") }}
+                    );
+                }); // DISPATCH_PLACEHOLDER_TYPES
+                return;
+            }
+            {%- endif %}
+            {%- endfor %}
+#endif // defined(ROCM_WAVE64)
         } // DISPATCH_EMB_CACHE_TYPES
     );
 }

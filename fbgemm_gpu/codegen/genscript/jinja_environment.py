@@ -65,8 +65,10 @@ env.globals["max_embedding_dim"] = 2048
 # larger max embedding dimension.
 env.globals["legacy_max_embedding_dim"] = 1024
 
-# An optimization for ROCm
-env.globals["items_per_warp"] = 128 if args.is_rocm is False else 256
+# We use different items_per* values for warp/wave 32 sizes
+# and wave size of 64 (ROCm)
+env.globals["items_per_warp32"] = 128
+env.globals["items_per_wave64"] = 256
 
 # The fixed max vectors per thread for different kernels.  The numbers were
 # derived from empirical studies
