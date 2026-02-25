@@ -46,6 +46,9 @@
 #include "fbgemm_gpu/embedding_forward_template_helpers.cuh"
 #include "fbgemm_gpu/split_embeddings_cache_cuda.cuh"
 
+#include <cstdlib>
+#include <iostream>
+
 using Tensor = at::Tensor;
 using namespace fbgemm_gpu;
 
@@ -128,6 +131,38 @@ __global__ void split_embedding_codegen_forward_{{ wdesc }}_v2_kernel(
     output_t* __restrict__ const output);
 {% endif %} {#-/* if not dense */#}
 
+template <
+    typename emb_t,
+    typename cache_t,
+    typename output_t,
+    bool use_lxu_cache,
+    typename index_t,
+    size_t kThreadGroupSize = kWarpSize>
+__launch_bounds__(kForwardMaxThreads) __global__ void
+split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> dev_weights,
+    const pta::PackedTensorAccessor64<emb_t, 1, at::RestrictPtrTraits> uvm_weights,
+    const pta::PackedTensorAccessor64<cache_t, 2, at::RestrictPtrTraits> lxu_cache_weights,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> weights_placements,
+    const pta::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits> weights_offsets,
+    int64_t D, // if nobag
+    FixedDivisor fd_B,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> indices,
+    const pta::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits> offsets,
+    const pta::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits> lxu_cache_locations,
+    /*
+      NOTE: We pass in `lxu_cache_conflict_misses =
+      uvm_cache_stats[uvm_cache_stats_index::num_conflict_unique_misses]` as a
+      run-time argument here instead of passing the cache miss rate as a
+      compile-time argument, because `lxu_cache_conflict_misses` is only
+      available on the GPU, and invoking a templatized kernel with the cache
+      miss rate as a template argument requires this information to first be
+      passed back to the host, which is an expensive operation.
+    */
+    const int32_t* lxu_cache_conflict_misses,
+    // If 2D, shape is [B][total_D]
+    pta::PackedTensorAccessor64<output_t, 2, at::RestrictPtrTraits> output
+    );
 
 {%- for nobag in ([True, False] if (not is_gwd) else [False]) %}
 {%- set ndesc = "_nobag" if nobag else "" %}
@@ -586,6 +621,14 @@ batch_index_select_dim0_codegen_forward_cuda(
         return output;
     }
 
+    bool is_nobag_exp = false;
+    if (const char* exp_p = std::getenv("FBGEMM_NOBAG_FWD_EXP")) {
+      try {
+        is_nobag_exp = static_cast<bool>(std::stoi(exp_p));
+      } catch (const std::exception& e) {
+        TORCH_WARN_ONCE("Failed to get FBGEMM_NOBAG_FWD_EXP. Falling back to default value (0)")
+      }
+    }
 
     AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "batched_embedding{{ ndesc }}_forward_kernel_1", [&] {
     DISPATCH_EMB_CACHE_OUTPUT_TYPES(
@@ -666,6 +709,60 @@ batch_index_select_dim0_codegen_forward_cuda(
           return;
         });
 
+        {%- if nobag and not dense and not ssd and not is_gwd_kernel and not vbe and not is_index_select %}
+        if( is_nobag_exp ) {
+          TORCH_WARN_ONCE("Launching experimental nobag forward kernel")
+
+          DISPATCH_KERNEL_FOR_CACHE_CASE(use_lxu_cache, [&] {
+            {%- set nobag_kernel =
+                "batch_index_select_dim0_codegen_forward_kernel"
+                if is_index_select else
+                "split_embedding_nobag_codegen_forward_{}_kernel_experimental".format(wdesc)
+            %}
+            FBGEMM_LAUNCH_KERNEL(
+              ({{ nobag_kernel }}
+                <emb_t, cache_t, output_t, use_cache_t, index_t>
+              ),
+              div_round_up(total_B, kForwardMaxThreads / kWarpSize),
+              dim3(kWarpSize, kForwardMaxThreads / kWarpSize),
+              0,
+              at::cuda::getCurrentCUDAStream(),
+              PTA_B(dev_weights, emb_t, 1, 64),
+              {%- if not dense %}
+              PTA_B(uvm_weights, emb_t, 1, 64),
+              PTA_B(lxu_cache_weights, cache_t, 2, 64),
+              PTA_B(weights_placements, int32_t, 1, 32),
+              {%- endif %}
+              PTA_B(weights_offsets, int64_t, 1, 32),
+              {%- if is_index_select %}
+              PTA_B(D_offsets, int32_t, 1, 32),
+              {%- else %}
+              D,
+              {%- endif %}
+              FixedDivisor(B),
+              PTA_B(indices, index_t, 1, 32),
+              {%- if not is_index_select %}
+              PTA_B(offsets, index_t, 1, 32),
+              {%- endif %}
+              {%- if not dense %}
+              PTA_B({{ locs_or_addrs_tensor }}, {{ locs_or_addrs_type }}, 1, 32),
+              uvm_cache_stats.size(0) == 0
+                  ? nullptr
+                  : (uvm_cache_stats.data_ptr<int32_t>() + uvm_cache_stats_index::num_conflict_unique_misses),
+              {%- endif %}
+              {%- if is_index_select %}
+              PTA_B(output_offsets, int64_t, 1, 32),
+              PTA_B(total_L_offsets, int64_t, 1, 32),
+              fixed_L_per_warp,
+              permute_output_dim_0_1,
+              {%- endif %}
+              PTA_B(output, output_t, {{ "1" if is_index_select else "2" }}, 64)
+            );
+            return;
+          });
+        } else {
+        {%- endif %}
+        
         DISPATCH_KERNEL_FOR_CACHE_CASE(use_lxu_cache, [&] {
           {%- set nobag_kernel =
               "batch_index_select_dim0_codegen_forward_kernel"
@@ -717,8 +814,9 @@ batch_index_select_dim0_codegen_forward_cuda(
           );
           return;
         });
-
-
+        {%- if nobag and not dense and not ssd and not is_gwd_kernel and not vbe and not is_index_select %}
+        }
+        {%- endif %}
         {#-/* Pooled TBE Case (nobag=False) *********************************/#}
         {%- else %}
 
