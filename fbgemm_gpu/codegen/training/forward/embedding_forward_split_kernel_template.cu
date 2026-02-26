@@ -578,7 +578,15 @@ split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
     // Determine the linearized warp ID, and exit early if needed
     const auto total_B = offsets.size(0) - 1;
     // Since we place a limit on the grid size, we need to perform grid-striding
-    for (auto b_t = blockIdx.x * blockDim.y + threadIdx.y; b_t < total_B; b_t += blockDim.y * gridDim.x) {
+    const int32_t total_warps = gridDim.x * blockDim.y;
+    const int32_t warp_id = blockIdx.x * blockDim.y + threadIdx.y;
+    const bool split_l = total_warps > total_B;
+    const int32_t warps_per_b = split_l ? (total_warps + total_B - 1) / total_B : 1;
+    const int32_t warp_in_b = split_l ? (warp_id / total_B) : 0;
+    const int32_t b_t_stride = split_l ? total_B : total_warps;
+    for (auto b_t = split_l ? (warp_id % total_B) : warp_id;
+         b_t < total_B;
+         b_t += b_t_stride) {
 
     // Determine the Table and Training Example IDs
     int32_t t;  // Table ID
@@ -614,7 +622,9 @@ split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
         // effectively 100%
         
     // Iterate over each kThreadGroupSize-sized subset of L indices in the bag
-    for (int32_t l_start = 0; l_start < L; l_start += kThreadGroupSize) {
+        for (int32_t l_start = warp_in_b * kThreadGroupSize;
+            l_start < L;
+            l_start += warps_per_b * kThreadGroupSize) {
         // Determine the L index that this thread will load data from in cooperative load
         auto l = l_start + threadIdx.x;
         // Cooperatively load the indices
@@ -692,7 +702,9 @@ split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
             // Load every row from HBM or UVM
             
     // Iterate over each kThreadGroupSize-sized subset of L indices in the bag
-    for (int32_t l_start = 0; l_start < L; l_start += kThreadGroupSize) {
+        for (int32_t l_start = warp_in_b * kThreadGroupSize;
+            l_start < L;
+            l_start += warps_per_b * kThreadGroupSize) {
         // Determine the L index that this thread will load data from in cooperative load
         auto l = l_start + threadIdx.x;
         // Cooperatively load the indices
@@ -770,7 +782,9 @@ split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
             // conflict unique misses, then the miss rate is effectively 0%
             
     // Iterate over each kThreadGroupSize-sized subset of L indices in the bag
-    for (int32_t l_start = 0; l_start < L; l_start += kThreadGroupSize) {
+        for (int32_t l_start = warp_in_b * kThreadGroupSize;
+            l_start < L;
+            l_start += warps_per_b * kThreadGroupSize) {
         // Determine the L index that this thread will load data from in cooperative load
         auto l = l_start + threadIdx.x;
         // Cooperatively load the cache's indices
@@ -853,7 +867,9 @@ split_embedding_nobag_codegen_forward_{{ wdesc }}_kernel_experimental(
             // Else, the cache conflict miss rate is mixed
             
     // Iterate over each kThreadGroupSize-sized subset of L indices in the bag
-    for (int32_t l_start = 0; l_start < L; l_start += kThreadGroupSize) {
+        for (int32_t l_start = warp_in_b * kThreadGroupSize;
+            l_start < L;
+            l_start += warps_per_b * kThreadGroupSize) {
         // Determine the L index that this thread will load data from in cooperative load
         auto l = l_start + threadIdx.x;
         // Cooperatively load the indices

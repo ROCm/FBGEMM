@@ -713,6 +713,15 @@ batch_index_select_dim0_codegen_forward_cuda(
         if( is_nobag_exp ) {
           TORCH_WARN_ONCE("Launching experimental nobag forward kernel")
 
+          const int32_t warps_per_block = kForwardMaxThreads / kWarpSize;
+          int32_t grid = div_round_up(total_B, warps_per_block);
+          #ifdef USE_ROCM
+          const int32_t target_blocks = 256;
+          grid = (grid < target_blocks) ? target_blocks : grid;
+          #endif
+          const auto max_blocks = utils::cuda::get_max_thread_blocks(at::cuda::getCurrentCUDAStream());
+          grid = (grid > max_blocks) ? max_blocks : grid;
+
           DISPATCH_KERNEL_FOR_CACHE_CASE(use_lxu_cache, [&] {
             {%- set nobag_kernel =
                 "batch_index_select_dim0_codegen_forward_kernel"
@@ -723,7 +732,7 @@ batch_index_select_dim0_codegen_forward_cuda(
               ({{ nobag_kernel }}
                 <emb_t, cache_t, output_t, use_cache_t, index_t>
               ),
-              div_round_up(total_B, kForwardMaxThreads / kWarpSize),
+              grid,
               dim3(kWarpSize, kForwardMaxThreads / kWarpSize),
               0,
               at::cuda::getCurrentCUDAStream(),
