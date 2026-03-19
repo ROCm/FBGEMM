@@ -145,7 +145,8 @@ struct load_row_per_warp {
       emb_t* emb_data,
       index_t row_index,
       const emb_t* p_emb_table,
-      int lane_id) {
+      int lane_id,
+      int32_t runtime_dim) {
     // Types are not supported, but we need an instance of run method to avoid
     // run-time .so symbol failure. Currently, the kernel dispatch for
     // unsupported type is guarded on host side
@@ -160,83 +161,73 @@ struct load_row_per_warp {
   }
 };
 
-template <typename index_t>
-struct load_row_per_warp<half, 64, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 64);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp16(emb_res, lane_id * sizeof(half));
-  }
-};
+template <typename emb_t, int32_t embedding_dim, typename index_t>
+  requires(std::is_same_v<emb_t, half> || std::is_same_v<emb_t, float>)
+  struct load_row_per_warp<emb_t, embedding_dim, index_t>
+  {
+    static __device__ void run(
+        emb_t *emb_data,
+        index_t row_index,
+        const emb_t *p_emb_table,
+        int lane_id,
+        int32_t runtime_dim)
+    {
+      int32x4_t emb_res =
+          amdgcn_make_buffer_resource(p_emb_table + row_index * runtime_dim, sizeof(emb_t) * runtime_dim);
 
-template <typename index_t>
-struct load_row_per_warp<half, 128, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 128);
-    *reinterpret_cast<half2*>(emb_data) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, lane_id * sizeof(half2));
-  }
-};
+      int offset = 0;
+      int reg_idx = 0;
 
-template <typename index_t>
-struct load_row_per_warp<half, 160, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res = amdgcn_make_buffer_resource(
-        p_emb_table + row_index * 160, sizeof(half) * 160);
-    *reinterpret_cast<half2*>(emb_data) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, lane_id * sizeof(half2));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp16(
-        emb_res, (lane_id + 128) * sizeof(half));
-  }
-};
+      if constexpr (std::is_same_v<emb_t, half>) {
+        // For half: vector load 128 elements per iteration (64 threads * 2 halfs)
+        constexpr int num_vector_ops = embedding_dim / 128;
 
-template <typename index_t>
-struct load_row_per_warp<half, 192, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 192);
-    *reinterpret_cast<half2*>(emb_data) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, lane_id * sizeof(half2));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp16(
-        emb_res, (lane_id + 128) * sizeof(half));
-  }
-};
+        #pragma unroll
+        for(int i = 0; i < num_vector_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(half2);
 
-template <typename index_t>
-struct load_row_per_warp<half, 256, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 256);
-    *reinterpret_cast<half2*>(&emb_data[0]) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, lane_id * sizeof(half2));
-    *reinterpret_cast<half2*>(&emb_data[2]) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(
-            emb_res, (lane_id + 64) * sizeof(half2));
-  }
-};
+          half2 val = llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, voffset);
+          // Unpack into register array
+          emb_data[reg_idx] = val.x;
+          emb_data[reg_idx + 1] = val.y;
 
-template <typename index_t>
-struct load_row_per_warp<half, 320, index_t> {
-  static __device__ void
-  run(half* emb_data, index_t row_index, const half* p_emb_table, int lane_id) {
-    int32x4_t emb_res = amdgcn_make_buffer_resource(
-        p_emb_table + row_index * 320, sizeof(half) * 320);
-    *reinterpret_cast<half2*>(&emb_data[0]) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(emb_res, lane_id * sizeof(half2));
-    *reinterpret_cast<half2*>(&emb_data[2]) =
-        llvm_amdgcn_raw_buffer_load_fp16x2(
-            emb_res, (lane_id + 64) * sizeof(half2));
-    emb_data[4] = llvm_amdgcn_raw_buffer_load_fp16(
-        emb_res, (lane_id + 256) * sizeof(half));
-  }
-};
+          offset += 128;
+          reg_idx += 2;
+        }
+
+        // load remaining elements (scalar loads)
+        constexpr int tail_start = num_vector_ops * 128;
+        constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+
+        #pragma unroll
+        for(int i = 0; i < num_scalar_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(half);
+
+          // we don't care about loading past the end of the embedding row because the
+          // emb_res buffer resource ensures that only 0s will be loaded
+          emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp16(emb_res, voffset);
+          offset += 64;
+          reg_idx += 1;
+        }
+      } else if constexpr (std::is_same_v<emb_t, float>) {
+        // For float: load 64 elements per iteration (64 threads * 1 float)
+        constexpr int num_ops = (embedding_dim + 63) / 64;
+
+        #pragma unroll
+        for(int i = 0; i < num_ops; i++)
+        {
+          int voffset = (offset + lane_id) * sizeof(float);
+
+          // as above, we don't care about loading past the end of the embedding row
+          emb_data[reg_idx] = llvm_amdgcn_raw_buffer_load_fp32(emb_res, voffset);
+          offset += 64;
+          reg_idx += 1;
+        }
+      }
+    }
+  };
 
 template <int32_t embedding_dim, typename index_t>
 struct load_row_per_warp<c10::Half, embedding_dim, index_t> {
@@ -244,120 +235,14 @@ struct load_row_per_warp<c10::Half, embedding_dim, index_t> {
       c10::Half* emb_data,
       index_t row_index,
       const c10::Half* p_emb_table,
-      int lane_id) {
+      int lane_id,
+      int32_t runtime_dim) {
     load_row_per_warp<half, embedding_dim, index_t>::run(
         reinterpret_cast<half*>(emb_data),
         row_index,
         reinterpret_cast<const half*>(p_emb_table),
-        lane_id);
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 64, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 64);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 128, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 128);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-    emb_data[1] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 64) * sizeof(float));
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 160, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res = amdgcn_make_buffer_resource(
-        p_emb_table + row_index * 160, sizeof(float) * 160);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-    emb_data[1] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 64) * sizeof(float));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 128) * sizeof(float));
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 192, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 192);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-    emb_data[1] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 64) * sizeof(float));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 128) * sizeof(float));
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 256, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res =
-        amdgcn_make_buffer_resource(p_emb_table + row_index * 256);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-    emb_data[1] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 64) * sizeof(float));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 128) * sizeof(float));
-    emb_data[3] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 192) * sizeof(float));
-  }
-};
-
-template <typename index_t>
-struct load_row_per_warp<float, 320, index_t> {
-  static __device__ void run(
-      float* emb_data,
-      index_t row_index,
-      const float* p_emb_table,
-      int lane_id) {
-    int32x4_t emb_res = amdgcn_make_buffer_resource(
-        p_emb_table + row_index * 320, sizeof(float) * 320);
-    emb_data[0] =
-        llvm_amdgcn_raw_buffer_load_fp32(emb_res, lane_id * sizeof(float));
-    emb_data[1] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 64) * sizeof(float));
-    emb_data[2] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 128) * sizeof(float));
-    emb_data[3] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 192) * sizeof(float));
-    emb_data[4] = llvm_amdgcn_raw_buffer_load_fp32(
-        emb_res, (lane_id + 256) * sizeof(float));
+        lane_id,
+        runtime_dim);
   }
 };
 
@@ -391,9 +276,14 @@ struct accumulate_row_per_warp {
   }
 };
 
-template <typename emb_t, int32_t embedding_dim>
+template <typename emb_t, int32_t embedding_dim, typename index_t>
 struct store_row_per_warp {
-  static __device__ void run(const emb_t* acc, emb_t* p_output, int lane_id) {
+  static __device__ void run(
+      const emb_t* acc,
+      index_t row_index,
+      emb_t* p_output_table,
+      int lane_id,
+      int runtime_dim) {
     // Types are not supported, but we need an instance of run method to avoid
     // run-time .so symbol failure. Currently, the kernel dispatch for
     // unsupported type is guarded on host function
@@ -408,157 +298,82 @@ struct store_row_per_warp {
   }
 };
 
-template <>
-struct store_row_per_warp<half, 64> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp16(acc[0], out_res, lane_id * sizeof(half));
-  }
-};
-
-template <>
-struct store_row_per_warp<half, 128> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
-  }
-};
-
-template <>
-struct store_row_per_warp<half, 160> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
+template <typename emb_t, int32_t embedding_dim, typename index_t>
+  requires(std::is_same_v<emb_t, half> || std::is_same_v<emb_t, float>)
+struct store_row_per_warp<emb_t, embedding_dim, index_t> {
+  static __device__ void run(const emb_t* acc, index_t row_index, emb_t* p_output_table, int lane_id, int32_t runtime_dim) {
     int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, 160 * sizeof(half));
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
-    llvm_amdgcn_raw_buffer_store_fp16(
-        acc[2], out_res, (lane_id + 128) * sizeof(half));
+        amdgcn_make_buffer_resource(p_output_table + row_index * runtime_dim, sizeof(emb_t) * runtime_dim);
+
+    int offset = 0;
+    int reg_idx = 0;
+
+    if constexpr (std::is_same_v<emb_t, half>) {
+      // For half: vector store 128 elements per iteration (64 threads * 2 halfs)
+      constexpr int num_vector_ops = embedding_dim / 128;
+
+      #pragma unroll
+      for(int i = 0; i < num_vector_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half2);
+
+        // Pack two half values into half2 for vectorized store
+        half2 val;
+        val.x = acc[reg_idx];
+        val.y = acc[reg_idx + 1];
+        llvm_amdgcn_raw_buffer_store_fp16x2(val, out_res, voffset);
+
+        offset += 128;
+        reg_idx += 2;
+      }
+
+      // store remaining elements (scalar stores)
+      constexpr int tail_start = num_vector_ops * 128;
+      constexpr int num_scalar_ops = (embedding_dim - tail_start + 63) / 64;
+
+      #pragma unroll
+      for(int i = 0; i < num_scalar_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(half);
+
+        // we don't care about storing past the end of the embedding row because the
+        // out_res buffer resource ensures that those writes will be ignored
+        llvm_amdgcn_raw_buffer_store_fp16(acc[reg_idx], out_res, voffset);
+        offset += 64;
+        reg_idx += 1;
+      }
+    } else if constexpr (std::is_same_v<emb_t, float>) {
+      // For float: store 64 elements per iteration (64 threads * 1 float)
+      constexpr int num_ops = (embedding_dim + 63) / 64;
+
+      #pragma unroll
+      for(int i = 0; i < num_ops; i++)
+      {
+        int voffset = (offset + lane_id) * sizeof(float);
+
+        // as above, we don't care about storing past the end of the embedding row
+        llvm_amdgcn_raw_buffer_store_fp32(acc[reg_idx], out_res, voffset);
+        offset += 64;
+        reg_idx += 1;
+      }
+    }
   }
 };
 
-template <>
-struct store_row_per_warp<half, 192> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
-    llvm_amdgcn_raw_buffer_store_fp16(
-        acc[2], out_res, (lane_id + 128) * sizeof(half));
-  }
-};
-
-template <>
-struct store_row_per_warp<half, 256> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc + 2),
-        out_res,
-        (lane_id + 64) * sizeof(half2));
-  }
-};
-
-template <>
-struct store_row_per_warp<half, 320> {
-  static __device__ void run(const half* acc, half* p_output, int lane_id) {
-    int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, 320 * sizeof(half));
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc), out_res, lane_id * sizeof(half2));
-    llvm_amdgcn_raw_buffer_store_fp16x2(
-        *reinterpret_cast<const half2*>(acc + 2),
-        out_res,
-        (lane_id + 64) * sizeof(half2));
-    llvm_amdgcn_raw_buffer_store_fp16(
-        acc[4], out_res, (lane_id + 256) * sizeof(half));
-  }
-};
-
-template <int32_t embedding_dim>
-struct store_row_per_warp<c10::Half, embedding_dim> {
-  static __device__ void
-  run(const c10::Half* emb_data, c10::Half* p_emb_table, int lane_id) {
-    store_row_per_warp<half, embedding_dim>::run(
+template <int32_t embedding_dim, typename index_t>
+struct store_row_per_warp<c10::Half, embedding_dim, index_t> {
+  static __device__ void run(
+      const c10::Half* emb_data,
+      index_t row_index,
+      c10::Half* p_emb_table,
+      int lane_id,
+      int32_t runtime_dim) {
+    store_row_per_warp<half, embedding_dim, index_t>::run(
         reinterpret_cast<const half*>(emb_data),
+        row_index,
         reinterpret_cast<half*>(p_emb_table),
-        lane_id);
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 64> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 128> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[1], out_res, (lane_id + 64) * sizeof(float));
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 160> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, sizeof(float) * 160);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[1], out_res, (lane_id + 64) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[2], out_res, (lane_id + 128) * sizeof(float));
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 192> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[1], out_res, (lane_id + 64) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[2], out_res, (lane_id + 128) * sizeof(float));
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 256> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res = amdgcn_make_buffer_resource(p_output);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[1], out_res, (lane_id + 64) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[2], out_res, (lane_id + 128) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[3], out_res, (lane_id + 192) * sizeof(float));
-  }
-};
-
-template <>
-struct store_row_per_warp<float, 320> {
-  static __device__ void run(const float* acc, float* p_output, int lane_id) {
-    int32x4_t out_res =
-        amdgcn_make_buffer_resource(p_output, sizeof(float) * 320);
-    llvm_amdgcn_raw_buffer_store_fp32(acc[0], out_res, lane_id * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[1], out_res, (lane_id + 64) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[2], out_res, (lane_id + 128) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[3], out_res, (lane_id + 192) * sizeof(float));
-    llvm_amdgcn_raw_buffer_store_fp32(
-        acc[4], out_res, (lane_id + 256) * sizeof(float));
+        lane_id,
+        runtime_dim);
   }
 };
 
