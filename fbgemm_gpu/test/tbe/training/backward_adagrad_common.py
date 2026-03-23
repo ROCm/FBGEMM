@@ -347,6 +347,42 @@ def execute_backward_adagrad(  # noqa C901
         )
     )
 
+<<<<<<< Updated upstream
+=======
+    tolerance = (
+        1.0e-4
+        if weights_precision == SparseType.FP32 and output_dtype == SparseType.FP32
+        else 1.0e-2 if weights_precision != SparseType.NFP8 else 1.0e-1
+    )
+
+    if mixed_B:
+        ref_output = format_ref_tensors_in_mixed_B_layout(fs, Bs_rank_feature)
+    else:
+        ref_output = torch.cat(fs, dim=1) if do_pooling else torch.cat(fs, dim=0)
+    assert (
+        ref_output.shape == fc2.shape
+    ), f"VBE={mixed_B} ref_output shape {ref_output.shape} != TBE output shape {fc2.shape}"
+
+    # DEBUG: Check forward pass
+    fwd_diff = (fc2 - ref_output).abs()
+    fwd_max_diff = fwd_diff.max().item()
+    fwd_mean_diff = fwd_diff.mean().item()
+    fwd_mismatch_count = (fwd_diff > tolerance).sum().item()
+    print(f"  [DEBUG FORWARD] max_diff={fwd_max_diff:.6e}, mean_diff={fwd_mean_diff:.6e}, mismatches={fwd_mismatch_count}/{fwd_diff.numel()}, tolerance={tolerance:.6e}")
+
+    try:
+        torch.testing.assert_close(
+            fc2,
+            ref_output,
+            atol=tolerance,
+            rtol=1.0e-2 if weights_precision != SparseType.FP32 else 1.0e-4,
+            msg=f"Forward output mismatch: VBE={mixed_B} pooling_mode={pooling_mode}, weight_precision={weights_precision} output_dtype={output_dtype} output_shape={fc2.shape}",
+        )
+        print("  [DEBUG FORWARD] PASSED")
+    except AssertionError as e:
+        print(f"  [DEBUG FORWARD] FAILED: {e}")
+        raise
+>>>>>>> Stashed changes
     if do_pooling:
         if mixed_B:
             goc = format_ref_tensors_in_mixed_B_layout(gos, Bs_rank_feature)
@@ -392,12 +428,36 @@ def execute_backward_adagrad(  # noqa C901
             assert set(optimizer_states_dict.keys()) == expected_keys
         # pyre-fixme[16]: `Optional` has no attribute `float`.
         ref_optimizer_state = bs[t].weight.grad.float().cpu().to_dense().pow(2)
+<<<<<<< Updated upstream
         torch.testing.assert_close(
             m1.float().cpu(),
             ref_optimizer_state.mean(dim=1) if row_wise else ref_optimizer_state,
             atol=tolerance,
             rtol=tolerance,
         )
+=======
+        # DEBUG: Check optimizer state
+        m1_cpu = m1.float().cpu()
+        ref_opt = ref_optimizer_state.mean(dim=1) if row_wise else ref_optimizer_state
+        opt_diff = (m1_cpu - ref_opt).abs()
+        opt_max_diff = opt_diff.max().item()
+        opt_mismatch_count = (opt_diff > tolerance).sum().item()
+        print(f"  [DEBUG OPT STATE t={t}] max_diff={opt_max_diff:.6e}, mismatches={opt_mismatch_count}/{opt_diff.numel()}")
+
+        try:
+            torch.testing.assert_close(
+                m1_cpu,
+                ref_opt,
+                atol=tolerance,
+                rtol=tolerance,
+            )
+            print(f"  [DEBUG OPT STATE t={t}] PASSED")
+        except AssertionError as e:
+            print(f"  [DEBUG OPT STATE t={t}] FAILED: {e}")
+            raise
+
+    # Weight update validation and gradcheck
+>>>>>>> Stashed changes
     for t in range(T):
         # optimizer_state = squares (no row-wise) or sum squares (row-wise)
         if row_wise and weight_decay_mode == WeightDecayMode.COUNTER:
@@ -428,12 +488,46 @@ def execute_backward_adagrad(  # noqa C901
         # If weights are FP8, add quantization noise.
         if weights_precision == SparseType.NFP8:
             weights_ref = weights_ref.to(fp8_dtype).to(torch.float)
+<<<<<<< Updated upstream
         torch.testing.assert_close(
             cc.split_embedding_weights()[t].float().cpu(),
             weights_ref,
             atol=tolerance,
             rtol=tolerance,
         )
+=======
+
+        # DEBUG: Check weight update
+        weights_actual = cc.split_embedding_weights()[t].float().cpu()
+        weight_diff = (weights_actual - weights_ref).abs()
+        weight_max_diff = weight_diff.max().item()
+        weight_mean_diff = weight_diff.mean().item()
+        weight_mismatch_count = (weight_diff > tolerance).sum().item()
+        print(f"  [DEBUG WEIGHT t={t}] max_diff={weight_max_diff:.6e}, mean_diff={weight_mean_diff:.6e}, mismatches={weight_mismatch_count}/{weight_diff.numel()}")
+
+        try:
+            torch.testing.assert_close(
+                weights_actual,
+                weights_ref,
+                atol=tolerance,
+                rtol=tolerance,
+            )
+            print(f"  [DEBUG WEIGHT t={t}] PASSED")
+        except AssertionError as e:
+            print(f"  [DEBUG WEIGHT t={t}] FAILED: {e}")
+            raise
+
+    # Do not run gradcheck when tbe_op is provided (due to OOM)
+    if tbe_op:
+        return
+
+    # Free large tensors no longer needed before gradcheck to reduce GPU memory pressure
+    del bs, bs_features, fs, gos, goc, fc2, ref_output
+    del split_optimizer_states, get_optimizer_states, xs, xws
+    # Release the original TBE op (cc will be reassigned to a smaller gradcheck TBE below)
+    del cc, tbe_op
+
+>>>>>>> Stashed changes
     if use_cpu:
         D_gradcheck = (D_gradcheck + 15) // 16 * 4
     else:
