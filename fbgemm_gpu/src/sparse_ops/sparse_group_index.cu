@@ -123,8 +123,6 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
   };
 
   for (int64_t warp_id = start_warp_id; warp_id < warp_end; warp_id += warp_stride) {
-    bool use_small_dim_path = false;
-    int rows_per_warp_small = 0;
     int32_t member_id = 0;
     int32_t member_warp_id = 0;
     if constexpr (USE_VAR_COLS) {
@@ -155,25 +153,17 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
       num_cols = num_cols_group[member_id];
       warps_per_row = (num_cols + COLS_PER_WARP - 1) >> LOG_COLS_PER_WARP;
       member_warp_id = warp_id - warp_offsets_group[member_id];
+    } else if constexpr (USE_PACKED_ROWS) {
+      // Small embedding: pack multiple rows per warp
+      const auto rows_per_warp = COLS_PER_WARP / num_cols;
+      const auto warps_per_member =
+          (num_work_rows + rows_per_warp - 1) / rows_per_warp;
+      member_id = warp_id / warps_per_member;
+      member_warp_id = warp_id % warps_per_member;
     } else {
-      // All columns are the same
+      // Large embedding: one or more warps per row
       member_id = warp_id / (warps_per_row * num_work_rows);
       member_warp_id = warp_id - (member_id * warps_per_row * num_work_rows);
-    }
-
-    if constexpr (USE_PACKED_ROWS) {
-      if (num_cols < COLS_PER_WARP && num_cols >= UNROLL_FACTOR) {
-        // Need to ensure that [member_id] and [member_warp_id] are calculated
-        // correctly for the small embedding dimension path below
-        rows_per_warp_small = COLS_PER_WARP / num_cols;
-        if constexpr (!USE_VAR_COLS) {
-          const auto warps_per_member =
-              (num_work_rows + rows_per_warp_small - 1) / rows_per_warp_small;
-          member_id = warp_id / warps_per_member;
-          member_warp_id = warp_id % warps_per_member;
-        }
-        use_small_dim_path = true;
-      }
     }
 
     index_t* indices = reinterpret_cast<index_t*>(indices_ptrs[member_id]);
@@ -184,46 +174,33 @@ __launch_bounds__(kMaxThreads) void group_index_select_or_add_2d_kernel(
     int64_t logical_row = 0;
     int64_t row = 0;
     int64_t col_offset = 0;
-    bool handled_small_dim_path = false;
 
     if constexpr (USE_PACKED_ROWS) {
-      if (use_small_dim_path) {
-        // Optimized path for small embedding dimensions
-        // Each warp processes 'rows_per_warp' rows
-        const int rows_per_warp = rows_per_warp_small;
-        const int64_t start_row = member_warp_id * rows_per_warp;
-        // Since we are processing multiple rows within the warp, we need to
-        // map each lane to a specific row, in addition to the column
-        const int local_row = (threadIdx.x * UNROLL_FACTOR) / 
-            num_cols; // the row ID within the set of rows handled by this warp
-        const int64_t current_row = start_row + 
-            local_row; // the actual row within the table processed by this lane
-        const int col_offset_small = (threadIdx.x * UNROLL_FACTOR) % num_cols;
-        // local_row may be out of bounds for the last few lanes in the warp if
-        // [COLS_PER_WARP % num_cols != 0] and we also need to confirm that we are
-        // within num_work_rows
-        if (local_row < rows_per_warp && current_row < num_work_rows) {
-          logical_row = current_row;
-          row = USE_SORTED_INDICES ? reverse_indices[current_row] : current_row;
-          col_offset = col_offset_small;
-          handled_small_dim_path = true;
-        } else {
-          flush_cache_accumulator(last_member_output_tile, last_member_num_cols);
-          continue;
-        }
+      // Small embedding dimension: pack multiple rows per warp
+      const int rows_per_warp = COLS_PER_WARP / num_cols;
+      const int64_t start_row = member_warp_id * rows_per_warp;
+      const int local_row = (threadIdx.x * UNROLL_FACTOR) / num_cols;
+      const int64_t current_row = start_row + local_row;
+      const int col_offset_small = (threadIdx.x * UNROLL_FACTOR) % num_cols;
+      // local_row may be out of bounds for the last few lanes in the warp if
+      // [COLS_PER_WARP % num_cols != 0] and we also need to confirm that we are
+      // within num_work_rows
+      if (local_row < rows_per_warp && current_row < num_work_rows) {
+        logical_row = current_row;
+        row = USE_SORTED_INDICES ? reverse_indices[current_row] : current_row;
+        col_offset = col_offset_small;
+      } else {
+        flush_cache_accumulator(last_member_output_tile, last_member_num_cols);
+        continue;
       }
-    }
-
-    if (!handled_small_dim_path) {
+    } else {
+      // Large embedding dimension: one or more warps per row
       int64_t row_in_member = 0;
       int64_t col_tile = 0;
       if constexpr (USE_CONTIGUOUS_WARPS) {
-        // Contiguous warp traversal: iterate rows sequentially while column tiles
-        // remain strided so each warp processes a different tile for successive rows.
         row_in_member = member_warp_id % num_work_rows;
         col_tile = member_warp_id / num_work_rows;
       } else {
-        // Original strided mapping: each warp walks tiles first, distributing rows round-robin.
         row_in_member = member_warp_id / warps_per_row;
         col_tile = member_warp_id % warps_per_row;
       }
