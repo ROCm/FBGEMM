@@ -979,17 +979,22 @@ def group_index_select_dim0_gpu_impl_abstract(
         size = list(input_group[i].size())
         ret.append(input_group[i].new_empty([indices_group[i].size(0)] + size[1:]))
 
-    # divide by 2 since sizeof(int64_t) / sizeof(int32_t) = 2
-    args_tensor_numel = 4 * group_size + 1 + int(math.ceil(group_size / 2))
+    # 7 pointer arrays: input, output, indices, sorted_indices, reverse_indices,
+    # warp_offsets (group_size+1), num_cols (int32, ceil to int64)
+    args_tensor_numel = 6 * group_size + 1 + int(math.ceil(group_size / 2))
 
-    ret.append(
-        # sizeof(int64_t) = 8, torch.uint8 = at::kByte
-        input_group[0].new_empty(
-            args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+    # Two args_tensors (small bucket, large bucket)
+    for _ in range(2):
+        ret.append(
+            # sizeof(int64_t) = 8, torch.uint8 = at::kByte
+            input_group[0].new_empty(
+                args_tensor_numel * 8, dtype=torch.uint8, pin_memory=True
+            )
         )
-    )
 
-    ret.append(torch.zeros(5, dtype=torch.int64, device="cpu"))
+    # Two saved_data tensors (7 elements each)
+    ret.append(torch.zeros(7, dtype=torch.int64, device="cpu"))
+    ret.append(torch.zeros(7, dtype=torch.int64, device="cpu"))
 
     return ret
 
@@ -1001,8 +1006,8 @@ def group_index_select_dim0_gpu_backward_abstract(
     Calculate output shapes for group_index_select_dim0_gpu_backward
     without the actual data.
     """
-    torch._check(len(all_inputs) > 3)
-    group_size = (len(all_inputs) - 3) // 2
+    torch._check(len(all_inputs) > 4)
+    group_size = (len(all_inputs) - 5) // 2
     ret = []
 
     # indices
