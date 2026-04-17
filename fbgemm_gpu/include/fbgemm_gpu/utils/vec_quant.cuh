@@ -13,12 +13,13 @@
 #include "fbgemm_gpu/utils/cuda_prelude.cuh"
 #include "fbgemm_gpu/utils/float.cuh"
 #include "fbgemm_gpu/utils/types.h"
+#include "fbgemm_gpu/utils/warp_size.h"
 
 namespace fbgemm_gpu {
 
 #define DEVICE_INLINE __device__ inline __attribute__((always_inline))
 
-#ifdef __HIP_PLATFORM_AMD__
+#if defined(USE_ROCM) && defined(ROCM_WAVE64)
 constexpr int32_t kThreadsPerWarp = 64;
 constexpr int32_t kWarpsPerBlock = 16;
 #else
@@ -215,17 +216,17 @@ DEVICE_INLINE T shfl_xor(
 template <typename T>
 DEVICE_INLINE T warpReduceSum(T val, uint32_t warp_mask = FINAL_MASK) {
 #pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    val += shfl_xor(warp_mask, val, mask, 32);
+  for (int mask = kThreadsPerWarp / 2; mask > 0; mask >>= 1)
+    val += shfl_xor(warp_mask, val, mask, kThreadsPerWarp);
   return val;
 }
 
 template <typename T>
 DEVICE_INLINE T warpReduceMax(T val, uint32_t warp_mask = FINAL_MASK) {
 #pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
+  for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
 #ifdef __HIP_PLATFORM_AMD__
-    val = std::max(val, shfl_xor(warp_mask, val, offset, 32));
+    val = std::max(val, shfl_xor(warp_mask, val, offset, kThreadsPerWarp));
 #else
     val = fmaxf(val, __shfl_down_sync(warp_mask, val, offset));
 #endif
@@ -234,16 +235,17 @@ DEVICE_INLINE T warpReduceMax(T val, uint32_t warp_mask = FINAL_MASK) {
 }
 
 __inline__ __device__ float blockReduceMax(float val) {
-  static __shared__ float shared[32];
-  uint32_t lane = threadIdx.x & 31;
-  uint32_t wid = threadIdx.x >> 5;
+  constexpr int kMaxThreadsPerBlock = 1024;
+  static __shared__ float shared[kMaxThreadsPerBlock / kThreadsPerWarp];
+  uint32_t lane = threadIdx.x & (kThreadsPerWarp - 1);
+  uint32_t wid = threadIdx.x / kThreadsPerWarp;
   val = warpReduceMax(val);
   if (lane == 0)
     shared[wid] = val; // write per‑warp result
   __syncthreads();
   // read by first warp
   if (wid == 0) {
-    int numWarps = (blockDim.x + 31) >> 5;
+    int numWarps = (blockDim.x + kThreadsPerWarp - 1) / kThreadsPerWarp;
     val = (lane < numWarps) ? shared[lane] : -1e20f;
     val = warpReduceMax(val);
   }
