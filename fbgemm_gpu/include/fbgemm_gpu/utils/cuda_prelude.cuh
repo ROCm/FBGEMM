@@ -72,7 +72,9 @@ static constexpr int32_t kMaxBlockYDim = 65535;
 static constexpr int32_t kMaxBlockZDim = 65535;
 
 // Full warp mask
-#if defined(ROCM_WAVE64)
+#if defined(USE_ROCM)
+// Need to use uint64_t size for both 32 and 64 wave sizes
+// to match intrinsics API
 static constexpr uint64_t kFullWarpMask = 0xff'ff'ff'ff'ff'ff'ff'ff;
 #else
 static constexpr uint32_t kFullWarpMask = 0xff'ff'ff'ff;

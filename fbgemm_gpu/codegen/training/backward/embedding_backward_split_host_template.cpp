@@ -15,6 +15,7 @@
 
 #include "fbgemm_gpu/utils/dispatch_macros.h"
 #include "fbgemm_gpu/utils/ops_utils.h"
+#include "fbgemm_gpu/utils/warp_size.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
 #include "fbgemm_gpu/config/feature_gates.h"
 
@@ -958,9 +959,9 @@ class {{ autograd_func }} :
 
     TORCH_CHECK_EQ(grad_outputs.size(), 1);
 
-#ifdef USE_ROCM
+#if defined(USE_ROCM) && defined(ROCM_WAVE64)
     constexpr int32_t BT_block_size = 64;
-    constexpr int32_t max_segment_length_per_warp =  16384;
+    constexpr int32_t max_segment_length_per_warp = 16384;
 #else
     constexpr int32_t BT_block_size = 32;
     constexpr int32_t max_segment_length_per_warp = 32;

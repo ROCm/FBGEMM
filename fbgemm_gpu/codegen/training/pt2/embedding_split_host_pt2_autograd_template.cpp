@@ -39,6 +39,7 @@
 #include "fbgemm_gpu/split_embeddings_utils.h"
 #include "fbgemm_gpu/config/feature_gates.h"
 #include "fbgemm_gpu/utils/tensor_utils.h"
+#include "fbgemm_gpu/utils/warp_size.h"
 #include "torch/csrc/autograd/record_function_ops.h"
 #include "torch/csrc/autograd/record_function_ops.h"
 
@@ -1078,9 +1079,16 @@ static torch::autograd::variable_list backward(
 
     TORCH_CHECK_EQ(grad_outputs.size(), 1);
 
-#ifdef USE_ROCM
+#if defined(USE_ROCM)
+#if defined(ROCM_WAVE64)
     constexpr int32_t BT_block_size = 64;
     int32_t max_segment_length_per_warp = 64;
+#elif defined(ROCM_WAVE32)
+    constexpr int32_t BT_block_size = 32;
+    int32_t max_segment_length_per_warp = 32;
+#else
+    static_assert(false, "ROCM_WAVE* is not defined. Make sure that warp_size.h is included");
+#endif
     {%- if (not nobag) and
            (optimizer == "rowwise_adagrad") and
            (not vbe) and

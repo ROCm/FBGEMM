@@ -90,7 +90,7 @@ inline __device__ void warpBitonicMergeLE16(K& k, V& v) {
 template <typename K, typename V, bool Dir, typename Comp>
 struct BitonicSort {
   static inline __device__ void sort(K k[1], V v[1]) {
-#if defined(ROCM_WAVE64)
+#if defined (USE_ROCM) && defined(ROCM_WAVE64)
     static_assert(fbgemm_gpu::kWarpSize == 64, "unexpected warp size");
 #else
     static_assert(fbgemm_gpu::kWarpSize == 32, "unexpected warp size");
@@ -100,7 +100,7 @@ struct BitonicSort {
     warpBitonicMergeLE16<K, V, 4, Dir, Comp, false>(k[0], v[0]);
     warpBitonicMergeLE16<K, V, 8, Dir, Comp, false>(k[0], v[0]);
     warpBitonicMergeLE16<K, V, 16, Dir, Comp, false>(k[0], v[0]);
-#ifdef USE_ROCM
+#if defined(USE_ROCM) && defined(ROCM_WAVE64)
     // AMD wavefronts are 64-wide, so we need a 6th merge stage (L=32)
     // to fully sort all 64 elements. L=32 <= kWarpSize/2 = 32. ✓
     warpBitonicMergeLE16<K, V, 32, Dir, Comp, false>(k[0], v[0]);
