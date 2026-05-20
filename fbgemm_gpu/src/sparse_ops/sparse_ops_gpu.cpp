@@ -442,16 +442,8 @@ static torch::autograd::variable_list group_index_select_dim0_forward_impl_gpu(
       (num_total_indices >= kSortIndicesLowerThreshold) &&
       (num_total_indices < kSortIndicesUpperThreshold);
 
-  // Cache+contig in the backward kernel pay off whenever the per-warp
-  // sequence of indices has runs of duplicates or spatial locality. For
-  // low-precision dtypes (fp16/bf16) the wins are large -- atomicAdd is a
-  // software CAS-loop emulation -- so we enable them unconditionally. For
-  // fp32 the hardware-native atomicAdd is cheap, so they only pay off when
-  // the workload is large enough to amortize the per-warp cache logic
-  // overhead. We use the same lower threshold as the sort heuristic, but
-  // intentionally ignore the upper threshold: when the workload is too
-  // large for sort to be worthwhile, cache+contig still help because the
-  // kernel runtime dominates.
+  // Only use caching and contiguous warp dispatch when there are sufficiently many
+  // indices (for fp32). Always on for fp16
   const bool enable_cache_and_contig_for_bwd =
       is_low_precision || (num_total_indices >= kSortIndicesLowerThreshold);
 #else
@@ -786,10 +778,7 @@ static torch::autograd::variable_list group_index_select_dim0_backward_impl_gpu(
 
 #ifdef USE_ROCM
   // enable_cache_and_contig is computed in the forward (see the heuristic
-  // there): true for fp16/bf16 always, and for fp32 when total_indices is
-  // above the lower threshold. It is intentionally decoupled from
-  // use_sorted_indices so that cache+contig stay on for large fp32
-  // workloads even when sort is disabled by the upper threshold.
+  // there)
   const bool use_contiguous_warps = enable_cache_and_contig;
   const bool use_cache = enable_cache_and_contig;
 #else
