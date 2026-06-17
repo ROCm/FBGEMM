@@ -114,9 +114,9 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
 
     AMD/ROCm support status:
         This operator supports AMD GPUs (ROCm/HIP). Key adaptations:
-        - Cache associativity (ASSOC) is set to 64 to match AMD's 64-wide
-          wavefronts (vs. 32 for NVIDIA warps). Python-side tensor shapes
-          and C++ kernel indexing are kept in sync via common.ASSOC.
+        - Cache associativity is derived from the device warp size (64 on AMD
+          CDNA wavefronts, 32 on RDNA and NVIDIA warps), so Python-side tensor
+          shapes stay in sync with the C++ kernel's per-lane way indexing.
         - BitonicSort includes a 6th merge stage (L=32) for 64-element sorts.
         - lxu_cache_lookup uses HIP-native __ballot() instead of
           __ballot_sync().
@@ -137,7 +137,7 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         row_alignment: int | None = None,
         fp8_exponent_bits: int | None = None,
         fp8_exponent_bias: int | None = None,
-        cache_assoc: int = ASSOC,
+        cache_assoc: int | None = None,
         scale_bias_size_in_bytes: int = DEFAULT_SCALE_BIAS_SIZE_IN_BYTES,
         cache_sets: int = 0,
         ssd_storage_directory: str = "/tmp",
@@ -163,11 +163,6 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
     ) -> None:  # noqa C901  # tuple of (rows, dims,)
         super().__init__()
 
-        assert cache_assoc == ASSOC, (
-            f"cache_assoc must match platform ASSOC={ASSOC} "
-            f"(CUDA=32, ROCm=64), got {cache_assoc}"
-        )
-
         self.enable_cache_locking = enable_cache_locking
         self.scale_bias_size_in_bytes = scale_bias_size_in_bytes
         self.pooling_mode = pooling_mode
@@ -184,6 +179,18 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         else:
             self.current_device = torch.device(device)
         self.use_cpu: bool = self.current_device.type == "cpu"
+
+        # Cache associativity must equal the device warp size (64 on CDNA, 32 on
+        # RDNA and NVIDIA), as the cache kernels scan one way per warp lane.
+        if cache_assoc is None:
+            cache_assoc = (
+                ASSOC
+                if self.use_cpu
+                else torch.cuda.get_device_properties(
+                    self.current_device
+                ).warp_size
+            )
+        self.cache_assoc: int = cache_assoc
 
         self.feature_table_map: list[int] = (
             feature_table_map if feature_table_map is not None else list(range(T_))
@@ -288,7 +295,7 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         )
         assert cache_sets > 0
         element_size = 1
-        cache_size = cache_sets * ASSOC * element_size * self.max_D_cache
+        cache_size = cache_sets * self.cache_assoc * element_size * self.max_D_cache
         logging.info(
             f"Using cache for SSD with admission algorithm "
             f"{CacheAlgorithm.LRU}, {cache_sets} sets, stored on {'DEVICE' if ssd_cache_location is EmbeddingLocation.DEVICE else 'MANAGED'} with {ssd_shards} shards, "
@@ -301,10 +308,10 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         )
         self.register_buffer(
             "lxu_cache_state",
-            torch.zeros(cache_sets, ASSOC, dtype=torch.int64).fill_(-1),
+            torch.zeros(cache_sets, self.cache_assoc, dtype=torch.int64).fill_(-1),
         )
         self.register_buffer(
-            "lru_state", torch.zeros(cache_sets, ASSOC, dtype=torch.int64)
+            "lru_state", torch.zeros(cache_sets, self.cache_assoc, dtype=torch.int64)
         )
         # Cache locking counter: prevents eviction of cache lines that are
         # currently being read by forward(). Without this, a concurrent
@@ -313,7 +320,7 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
             "lxu_cache_locking_counter",
             torch.zeros(
                 cache_sets,
-                ASSOC,
+                self.cache_assoc,
                 device=self.current_device,
                 dtype=torch.int32,
             ),
@@ -328,14 +335,14 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
                 "lxu_cache_weights",
                 torch.ops.fbgemm.new_managed_tensor(
                     torch.zeros(1, device=self.current_device, dtype=torch.uint8),
-                    [cache_sets * ASSOC, self.max_D_cache],
+                    [cache_sets * self.cache_assoc, self.max_D_cache],
                 ),
             )
         else:
             self.register_buffer(
                 "lxu_cache_weights",
                 torch.zeros(
-                    cache_sets * ASSOC,
+                    cache_sets * self.cache_assoc,
                     self.max_D_cache,
                     device=self.current_device,
                     dtype=torch.uint8,
@@ -472,9 +479,9 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
 
         if IS_ROCM:
             logging.info(
-                "SSD TBE inference running on ROCm with ASSOC=%d "
-                "(matching AMD 64-wide wavefronts).",
-                ASSOC,
+                "SSD TBE inference running on ROCm with cache associativity=%d "
+                "(matching the device warp size).",
+                self.cache_assoc,
             )
 
         # Read-write lock for concurrent inference + streaming updates.
@@ -775,17 +782,17 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         max_cache_sets = self.lxu_cache_state.shape[0]
         cache_set_ids = indices % max_cache_sets  # [N]
 
-        # Gather the ASSOC slots for each relevant cache set: [N, ASSOC]
+        # Gather the ways for each relevant cache set: [N, cache_assoc]
         relevant_states = self.lxu_cache_state[cache_set_ids]
 
-        # Find which slots hold the updated indices: [N, ASSOC] bool
+        # Find which slots hold the updated indices: [N, cache_assoc] bool
         matches = relevant_states == indices.unsqueeze(1)
 
         if matches.any():
             # Get (row_in_batch, slot) pairs for all matches
             n_idx, slot_idx = matches.nonzero(as_tuple=True)
             # Convert to flat indices into lxu_cache_state
-            flat_idx = cache_set_ids[n_idx] * ASSOC + slot_idx
+            flat_idx = cache_set_ids[n_idx] * self.cache_assoc + slot_idx
             self.lxu_cache_state.view(-1)[flat_idx] = -1
 
     @torch.jit.export

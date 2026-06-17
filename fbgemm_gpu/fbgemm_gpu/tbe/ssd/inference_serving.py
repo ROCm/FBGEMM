@@ -35,6 +35,16 @@ from .common import ASSOC
 from .inference import SSDIntNBitTableBatchedEmbeddingBags
 
 
+def _device_cache_assoc() -> int:
+    # Cache associativity equals the device warp size (64 on CDNA, 32 on RDNA
+    # and NVIDIA). Fall back to ASSOC when no device is available (planning).
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).warp_size
+    return ASSOC
+
+
 class TurboSSDInferenceModule(nn.Module):
     """
     Drop-in serving module backed by FBGEMM SSD TBE with TurboSSD v2
@@ -126,7 +136,7 @@ class TurboSSDInferenceModule(nn.Module):
         module = cls(tbe)
 
         total_rows = sum(r for _, r, _, _ in specs)
-        cache_capacity = cache_sets * ASSOC
+        cache_capacity = cache_sets * _device_cache_assoc()
         logging.info(
             f"TurboSSD inference module: {len(specs)} tables, "
             f"{total_rows:,} total rows, "
@@ -145,23 +155,23 @@ class TurboSSDInferenceModule(nn.Module):
         """
         Compute the number of cache sets for the target hit rate.
 
-        For a set-associative cache with ASSOC ways, we need enough sets
+        For a set-associative cache with `assoc` ways, we need enough sets
         so that the total number of cache slots >= target fraction of the
         working set.
 
         If an HBM budget is specified, the cache is capped to fit within it.
         """
-
+        assoc = _device_cache_assoc()
         total_rows = sum(rows for _, rows, _, _ in specs)
         target_cached_rows = int(total_rows * cache_hit_rate)
-        cache_sets_from_hit_rate = max((target_cached_rows + ASSOC - 1) // ASSOC, 1)
+        cache_sets_from_hit_rate = max((target_cached_rows + assoc - 1) // assoc, 1)
 
         if hbm_budget_gb > 0:
             max_d_cache = max(
                 rounded_row_size_in_bytes(dim, ty, 16) for _, _, dim, ty in specs
             )
             budget_bytes = int(hbm_budget_gb * 1024 * 1024 * 1024)
-            cache_sets_from_budget = budget_bytes // (ASSOC * max_d_cache)
+            cache_sets_from_budget = budget_bytes // (assoc * max_d_cache)
             cache_sets = min(cache_sets_from_hit_rate, max(cache_sets_from_budget, 1))
         else:
             cache_sets = cache_sets_from_hit_rate
@@ -179,14 +189,15 @@ class TurboSSDInferenceModule(nn.Module):
         Returns the projected HBM cache size. Useful for capacity planning
         on H100 (96 GB) and MI350X (288 GB).
         """
+        assoc = _device_cache_assoc()
         total_rows = sum(rows for _, rows, _, _ in specs)
         target_rows = int(total_rows * cache_hit_rate)
-        cache_sets = max((target_rows + ASSOC - 1) // ASSOC, 1)
+        cache_sets = max((target_rows + assoc - 1) // assoc, 1)
 
         max_d_cache = max(
             rounded_row_size_in_bytes(dim, ty, 16) for _, _, dim, ty in specs
         )
-        cache_bytes = cache_sets * ASSOC * max_d_cache
+        cache_bytes = cache_sets * assoc * max_d_cache
         return cache_bytes / (1024 * 1024 * 1024)
 
     def forward(

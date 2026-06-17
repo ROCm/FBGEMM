@@ -10,7 +10,6 @@
 import random
 import time
 import unittest
-from unittest.mock import patch
 
 import hypothesis.strategies as st
 import numpy as np
@@ -25,7 +24,6 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     unpadded_row_size_in_bytes,
 )
 from fbgemm_gpu.tbe.ssd import SSDIntNBitTableBatchedEmbeddingBags
-from fbgemm_gpu.tbe.ssd.common import ASSOC
 from fbgemm_gpu.tbe.utils import (
     b_indices,
     fake_quantize_embs,
@@ -411,7 +409,7 @@ class SSDIntNBitTableBatchedEmbeddingsTest(unittest.TestCase):
             lxu_cache_state_cpu = emb.lxu_cache_state.cpu()
 
             NOT_FOUND = np.iinfo(np.int32).max
-            ASSOC = 32
+            assoc = emb.cache_assoc
 
             for loc, linear_idx in zip(
                 lxu_cache_locations.cpu().numpy().tolist(),
@@ -419,8 +417,8 @@ class SSDIntNBitTableBatchedEmbeddingsTest(unittest.TestCase):
             ):
                 assert loc != NOT_FOUND
                 # if we have a hit, check the cache is consistent
-                loc_set = loc // ASSOC
-                loc_slot = loc % ASSOC
+                loc_set = loc // assoc
+                loc_slot = loc % assoc
                 assert lru_state_cpu[loc_set, loc_slot] == emb.timestep_counter.get()
                 assert lxu_cache_state_cpu[loc_set, loc_slot] == linear_idx
             fs = (
@@ -461,14 +459,13 @@ class SSDInferenceCacheLockingTest(unittest.TestCase):
     def test_lxu_cache_locking_counter_registered(self) -> None:
         """
         Test D96632292: Verify lxu_cache_locking_counter buffer is registered
-        with correct shape (cache_sets, ASSOC) and dtype int32.
+        with correct shape (cache_sets, cache_assoc) and dtype int32.
         """
         import tempfile
 
         E = int(1e4)
         D = 128
         cache_sets = 64
-        ASSOC = 32  # hardcoded in FBGEMM
 
         emb = SSDIntNBitTableBatchedEmbeddingBags(
             embedding_specs=[("", E, D, SparseType.FP32)],
@@ -486,8 +483,8 @@ class SSDInferenceCacheLockingTest(unittest.TestCase):
         )
         self.assertEqual(
             emb.lxu_cache_locking_counter.shape,
-            (cache_sets, ASSOC),
-            f"Expected shape ({cache_sets}, {ASSOC}), "
+            (cache_sets, emb.cache_assoc),
+            f"Expected shape ({cache_sets}, {emb.cache_assoc}), "
             f"got {emb.lxu_cache_locking_counter.shape}",
         )
         self.assertEqual(
@@ -1539,7 +1536,7 @@ class TurboSSDInferenceModuleTest(unittest.TestCase):
             hbm_budget_gb=0.1,
             cache_hit_rate=0.90,
         )
-        cache_slots = module.tbe.lxu_cache_state.shape[0] * ASSOC
+        cache_slots = module.tbe.lxu_cache_state.numel()
         # 0.1 GB = ~107 million bytes. With ~512 bytes/row, ~209K rows max.
         self.assertLess(cache_slots, 1_000_000)
 
@@ -1639,14 +1636,12 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
     Tests for AMD/ROCm support in SSD TBE inference.
 
     These tests verify:
-    - ASSOC constant matches the platform warp/wavefront width
-    - Tensor shapes use the platform-appropriate ASSOC
-    - Cache invalidation works correctly with any ASSOC value
-    - Forward pass is correct regardless of ASSOC
+    - Cache associativity matches the device warp/wavefront width
+    - Tensor shapes use the device-derived associativity
+    - Cache invalidation works correctly at any associativity
+    - Forward pass is correct regardless of associativity
     - The full prefetch+forward pipeline works end-to-end
     """
-
-    IS_ROCM: bool = hasattr(torch.version, "hip") and torch.version.hip is not None
 
     def _create_emb(
         self,
@@ -1687,53 +1682,63 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         torch.cuda.synchronize()
         return weights
 
-    # ─── ASSOC constant tests ────────────────────────────────────────────
+    # ─── Cache associativity tests ───────────────────────────────────────
 
-    def test_assoc_value_matches_platform(self) -> None:
-        """ASSOC should be 64 on ROCm, 32 on CUDA."""
-        if self.IS_ROCM:
-            self.assertEqual(ASSOC, 64, "ASSOC must be 64 on ROCm (64-wide wavefronts)")
-        else:
-            self.assertEqual(ASSOC, 32, "ASSOC must be 32 on CUDA (32-wide warps)")
+    def test_cache_assoc_matches_device_warp_size(self) -> None:
+        """Cache associativity must equal the device warp size."""
+        warp_size = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).warp_size
+        emb = self._create_emb(cache_sets=64)
+        self.assertEqual(
+            emb.cache_assoc,
+            warp_size,
+            f"cache_assoc ({emb.cache_assoc}) must equal the device warp size "
+            f"({warp_size}); the cache kernels scan one way per warp lane.",
+        )
 
-    def test_assoc_is_power_of_two(self) -> None:
-        """ASSOC must be a power of 2 for set-associative cache indexing."""
+    def test_cache_assoc_is_power_of_two(self) -> None:
+        """Cache associativity must be a power of 2 for set indexing."""
+        emb = self._create_emb(cache_sets=64)
+        assoc = emb.cache_assoc
         self.assertTrue(
-            ASSOC > 0 and (ASSOC & (ASSOC - 1)) == 0,
-            f"ASSOC={ASSOC} is not a power of 2",
+            assoc > 0 and (assoc & (assoc - 1)) == 0,
+            f"cache_assoc={assoc} is not a power of 2",
         )
 
     # ─── Tensor shape tests ──────────────────────────────────────────────
 
     def test_lxu_cache_state_shape(self) -> None:
-        """lxu_cache_state must have ASSOC columns."""
+        """lxu_cache_state must have cache_assoc columns."""
         cache_sets = 128
         emb = self._create_emb(cache_sets=cache_sets)
         self.assertEqual(
             emb.lxu_cache_state.shape,
-            (cache_sets, ASSOC),
-            f"lxu_cache_state shape mismatch: expected ({cache_sets}, {ASSOC})",
+            (cache_sets, emb.cache_assoc),
+            f"lxu_cache_state shape mismatch: expected ({cache_sets}, {emb.cache_assoc})",
         )
 
     def test_lru_state_shape(self) -> None:
-        """lru_state must have ASSOC columns."""
+        """lru_state must have cache_assoc columns."""
         cache_sets = 64
         emb = self._create_emb(cache_sets=cache_sets)
-        self.assertEqual(emb.lru_state.shape, (cache_sets, ASSOC))
+        self.assertEqual(emb.lru_state.shape, (cache_sets, emb.cache_assoc))
 
     def test_lxu_cache_locking_counter_shape(self) -> None:
-        """lxu_cache_locking_counter must have ASSOC columns."""
+        """lxu_cache_locking_counter must have cache_assoc columns."""
         cache_sets = 64
         emb = self._create_emb(cache_sets=cache_sets)
-        self.assertEqual(emb.lxu_cache_locking_counter.shape, (cache_sets, ASSOC))
+        self.assertEqual(
+            emb.lxu_cache_locking_counter.shape, (cache_sets, emb.cache_assoc)
+        )
 
     def test_lxu_cache_weights_shape(self) -> None:
-        """lxu_cache_weights rows = cache_sets * ASSOC."""
+        """lxu_cache_weights rows = cache_sets * cache_assoc."""
         cache_sets = 32
         D = 128
         weights_ty = SparseType.FP32
         emb = self._create_emb(cache_sets=cache_sets, D=D, weights_ty=weights_ty)
-        expected_rows = cache_sets * ASSOC
+        expected_rows = cache_sets * emb.cache_assoc
         self.assertEqual(
             emb.lxu_cache_weights.shape[0],
             expected_rows,
@@ -1775,7 +1780,7 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         )
 
     def test_invalidate_cache_last_slot(self) -> None:
-        """Cache invalidation must work in the last ASSOC slot (slot ASSOC-1)."""
+        """Cache invalidation must work in the last way (slot cache_assoc-1)."""
         E = 1000
         D = 128
         cache_sets = 64
@@ -1783,7 +1788,7 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
 
         # Place index 7 in the LAST slot of its cache set
         target_set = 7 % cache_sets
-        last_slot = ASSOC - 1
+        last_slot = emb.cache_assoc - 1
         emb.lxu_cache_state[target_set, last_slot] = 7
 
         emb._invalidate_cache(torch.tensor([7], dtype=torch.int64))
@@ -1796,7 +1801,7 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
 
     def test_invalidate_cache_all_slots_populated(self) -> None:
         """
-        When all ASSOC slots in a cache set are populated, invalidation
+        When all ways in a cache set are populated, invalidation
         should only clear the matching entry.
         """
         E = 10000
@@ -1804,21 +1809,21 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         cache_sets = 128
         emb = self._create_emb(E=E, D=D, cache_sets=cache_sets)
 
-        # Fill all ASSOC slots in set 0 with distinct indices that all
+        # Fill all ways in set 0 with distinct indices that all
         # map to set 0 (i.e., index % cache_sets == 0).
         target_set = 0
-        indices_in_set = [i * cache_sets for i in range(ASSOC)]
+        indices_in_set = [i * cache_sets for i in range(emb.cache_assoc)]
         for slot, idx in enumerate(indices_in_set):
             emb.lxu_cache_state[target_set, slot] = idx
 
         # Invalidate only the index in the middle slot
-        mid_slot = ASSOC // 2
+        mid_slot = emb.cache_assoc // 2
         mid_idx = indices_in_set[mid_slot]
         emb._invalidate_cache(torch.tensor([mid_idx], dtype=torch.int64))
 
         # Middle slot should be -1, others unchanged
         self.assertEqual(emb.lxu_cache_state[target_set, mid_slot].item(), -1)
-        for slot in range(ASSOC):
+        for slot in range(emb.cache_assoc):
             if slot != mid_slot:
                 self.assertEqual(
                     emb.lxu_cache_state[target_set, slot].item(),
@@ -1828,8 +1833,8 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
 
     def test_invalidate_cache_flat_index_correctness(self) -> None:
         """
-        The flat index computation (cache_set * ASSOC + slot) must be correct
-        for the platform's ASSOC value.
+        The flat index computation (cache_set * cache_assoc + slot) must be
+        correct for the device's cache associativity.
         """
         E = 10000
         D = 64
@@ -1837,12 +1842,13 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         emb = self._create_emb(E=E, D=D, cache_sets=cache_sets)
 
         # Place entries in various (set, slot) positions
+        assoc = emb.cache_assoc
         test_cases = [
             (0, 0),
-            (0, ASSOC - 1),
+            (0, assoc - 1),
             (cache_sets - 1, 0),
-            (cache_sets - 1, ASSOC - 1),
-            (cache_sets // 2, ASSOC // 2),
+            (cache_sets - 1, assoc - 1),
+            (cache_sets // 2, assoc // 2),
         ]
         for cache_set, slot in test_cases:
             idx = cache_set  # index % cache_sets == cache_set
@@ -1983,63 +1989,60 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
     # ─── Multi-table with platform ASSOC ─────────────────────────────────
 
     def test_multi_table_tensor_shapes(self) -> None:
-        """Multi-table setup should share the same cache with ASSOC slots."""
+        """Multi-table setup should share the same cache with cache_assoc slots."""
         T = 3
         cache_sets = 32
         emb = self._create_emb(T=T, cache_sets=cache_sets)
 
         # Cache state is shared across all tables
-        self.assertEqual(emb.lxu_cache_state.shape, (cache_sets, ASSOC))
-        self.assertEqual(emb.lxu_cache_weights.shape[0], cache_sets * ASSOC)
+        self.assertEqual(emb.lxu_cache_state.shape, (cache_sets, emb.cache_assoc))
+        self.assertEqual(
+            emb.lxu_cache_weights.shape[0], cache_sets * emb.cache_assoc
+        )
 
-    # ─── Simulated ASSOC=64 tests (run on NVIDIA to test the logic) ──────
+    # ─── Explicit assoc=64 tests (exercise 64-wide cache on any device) ──
 
-    def test_invalidate_cache_simulated_assoc64(self) -> None:
+    def test_invalidate_cache_explicit_assoc64(self) -> None:
         """
-        Simulate ASSOC=64 on NVIDIA hardware by patching the common.ASSOC
-        and creating a module with the wider cache. This verifies the
-        _invalidate_cache logic works for 64-wide cache sets.
+        Construct with an explicit cache_assoc=64 so the wider cache can be
+        exercised on any device. Verifies _invalidate_cache works for 64-wide
+        cache sets.
         """
         import tempfile
 
         E = 1000
         D = 64
         cache_sets = 16
-        sim_assoc = 64
+        assoc = 64
 
-        # Create with simulated ASSOC=64
-        with patch("fbgemm_gpu.tbe.ssd.common.ASSOC", sim_assoc), patch(
-            "fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc
-        ):
-            emb = SSDIntNBitTableBatchedEmbeddingBags(
-                embedding_specs=[("", E, D, SparseType.FP32)],
-                feature_table_map=[0],
-                ssd_storage_directory=tempfile.mkdtemp(),
-                cache_sets=cache_sets,
-                cache_assoc=sim_assoc,
-                pooling_mode=PoolingMode.SUM,
-            ).cuda()
+        emb = SSDIntNBitTableBatchedEmbeddingBags(
+            embedding_specs=[("", E, D, SparseType.FP32)],
+            feature_table_map=[0],
+            ssd_storage_directory=tempfile.mkdtemp(),
+            cache_sets=cache_sets,
+            cache_assoc=assoc,
+            pooling_mode=PoolingMode.SUM,
+        ).cuda()
 
         # Verify shapes
-        self.assertEqual(emb.lxu_cache_state.shape, (cache_sets, sim_assoc))
-        self.assertEqual(emb.lxu_cache_weights.shape[0], cache_sets * sim_assoc)
+        self.assertEqual(emb.lxu_cache_state.shape, (cache_sets, assoc))
+        self.assertEqual(emb.lxu_cache_weights.shape[0], cache_sets * assoc)
 
-        # Place an entry in slot 63 (only valid with ASSOC=64)
+        # Place an entry in slot 63 (only valid with assoc=64)
         target_set = 5
         emb.lxu_cache_state[target_set, 63] = 5
 
-        with patch("fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc):
-            emb._invalidate_cache(torch.tensor([5], dtype=torch.int64))
+        emb._invalidate_cache(torch.tensor([5], dtype=torch.int64))
 
         self.assertEqual(
             emb.lxu_cache_state[target_set, 63].item(),
             -1,
-            "Slot 63 should be invalidated with ASSOC=64",
+            "Slot 63 should be invalidated with assoc=64",
         )
 
-    def test_invalidate_cache_simulated_assoc64_boundary(self) -> None:
+    def test_invalidate_cache_explicit_assoc64_boundary(self) -> None:
         """
-        With ASSOC=64, verify flat index computation at boundary:
+        With cache_assoc=64, verify flat index computation at boundary:
         (last_set, last_slot) should produce correct flat_idx.
         """
         import tempfile
@@ -2047,35 +2050,31 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         E = 10000
         D = 64
         cache_sets = 8
-        sim_assoc = 64
+        assoc = 64
 
-        with patch("fbgemm_gpu.tbe.ssd.common.ASSOC", sim_assoc), patch(
-            "fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc
-        ):
-            emb = SSDIntNBitTableBatchedEmbeddingBags(
-                embedding_specs=[("", E, D, SparseType.FP32)],
-                feature_table_map=[0],
-                ssd_storage_directory=tempfile.mkdtemp(),
-                cache_sets=cache_sets,
-                cache_assoc=sim_assoc,
-                pooling_mode=PoolingMode.SUM,
-            ).cuda()
+        emb = SSDIntNBitTableBatchedEmbeddingBags(
+            embedding_specs=[("", E, D, SparseType.FP32)],
+            feature_table_map=[0],
+            ssd_storage_directory=tempfile.mkdtemp(),
+            cache_sets=cache_sets,
+            cache_assoc=assoc,
+            pooling_mode=PoolingMode.SUM,
+        ).cuda()
 
         # Place entry at (set=7, slot=63) — the very last position
         last_set = cache_sets - 1
-        last_slot = sim_assoc - 1
+        last_slot = assoc - 1
         idx = last_set  # maps to set = 7 % 8 = 7
         emb.lxu_cache_state[last_set, last_slot] = idx
 
-        expected_flat_idx = last_set * sim_assoc + last_slot  # 7*64+63 = 511
+        expected_flat_idx = last_set * assoc + last_slot  # 7*64+63 = 511
         # Verify the flat view
         self.assertEqual(
             emb.lxu_cache_state.view(-1)[expected_flat_idx].item(),
             idx,
         )
 
-        with patch("fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc):
-            emb._invalidate_cache(torch.tensor([idx], dtype=torch.int64))
+        emb._invalidate_cache(torch.tensor([idx], dtype=torch.int64))
 
         self.assertEqual(
             emb.lxu_cache_state.view(-1)[expected_flat_idx].item(),
@@ -2083,9 +2082,9 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
             f"Flat index {expected_flat_idx} should be invalidated",
         )
 
-    def test_invalidate_cache_simulated_assoc64_multi_match(self) -> None:
+    def test_invalidate_cache_explicit_assoc64_multi_match(self) -> None:
         """
-        With ASSOC=64, test that invalidation of a batch of indices
+        With cache_assoc=64, test that invalidation of a batch of indices
         correctly handles multiple matches across different cache sets.
         """
         import tempfile
@@ -2093,19 +2092,16 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         E = 10000
         D = 64
         cache_sets = 16
-        sim_assoc = 64
+        assoc = 64
 
-        with patch("fbgemm_gpu.tbe.ssd.common.ASSOC", sim_assoc), patch(
-            "fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc
-        ):
-            emb = SSDIntNBitTableBatchedEmbeddingBags(
-                embedding_specs=[("", E, D, SparseType.FP32)],
-                feature_table_map=[0],
-                ssd_storage_directory=tempfile.mkdtemp(),
-                cache_sets=cache_sets,
-                cache_assoc=sim_assoc,
-                pooling_mode=PoolingMode.SUM,
-            ).cuda()
+        emb = SSDIntNBitTableBatchedEmbeddingBags(
+            embedding_specs=[("", E, D, SparseType.FP32)],
+            feature_table_map=[0],
+            ssd_storage_directory=tempfile.mkdtemp(),
+            cache_sets=cache_sets,
+            cache_assoc=assoc,
+            pooling_mode=PoolingMode.SUM,
+        ).cuda()
 
         # Populate 3 entries in different sets, using various slots
         entries = [
@@ -2120,8 +2116,7 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
             [e[2] for e in entries],
             dtype=torch.int64,
         )
-        with patch("fbgemm_gpu.tbe.ssd.inference.ASSOC", sim_assoc):
-            emb._invalidate_cache(indices_to_invalidate)
+        emb._invalidate_cache(indices_to_invalidate)
 
         for target_set, slot, idx in entries:
             self.assertEqual(
@@ -2129,3 +2124,28 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
                 -1,
                 f"Entry idx={idx} at set={target_set}, slot={slot} should be invalidated",
             )
+
+
+@unittest.skipIf(*gpu_unavailable)
+class SSDInferenceAssocWarpSizeTest(unittest.TestCase):
+    """
+    The SSD inference cache associativity must equal the device warp size: the
+    cache kernels use kWarpSize for set indexing, scanning one way per lane. On
+    wave32 (RDNA) devices a hardcoded associativity of 64 makes the host
+    allocate 64-way sets that the kernel only half-scans. Unlike the rest of the
+    SSD tests, this does not need the RocksDB backend, so it runs in OSS.
+    """
+
+    def test_serving_compute_cache_sets_uses_device_warp_size(self) -> None:
+        from fbgemm_gpu.tbe.ssd.inference_serving import _device_cache_assoc
+
+        warp_size = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).warp_size
+        self.assertEqual(
+            _device_cache_assoc(),
+            warp_size,
+            f"SSD serving associativity ({_device_cache_assoc()}) must equal the "
+            f"device warp size ({warp_size}); the cache kernels scan one way per "
+            "warp lane.",
+        )
