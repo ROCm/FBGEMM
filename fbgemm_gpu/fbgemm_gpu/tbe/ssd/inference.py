@@ -35,7 +35,7 @@ from fbgemm_gpu.tbe.config import (
 from torch import distributed as dist, nn, Tensor  # usort:skip
 from torch.autograd.profiler import record_function
 
-from .common import ASSOC
+from .common import device_cache_assoc
 
 IS_ROCM: bool = hasattr(torch.version, "hip") and torch.version.hip is not None
 
@@ -180,13 +180,17 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
             self.current_device = torch.device(device)
         self.use_cpu: bool = self.current_device.type == "cpu"
 
+        # Cache associativity must equal the device warp size (32 on NVIDIA,
+        # either 32 or 64 on AMD). An explicit cache_assoc is honored only
+        # if it matches, so callers cannot silently request a mismatched
+        # (broken) geometry.
+        resolved_cache_assoc = device_cache_assoc(self.use_cpu)
         if cache_assoc is None:
-            cache_assoc = (
-                ASSOC
-                if self.use_cpu
-                else torch.cuda.get_device_properties(
-                    self.current_device
-                ).warp_size
+            cache_assoc = resolved_cache_assoc
+        elif cache_assoc != resolved_cache_assoc:
+            raise ValueError(
+                f"cache_assoc ({cache_assoc}) must equal the device warp size "
+                f"({resolved_cache_assoc})"
             )
         self.cache_assoc: int = cache_assoc
 

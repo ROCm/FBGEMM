@@ -10,6 +10,7 @@
 import random
 import time
 import unittest
+from unittest.mock import patch
 
 import hypothesis.strategies as st
 import numpy as np
@@ -2000,13 +2001,12 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
             emb.lxu_cache_weights.shape[0], cache_sets * emb.cache_assoc
         )
 
-    # ─── Explicit assoc=64 tests (exercise 64-wide cache on any device) ──
+    # ─── Simulated assoc=64 tests (exercise 64-wide cache on any device) ──
 
     def test_invalidate_cache_explicit_assoc64(self) -> None:
         """
-        Construct with an explicit cache_assoc=64 so the wider cache can be
-        exercised on any device. Verifies _invalidate_cache works for 64-wide
-        cache sets.
+        Simulate a 64-wide warp so the wider cache can be exercised on any
+        device. Verifies _invalidate_cache works for 64-wide cache sets.
         """
         import tempfile
 
@@ -2015,14 +2015,17 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         cache_sets = 16
         assoc = 64
 
-        emb = SSDIntNBitTableBatchedEmbeddingBags(
-            embedding_specs=[("", E, D, SparseType.FP32)],
-            feature_table_map=[0],
-            ssd_storage_directory=tempfile.mkdtemp(),
-            cache_sets=cache_sets,
-            cache_assoc=assoc,
-            pooling_mode=PoolingMode.SUM,
-        ).cuda()
+        with patch(
+            "fbgemm_gpu.tbe.ssd.inference.device_cache_assoc", return_value=assoc
+        ):
+            emb = SSDIntNBitTableBatchedEmbeddingBags(
+                embedding_specs=[("", E, D, SparseType.FP32)],
+                feature_table_map=[0],
+                ssd_storage_directory=tempfile.mkdtemp(),
+                cache_sets=cache_sets,
+                cache_assoc=assoc,
+                pooling_mode=PoolingMode.SUM,
+            ).cuda()
 
         # Verify shapes
         self.assertEqual(emb.lxu_cache_state.shape, (cache_sets, assoc))
@@ -2052,14 +2055,17 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         cache_sets = 8
         assoc = 64
 
-        emb = SSDIntNBitTableBatchedEmbeddingBags(
-            embedding_specs=[("", E, D, SparseType.FP32)],
-            feature_table_map=[0],
-            ssd_storage_directory=tempfile.mkdtemp(),
-            cache_sets=cache_sets,
-            cache_assoc=assoc,
-            pooling_mode=PoolingMode.SUM,
-        ).cuda()
+        with patch(
+            "fbgemm_gpu.tbe.ssd.inference.device_cache_assoc", return_value=assoc
+        ):
+            emb = SSDIntNBitTableBatchedEmbeddingBags(
+                embedding_specs=[("", E, D, SparseType.FP32)],
+                feature_table_map=[0],
+                ssd_storage_directory=tempfile.mkdtemp(),
+                cache_sets=cache_sets,
+                cache_assoc=assoc,
+                pooling_mode=PoolingMode.SUM,
+            ).cuda()
 
         # Place entry at (set=7, slot=63) — the very last position
         last_set = cache_sets - 1
@@ -2094,14 +2100,17 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
         cache_sets = 16
         assoc = 64
 
-        emb = SSDIntNBitTableBatchedEmbeddingBags(
-            embedding_specs=[("", E, D, SparseType.FP32)],
-            feature_table_map=[0],
-            ssd_storage_directory=tempfile.mkdtemp(),
-            cache_sets=cache_sets,
-            cache_assoc=assoc,
-            pooling_mode=PoolingMode.SUM,
-        ).cuda()
+        with patch(
+            "fbgemm_gpu.tbe.ssd.inference.device_cache_assoc", return_value=assoc
+        ):
+            emb = SSDIntNBitTableBatchedEmbeddingBags(
+                embedding_specs=[("", E, D, SparseType.FP32)],
+                feature_table_map=[0],
+                ssd_storage_directory=tempfile.mkdtemp(),
+                cache_sets=cache_sets,
+                cache_assoc=assoc,
+                pooling_mode=PoolingMode.SUM,
+            ).cuda()
 
         # Populate 3 entries in different sets, using various slots
         entries = [
@@ -2130,22 +2139,20 @@ class SSDInferenceAMDSupportTest(unittest.TestCase):
 class SSDInferenceAssocWarpSizeTest(unittest.TestCase):
     """
     The SSD inference cache associativity must equal the device warp size: the
-    cache kernels use kWarpSize for set indexing, scanning one way per lane. On
-    wave32 (RDNA) devices a hardcoded associativity of 64 makes the host
-    allocate 64-way sets that the kernel only half-scans. Unlike the rest of the
-    SSD tests, this does not need the RocksDB backend, so it runs in OSS.
+    cache kernels use kWarpSize for set indexing, scanning one way per lane.
+    Unlike the rest of the SSD tests, this does not need the RocksDB backend,
+    so it runs in OSS.
     """
 
-    def test_serving_compute_cache_sets_uses_device_warp_size(self) -> None:
-        from fbgemm_gpu.tbe.ssd.inference_serving import _device_cache_assoc
+    def test_device_cache_assoc_matches_warp_size(self) -> None:
+        from fbgemm_gpu.tbe.ssd.common import device_cache_assoc
 
         warp_size = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).warp_size
         self.assertEqual(
-            _device_cache_assoc(),
+            device_cache_assoc(),
             warp_size,
-            f"SSD serving associativity ({_device_cache_assoc()}) must equal the "
-            f"device warp size ({warp_size}); the cache kernels scan one way per "
-            "warp lane.",
+            f"SSD cache associativity ({device_cache_assoc()}) must equal the "
+            f"device warp size ({warp_size})."
         )

@@ -27,6 +27,17 @@ except Exception:
 ASSOC: int = 32
 
 
+def device_cache_assoc(use_cpu: bool = False) -> int:
+    """
+    Cache associativity for the current device: the warp size (32 on NVIDIA,
+    either 32 or 64 on AMD), since the C++ cache kernels use kWarpSize for set
+    indexing. Falls back to ASSOC when there is no device.
+    """
+    if use_cpu or not torch.cuda.is_available():
+        return ASSOC
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).warp_size
+
+
 def pad4(value: int) -> int:
     """
     Compute the smallest multiple of 4 that is greater than or equal to the given value.
