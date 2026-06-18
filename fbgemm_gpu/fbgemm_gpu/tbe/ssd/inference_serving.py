@@ -145,8 +145,8 @@ class TurboSSDInferenceModule(nn.Module):
         """
         Compute the number of cache sets for the target hit rate.
 
-        For a set-associative cache with `assoc` ways, we need enough sets
-        so that the total number of cache slots >= target fraction of the
+        For a set-associative cache with `assoc` slots per set, we need enough
+        sets so that the total number of cache slots >= target fraction of the
         working set.
 
         If an HBM budget is specified, the cache is capped to fit within it.

@@ -116,7 +116,7 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         This operator supports AMD GPUs (ROCm/HIP). Key adaptations:
         - Cache associativity is derived from the device warp size (32 on
           NVIDIA, either 32 or 64 on AMD), so Python-side tensor shapes
-          stay in sync with the C++ kernel's per-lane way indexing.
+          stay in sync with the C++ kernel's per-lane slot indexing.
         - BitonicSort includes a 6th merge stage (L=32) for 64-element sorts.
         - lxu_cache_lookup uses HIP-native __ballot() instead of
           __ballot_sync().
@@ -784,7 +784,7 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
         max_cache_sets = self.lxu_cache_state.shape[0]
         cache_set_ids = indices % max_cache_sets  # [N]
 
-        # Gather the ways for each relevant cache set: [N, cache_assoc]
+        # Gather the slots for each relevant cache set: [N, cache_assoc]
         relevant_states = self.lxu_cache_state[cache_set_ids]
 
         # Find which slots hold the updated indices: [N, cache_assoc] bool
