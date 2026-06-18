@@ -1537,7 +1537,7 @@ class TurboSSDInferenceModuleTest(unittest.TestCase):
             hbm_budget_gb=0.1,
             cache_hit_rate=0.90,
         )
-        cache_slots = module.tbe.lxu_cache_state.numel()
+        cache_slots = module.tbe.lxu_cache_state.shape[0] * module.tbe.cache_assoc
         # 0.1 GB = ~107 million bytes. With ~512 bytes/row, ~209K rows max.
         self.assertLess(cache_slots, 1_000_000)
 
