@@ -114,9 +114,9 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
 
     AMD/ROCm support status:
         This operator supports AMD GPUs (ROCm/HIP). Key adaptations:
-        - Cache associativity is derived from the device warp size (64 on AMD
-          CDNA wavefronts, 32 on RDNA and NVIDIA warps), so Python-side tensor
-          shapes stay in sync with the C++ kernel's per-lane way indexing.
+        - Cache associativity is derived from the device warp size (32 on
+          NVIDIA, either 32 or 64 on AMD), so Python-side tensor shapes
+          stay in sync with the C++ kernel's per-lane way indexing.
         - BitonicSort includes a 6th merge stage (L=32) for 64-element sorts.
         - lxu_cache_lookup uses HIP-native __ballot() instead of
           __ballot_sync().
@@ -180,8 +180,6 @@ class SSDIntNBitTableBatchedEmbeddingBags(nn.Module):
             self.current_device = torch.device(device)
         self.use_cpu: bool = self.current_device.type == "cpu"
 
-        # Cache associativity must equal the device warp size (64 on CDNA, 32 on
-        # RDNA and NVIDIA), as the cache kernels scan one way per warp lane.
         if cache_assoc is None:
             cache_assoc = (
                 ASSOC

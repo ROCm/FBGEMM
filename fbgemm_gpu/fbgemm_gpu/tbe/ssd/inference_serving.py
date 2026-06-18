@@ -36,8 +36,9 @@ from .inference import SSDIntNBitTableBatchedEmbeddingBags
 
 
 def _device_cache_assoc() -> int:
-    # Cache associativity equals the device warp size (64 on CDNA, 32 on RDNA
-    # and NVIDIA). Fall back to ASSOC when no device is available (planning).
+    # Cache associativity equals the device warp size (32 on NVIDIA, 
+    # either 32 or 64 on AMD). Fall back to ASSOC when no device is 
+    # available.
     if torch.cuda.is_available():
         return torch.cuda.get_device_properties(
             torch.cuda.current_device()

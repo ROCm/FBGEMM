@@ -21,10 +21,9 @@ except Exception:
     pass
 
 # Cache associativity must match the hardware warp/wavefront width, since the
-# C++ cache kernels use kWarpSize for set indexing (one way per lane). The
-# device paths derive it from torch.cuda.get_device_properties(dev).warp_size
-# (32 on RDNA and NVIDIA, 64 on CDNA); this constant is only the no-device
-# fallback.
+# C++ cache kernels use kWarpSize for set indexing. The device paths derive
+# it from torch.cuda.get_device_properties(dev).warp_size (32 on NVIDIA,
+# either 32 or 64 on AMD); this constant is only the no-device fallback.
 ASSOC: int = 32
 
 
