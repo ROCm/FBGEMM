@@ -75,6 +75,9 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
 
   DISPATCH_TO_META("linearize_cache_indices", linearize_cache_indices_meta);
   DISPATCH_TO_META("lxu_cache_lookup", lxu_cache_lookup_meta);
+  DISPATCH_TO_META("get_unique_indices", get_unique_indices_meta);
+  DISPATCH_TO_META(
+      "get_unique_indices_with_inverse", get_unique_indices_with_inverse_meta);
 }
 
 auto raw_embedding_streamer =
@@ -92,6 +95,7 @@ auto raw_embedding_streamer =
                 std::vector<int64_t>,
                 int64_t,
                 int64_t,
+                int64_t,
                 int64_t>(),
             "",
             {
@@ -104,7 +108,8 @@ auto raw_embedding_streamer =
                 torch::arg("table_sizes") = torch::List<int64_t>(),
                 torch::arg("res_chunk_size") = 500000,
                 torch::arg("res_num_consumers") = 8,
-                torch::arg("res_num_copy_threads") = 4,
+                torch::arg("res_num_uvm_hit_copy_threads") = 4,
+                torch::arg("res_num_hbm_copy_threads") = 4,
             })
         .def(
             "stream",
@@ -119,9 +124,19 @@ auto raw_embedding_streamer =
                 torch::arg("require_tensor_copy"),
                 torch::arg("blocking_tensor_copy"),
                 torch::arg("copy_done_flag") = std::nullopt,
+                torch::arg("use_hbm") = false,
+                torch::arg("expected_flag_value") = std::nullopt,
             })
+        // The exposed name is kept as-is for backward compatibility: frozen
+        // fbgemm clones bundled with published models (pyper_models/.../
+        // archive/) still call join_stream_tensor_copy_thread() and are never
+        // updated. Only the C++ method name changes to reflect that it joins
+        // the dispatch, which in turn joins the copy threads.
         .def(
             "join_stream_tensor_copy_thread",
-            &fbgemm_gpu::RawEmbeddingStreamer::join_stream_tensor_copy_thread);
+            &fbgemm_gpu::RawEmbeddingStreamer::join_dispatch_and_workers)
+        .def(
+            "join_hbm_dispatch_and_workers",
+            &fbgemm_gpu::RawEmbeddingStreamer::join_hbm_dispatch_and_workers);
 
 } // namespace
