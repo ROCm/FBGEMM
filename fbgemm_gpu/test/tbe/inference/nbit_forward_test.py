@@ -27,7 +27,11 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
 from fbgemm_gpu.tbe.cache.cache_config import CacheAlgorithm
-from fbgemm_gpu.tbe.config.embedding_config import EmbeddingLocation, PoolingMode
+from fbgemm_gpu.tbe.config.embedding_config import (
+    BoundsCheckMode,
+    EmbeddingLocation,
+    PoolingMode,
+)
 from fbgemm_gpu.tbe.utils import (
     b_indices,
     dequantize_embs,
@@ -44,9 +48,14 @@ from .common import get_nbit_weights_ty, NBitFowardTestCommon
 
 if open_source:
     # pyre-ignore[21]
-    from test_utils import gpu_unavailable, optests, TEST_WITH_ROCM
+    from test_utils import gpu_unavailable, optests, skipIfNotRocm, TEST_WITH_ROCM
 else:
-    from fbgemm_gpu.test.test_utils import gpu_unavailable, optests, TEST_WITH_ROCM
+    from fbgemm_gpu.test.test_utils import (
+        gpu_unavailable,
+        optests,
+        skipIfNotRocm,
+        TEST_WITH_ROCM,
+    )
 
 
 VERBOSITY: Verbosity = Verbosity.verbose
@@ -140,6 +149,9 @@ additional_decorators: dict[str, list[Callable[..., Any]]] = {
         unittest.skip("Operator not implemented for fake tensors"),
     ],
     "test_faketensor__test_nbit_forward_nan_zero_fill": [
+        unittest.skip("Operator not implemented for fake tensors"),
+    ],
+    "test_faketensor__test_nbit_forward_packed_bags_uneven_pooling": [
         unittest.skip("Operator not implemented for fake tensors"),
     ],
 }
@@ -573,6 +585,71 @@ class NBitFowardTest(NBitFowardTestCommon):
         for name, weights_ty, D, output_dtype, weighted in NAN_ZERO_FILL_CASES:
             with self.subTest(case=name):
                 self._execute_nan_zero_fill(weights_ty, D, output_dtype, weighted)
+
+    @unittest.skipIf(*gpu_unavailable)
+    @skipIfNotRocm("Bag packing is a ROCm-only kernel path")
+    def test_nbit_forward_packed_bags_uneven_pooling(self) -> None:
+        """Verify pooling when bags packed into one warp/wave have unequal Ls.
+
+        Every embedding row is set to 1.0 and no index is pruned, so a SUM bag
+        has an analytic value independent of the kernel: its own pooling factor
+        L. The bag lengths alternate short/long so that bags sharing a
+        warp/wave never agree, and the long ones span several iterations of the
+        row-load loop.
+
+        This pattern is the point of the test: with uniform lengths, a kernel
+        that applies one bag's L to its neighbour still produces the right
+        answer, so the bug class is invisible.
+
+        NOTE (ROCm-specific): bag packing is gated on
+        TBE_ROCM_INFERENCE_PACKED_BAGS, and INT4 with D=160 is a shape small
+        enough for more than one bag to fit a wave. Nothing packs elsewhere, so
+        the test is skipped there rather than silently checking something other
+        than what its name describes.
+        """
+        device = torch.cuda.current_device()
+        E = 100
+        D = 160
+
+        op = IntNBitTableBatchedEmbeddingBagsCodegen(
+            embedding_specs=[("", E, D, SparseType.INT4, EmbeddingLocation.DEVICE)],
+            output_dtype=SparseType.FP16,
+            pooling_mode=PoolingMode.SUM,
+            device=device,
+        )
+        op.fill_random_weights()
+
+        # Overwrite every row with 1.0 (dequant of 1.0 is exact for INT4).
+        quant_weights, quant_scale_shift = quantize_embs(
+            torch.ones(E, D), SparseType.INT4
+        )
+        weights, scale_shift = op.split_embedding_weights()[0]
+        weights.copy_(quant_weights)
+        if quant_scale_shift is not None:
+            self.assertIsNotNone(scale_shift)
+            scale_shift.copy_(quant_scale_shift)
+
+        # Alternating lengths: adjacent bags, which are the ones packed
+        # together, differ by a wide margin.
+        Ls = [1, 64, 1, 64, 1, 64, 1, 64]
+        B = len(Ls)
+        total = sum(Ls)
+        offsets = torch.tensor([0, *np.cumsum(Ls)], dtype=torch.int, device=device)
+        indices = torch.randint(0, E, (total,), dtype=torch.int, device=device)
+
+        # Every row is 1.0 and nothing is pruned, so each bag sums to its own L.
+        expected = torch.zeros(B, D, dtype=torch.float)
+        for b, L in enumerate(Ls):
+            expected[b, :] = L
+
+        output = op(indices=indices, offsets=offsets)
+
+        torch.testing.assert_close(
+            output.float().cpu(),
+            expected,
+            atol=1.0e-2,
+            rtol=1.0e-2,
+        )
 
     def test_nbit_forward_cpu_multi_table_pooled_no_prezero(self) -> None:
         """Multi-table CPU SUM-pooled nbit forward writes every output column itself.
@@ -1449,6 +1526,63 @@ class NBitFowardTest(NBitFowardTestCommon):
             indices_dtype=indices_dtype,
             output_dtype=SparseType.INT4,
         )
+
+    def test_nbit_forward_cpu_seq_rejects_index_at_row_count(self) -> None:
+        """The sequence gather rejects an index equal to the table's row count.
+
+        ``BoundsCheckMode.NONE`` is load bearing: the frontend bounds check
+        clamps against the *logical* row count, which is never larger than the
+        *padded* row count the kernel checks against, so with it enabled this
+        boundary is unreachable and the op cannot be tested here at all.
+        """
+        E, D = 64, 128
+        op = IntNBitTableBatchedEmbeddingBagsCodegen(
+            embedding_specs=[("", E, D, SparseType.INT4, EmbeddingLocation.HOST)],
+            pooling_mode=PoolingMode.NONE,
+            output_dtype=SparseType.INT4,
+            bounds_check_mode=BoundsCheckMode.NONE,
+            device="cpu",
+        )
+        op.fill_random_weights()
+
+        # Derive what the kernel uses as data_size rather than assuming it is E:
+        # it divides the whole cacheline-padded weight buffer by the fused row
+        # size, and this table's slice runs to the end of that buffer.
+        row_bytes = op.split_embedding_weights_with_scale_bias(0)[0][0].shape[1]
+        num_rows = op.weights_host.numel() // row_bytes
+        self.assertGreaterEqual(num_rows, E)
+
+        offsets = torch.tensor([0, 1], dtype=torch.int)
+        # Positive control: the last row the buffer actually holds.
+        op(torch.tensor([num_rows - 1], dtype=torch.int), offsets)
+
+        with self.assertRaisesRegex(RuntimeError, "out of bounds"):
+            op(torch.tensor([num_rows], dtype=torch.int), offsets)
+
+    def test_nbit_forward_cpu_seq_ragged_matches_flat(self) -> None:
+        for weights_ty, output_dtype in [
+            # One pair per kernel family the offsets predicate branches on:
+            # nbit taking the no_bag fast path (offsets ignored), nbit bagged
+            # and FP8 bagged (offsets dereferenced), and the base family, which
+            # the other three do not reach.
+            (SparseType.INT4, SparseType.INT4),
+            (SparseType.INT4, SparseType.FP16),
+            (SparseType.FP8, SparseType.FP16),
+            (SparseType.INT8, SparseType.FP32),
+        ]:
+            with self.subTest(weights_ty=weights_ty, output_dtype=output_dtype):
+                self._check_nbit_forward_cpu_seq_ragged_matches_flat(
+                    weights_ty, output_dtype
+                )
+
+    def test_nbit_forward_cpu_seq_no_indices(self) -> None:
+        for weights_ty, output_dtype in [
+            (SparseType.INT4, SparseType.INT4),
+            (SparseType.INT4, SparseType.FP16),
+            (SparseType.FP8, SparseType.FP16),
+        ]:
+            with self.subTest(weights_ty=weights_ty, output_dtype=output_dtype):
+                self._check_nbit_forward_cpu_seq_no_indices(weights_ty, output_dtype)
 
     @unittest.skipIf(*gpu_unavailable)
     @given(

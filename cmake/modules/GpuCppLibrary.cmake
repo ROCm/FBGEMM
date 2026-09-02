@@ -168,6 +168,7 @@ function(gpu_cpp_library)
         CC_FLAGS            # General compilation flags applicable to all build variants
         NVCC_FLAGS          # Compilation flags specific to NVCC
         HIPCC_FLAGS         # Compilation flags specific to HIPCC
+        EXCLUDED_WARNING_FLAGS # Shared warning flags not applied to this target
         INCLUDE_DIRS        # First-party include directories for compilation
         SYSTEM_INCLUDE_DIRS # Third-party include directories, passed as SYSTEM to suppress their warnings
         DEPS                # Target dependencies, i.e. built STATIC targets
@@ -219,6 +220,41 @@ function(gpu_cpp_library)
     endif()
 
     ############################################################################
+    # Compilation Flags
+    ############################################################################
+
+    # Computed BEFORE the library is created, because `hip_add_library()` takes
+    # HIPCC_OPTIONS as a creation-time argument (it is a legacy FindHIP concept,
+    # not a target property that can be set afterwards), so the HIPCC list has to
+    # exist by then. Both lists are now consumed, and both minus `-Werror`:
+    # `_nvcc_warning_flags` by the CUDA genex near the bottom of this function,
+    # and `_hipcc_warning_flags` by `hip_add_library()` below.
+    #
+    # Only the flag computation moved here. The MSVC `target_compile_definitions`
+    # that used to sit in the same block stays after library creation, because it
+    # needs ${lib_name} to exist.
+
+    fbgemm_get_warning_flags(
+        MSVC_FLAGS_VAR  _msvc_flags
+        CC_FLAGS_VAR    _cc_flags
+        NVCC_FLAGS_VAR  _nvcc_warning_flags
+        HIPCC_FLAGS_VAR _hipcc_warning_flags
+        EXTRA_MSVC_FLAGS ${args_MSVC_FLAGS}
+        EXTRA_CC_FLAGS   ${args_CC_FLAGS})
+
+    foreach(_flag IN LISTS args_EXCLUDED_WARNING_FLAGS)
+        list(REMOVE_ITEM _cc_flags "${_flag}")
+        list(REMOVE_ITEM _nvcc_warning_flags "-Xcompiler=${_flag}")
+        list(REMOVE_ITEM _hipcc_warning_flags "${_flag}")
+    endforeach()
+
+    if(MSVC)
+        set(lib_cc_flags ${_msvc_flags})
+    else()
+        set(lib_cc_flags ${_cc_flags})
+    endif()
+
+    ############################################################################
     # Build the Library
     ############################################################################
 
@@ -256,12 +292,36 @@ function(gpu_cpp_library)
             list(APPEND lib_hipcc_system_includes "-isystem${include_dir}")
         endforeach()
 
+        # RECONNAISSANCE: warnings ON, `-Werror` OFF.
+        #
+        # OSS HIP compilation has never had `-Wall`/`-Wextra` at all, and there is
+        # no local ROCm build to measure with, so this lands warn-only to size the
+        # fixup work from CI before it can break anyone. **This is temporary** --
+        # a follow-up deletes the two lines below and passes
+        # `_hipcc_warning_flags` directly, at which point ROCm CI becomes a real
+        # device-code gate.
+        #
+        # Strip every `-Werror*` entry, not just the bare token. `REMOVE_ITEM`
+        # with the literal would leave a targeted `-Werror=<name>` behind if the
+        # warning list ever grows one, and the surface would silently stop being
+        # warn-only. The `^-Werror` anchor deliberately does not match the
+        # `-Wno-error=<name>` entries -- those are inert once `-Werror` is gone,
+        # and removing them would be a behaviour change.
+        set(_hipcc_recon ${_hipcc_warning_flags})
+        list(FILTER _hipcc_recon EXCLUDE REGEX "^-Werror")
+
         # Create the HIP library
+        #
+        # Warning flags come FIRST, before HIP_HCC_FLAGS. The tail of
+        # HIP_HCC_FLAGS is the HIP-specific `-Wno-*` block appended by
+        # RocmSetup.cmake, and those suppressions must keep winning -- otherwise
+        # `-Wall` re-enables things HIP deliberately turned off, such as
+        # `-Wformat`. Do not reorder these two.
         hip_add_library(${lib_name} ${args_TYPE}
             ${lib_sources_hipified}
             ${args_OTHER_SRCS}
             ${FBGEMM_HIP_HCC_LIBRARIES}
-            HIPCC_OPTIONS ${HIP_HCC_FLAGS} ${lib_hipcc_system_includes} ${args_HIPCC_FLAGS})
+            HIPCC_OPTIONS ${_hipcc_recon} ${HIP_HCC_FLAGS} ${lib_hipcc_system_includes} ${args_HIPCC_FLAGS})
 
         # Append ROCM includes
         target_include_directories(${lib_name} PUBLIC
@@ -280,32 +340,18 @@ function(gpu_cpp_library)
     endif()
 
     ############################################################################
-    # Compilation Flags and Definitions
+    # Compilation Definitions
     ############################################################################
 
-    if(MSVC)
+    # The flag computation that used to be here moved above the "Build the
+    # Library" section -- see the note there. This part cannot move, because it
+    # operates on the target.
+    if(MSVC AND args_TYPE STREQUAL STATIC)
         # MSVC needs to define these variables to avoid generating _dllimport
         # functions.
-        if(args_TYPE STREQUAL STATIC)
-            target_compile_definitions(${lib_name}
-                PUBLIC ASMJIT_STATIC
-                PUBLIC FBGEMM_STATIC)
-        endif()
-
-        fbgemm_get_warning_flags(
-            MSVC_FLAGS_VAR _msvc_flags
-            CC_FLAGS_VAR   _cc_flags
-            EXTRA_MSVC_FLAGS ${args_MSVC_FLAGS}
-            EXTRA_CC_FLAGS   ${args_CC_FLAGS})
-        set(lib_cc_flags ${_msvc_flags})
-
-    else()
-        fbgemm_get_warning_flags(
-            MSVC_FLAGS_VAR _msvc_flags
-            CC_FLAGS_VAR   _cc_flags
-            EXTRA_MSVC_FLAGS ${args_MSVC_FLAGS}
-            EXTRA_CC_FLAGS   ${args_CC_FLAGS})
-        set(lib_cc_flags ${_cc_flags})
+        target_compile_definitions(${lib_name}
+            PUBLIC ASMJIT_STATIC
+            PUBLIC FBGEMM_STATIC)
     endif()
 
 
@@ -377,9 +423,53 @@ function(gpu_cpp_library)
     ############################################################################
 
     # Set the additional compilation flags
+    #
+    # ⚠ `args_CC_FLAGS` is applied to EVERY language, unwrapped. No current caller
+    # passes a `-W` flag through it (audited), and one that did would
+    # reach nvcc raw and fail the build. Keep it that way.
     target_compile_options(${lib_name} PRIVATE
         ${args_CC_FLAGS}
         $<$<COMPILE_LANGUAGE:CXX>:${lib_cc_flags}>)
+
+    # Forward the host warning set to nvcc's host compiler.
+    #
+    # `_nvcc_warning_flags` is the CXX warning set with every entry wrapped as
+    # `-Xcompiler=<flag>` (see fbgemm_get_warning_flags). nvcc rejects a bare
+    # `-W...`, so the wrapping is mandatory, not cosmetic -- and it must be the
+    # single-token `-Xcompiler=<flag>` form, because the two-token
+    # `-Xcompiler <flag>` form can be split when CMake expands a `;`-list.
+    #
+    # The list form inside the genex is deliberate and matches the CXX line above:
+    # a `;`-list inside `$<...>` was measured NOT to leak to other languages, so
+    # a per-flag `foreach` would be a no-op.
+    #
+    # Skipped under MSVC: `_nvcc_warning_flags` is derived from the gcc/clang list
+    # regardless of host compiler, so on Windows nvcc would forward `-Wextra`,
+    # `-Wno-strict-aliasing` and friends to cl.exe, which does not accept them.
+    # The host CXX path already handles this by selecting `_msvc_flags` into
+    # `lib_cc_flags`; there is no MSVC-shaped equivalent for the nvcc list today.
+    # RECONNAISSANCE: warnings ON, `-Werror` OFF -- the same treatment the HIPCC
+    # list gets above, for a different reason.
+    #
+    # nvcc hands its own generated stubs (`/tmp/tmpxft_*.cudafe1.stub.c`) to the
+    # host compiler, so `-Xcompiler=-Werror` lands on code this repo does not
+    # write and cannot annotate. Those stubs spell out template arguments as bare
+    # decimal literals, and an `int64_t` NTTP of `INT64_MIN` becomes
+    # `9223372036854775808` -- which does not fit a signed 64-bit type, so GCC
+    # emits `integer constant is so large that it is unsigned`. That diagnostic
+    # carries NO `-W<name>`, so unlike every other noisy warning here it cannot
+    # be demoted with `-Wno-error=<name>`; dropping `-Werror` is the only lever.
+    #
+    # Same anchor rationale as the HIPCC list: `^-Xcompiler=-Werror` strips bare
+    # `-Werror` and any future `-Werror=<name>`, and deliberately does not match
+    # `-Xcompiler=-Wno-error=<name>`, which is inert once `-Werror` is gone.
+    set(_nvcc_recon ${_nvcc_warning_flags})
+    list(FILTER _nvcc_recon EXCLUDE REGEX "^-Xcompiler=-Werror")
+
+    if(NOT MSVC)
+        target_compile_options(${lib_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:${_nvcc_recon}>)
+    endif()
 
     ############################################################################
     # Post-Build Steps
@@ -443,6 +533,21 @@ function(gpu_cpp_library)
         " "
         "CC_FLAGS:"
         "${args_CC_FLAGS}"
+        " "
+        "RESOLVED WARNING FLAGS (CC):"
+        "${_cc_flags}"
+        " "
+        "RESOLVED WARNING FLAGS (NVCC, full set):"
+        "${_nvcc_warning_flags}"
+        " "
+        "RESOLVED WARNING FLAGS (NVCC, AS APPLIED -- recon strips -Werror*):"
+        "${_nvcc_recon}"
+        " "
+        "RESOLVED WARNING FLAGS (HIPCC, full set):"
+        "${_hipcc_warning_flags}"
+        " "
+        "RESOLVED WARNING FLAGS (HIPCC, AS APPLIED -- recon strips -Werror*):"
+        "${_hipcc_recon}"
         " "
         "NVCC_FLAGS:"
         "${args_NVCC_FLAGS}"
