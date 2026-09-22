@@ -106,6 +106,15 @@ running_on_rocm: tuple[bool, str] = (
     "Test currently doesn't work on the ROCm stack",
 )
 
+# Used for `@unittest.skipIf` for tests that exercise no device-specific
+# code at all (e.g. CPU- or meta-backend tests).  These pass on ROCm, but
+# they duplicate what the CPU and CUDA CI jobs already cover, and host-side
+# work is slow enough on the ROCm runners to eat into the job's time budget.
+redundant_on_rocm: tuple[bool, str] = (
+    TEST_WITH_ROCM,
+    "Test exercises no ROCm-specific code; covered by the CUDA CI job",
+)
+
 # Tests with this marker generally fails with `free(): corrupted unsorted chunks`
 # errors when fbgemm_gpu is compiled under Clang
 on_oss_clang: tuple[bool, str] = (

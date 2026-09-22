@@ -17,9 +17,9 @@ from .common import open_source
 
 if open_source:
     # pyre-ignore[21]
-    from test_utils import gpu_unavailable
+    from test_utils import gpu_unavailable, redundant_on_rocm
 else:
-    from fbgemm_gpu.test.test_utils import gpu_unavailable
+    from fbgemm_gpu.test.test_utils import gpu_unavailable, redundant_on_rocm
 
 if torch.cuda.is_available():
     from fbgemm_gpu.sll.triton import triton_jagged_jagged_bmm_jagged_out
@@ -110,6 +110,8 @@ class JaggedJaggedBmmJaggedOutTest(unittest.TestCase):
     )
     # pyrefly: ignore [bad-argument-type]
     @unittest.skipIf(*gpu_unavailable)
+    # pyrefly: ignore [bad-argument-type]
+    @unittest.skipIf(*redundant_on_rocm)
     @settings(deadline=30000)
     def test_triton_jagged_jagged_bmm_jagged_out_meta_backend(
         self,

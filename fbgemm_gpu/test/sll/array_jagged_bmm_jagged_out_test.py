@@ -12,13 +12,13 @@ import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
 
-from .common import open_source
+from .common import device_types, open_source
 
 if open_source:
     # pyre-ignore[21]
-    from test_utils import gpu_unavailable
+    from test_utils import gpu_unavailable, redundant_on_rocm
 else:
-    from fbgemm_gpu.test.test_utils import gpu_unavailable
+    from fbgemm_gpu.test.test_utils import gpu_unavailable, redundant_on_rocm
 
 if torch.cuda.is_available():
     from fbgemm_gpu.sll.triton import triton_array_jagged_bmm_jagged_out
@@ -155,7 +155,7 @@ class ArrayJaggedBmmJaggedTest(unittest.TestCase):
         B=st.integers(10, 512),
         max_L=st.integers(1, 200),
         D=st.integers(1, 100),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     # pyrefly: ignore [bad-argument-type]
     @unittest.skipIf(*gpu_unavailable)
@@ -246,6 +246,8 @@ class ArrayJaggedBmmJaggedTest(unittest.TestCase):
     )
     # pyrefly: ignore [bad-argument-type]
     @unittest.skipIf(*gpu_unavailable)
+    # pyrefly: ignore [bad-argument-type]
+    @unittest.skipIf(*redundant_on_rocm)
     @settings(deadline=30000)
     def test_triton_array_jagged_bmm_jagged_out_meta_backend(
         self,

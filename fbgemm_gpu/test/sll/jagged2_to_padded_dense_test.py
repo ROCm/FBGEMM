@@ -11,7 +11,7 @@ import fbgemm_gpu.sll  # noqa F401
 import torch
 from hypothesis import given, settings, strategies as st
 
-from .common import open_source  # noqa
+from .common import device_types, open_source  # noqa
 
 if open_source:
     # pyre-ignore[21]
@@ -27,7 +27,7 @@ class Jagged2ToPaddedDenseTest(unittest.TestCase):
     @given(
         B=st.integers(1, 10),
         max_L=st.integers(1, 100),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_jagged2_to_padded_dense(

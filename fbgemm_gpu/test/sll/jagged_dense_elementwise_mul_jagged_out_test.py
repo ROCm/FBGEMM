@@ -11,13 +11,13 @@ import fbgemm_gpu.sll  # noqa F401
 import torch
 from hypothesis import given, settings, strategies as st
 
-from .common import open_source  # noqa
+from .common import device_types, open_source  # noqa
 
 if open_source:
     # pyre-ignore[21]
-    from test_utils import gpu_unavailable
+    from test_utils import gpu_unavailable, redundant_on_rocm
 else:
-    from fbgemm_gpu.test.test_utils import gpu_unavailable
+    from fbgemm_gpu.test.test_utils import gpu_unavailable, redundant_on_rocm
 
 
 # pyrefly: ignore [bad-argument-type]
@@ -95,7 +95,7 @@ class JaggedDenseElementwiseMulJaggedOutTest(unittest.TestCase):
     @given(
         B=st.integers(10, 512),
         L=st.integers(1, 200),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_jagged_dense_elementwise_mul_jagged_out_with_grad(
@@ -162,6 +162,8 @@ class JaggedDenseElementwiseMulJaggedOutTest(unittest.TestCase):
         L=st.integers(1, 200),
         device_type=st.sampled_from(["meta"]),
     )
+    # pyrefly: ignore [bad-argument-type]
+    @unittest.skipIf(*redundant_on_rocm)
     @settings(deadline=30000)
     def test_jagged_dense_elementwise_mul_jagged_out_meta_backend(
         self,

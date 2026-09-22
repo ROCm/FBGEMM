@@ -11,7 +11,7 @@ import fbgemm_gpu.sll  # noqa F401
 import torch
 from hypothesis import given, settings, strategies as st
 
-from .common import open_source  # noqa
+from .common import device_types, open_source  # noqa
 
 if open_source:
     # pyre-ignore[21]
@@ -27,7 +27,7 @@ class DenseJaggedCatJaggedOutTest(unittest.TestCase):
     @given(
         B=st.integers(10, 512),
         max_L=st.integers(1, 200),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
         enable_pt2=st.sampled_from([True, False]),
     )
     @settings(deadline=None)

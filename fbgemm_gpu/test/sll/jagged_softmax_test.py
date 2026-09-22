@@ -12,13 +12,13 @@ import fbgemm_gpu.sll  # noqa F401
 import torch
 from hypothesis import given, settings, strategies as st
 
-from .common import open_source  # noqa
+from .common import device_types, open_source  # noqa
 
 if open_source:
     # pyre-ignore[21]
-    from test_utils import gpu_unavailable
+    from test_utils import gpu_unavailable, redundant_on_rocm
 else:
-    from fbgemm_gpu.test.test_utils import gpu_unavailable
+    from fbgemm_gpu.test.test_utils import gpu_unavailable, redundant_on_rocm
 
 
 # pyrefly: ignore [bad-argument-type]
@@ -30,7 +30,7 @@ class JaggedSoftmaxTest(unittest.TestCase):
         N=st.integers(1, 1000),
         H=st.integers(1, 20),
         use_fbgemm_kernel=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_triton_jagged_softmax(
@@ -96,7 +96,7 @@ class JaggedSoftmaxTest(unittest.TestCase):
         B=st.integers(1, 10),
         N=st.integers(10, 100),
         transpose=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_triton_jagged2_softmax(
@@ -163,6 +163,8 @@ class JaggedSoftmaxTest(unittest.TestCase):
         transpose=st.booleans(),
         device_type=st.sampled_from(["meta"]),
     )
+    # pyrefly: ignore [bad-argument-type]
+    @unittest.skipIf(*redundant_on_rocm)
     @settings(deadline=None)
     def test_triton_jagged2_softmax_meta_backend(
         self,

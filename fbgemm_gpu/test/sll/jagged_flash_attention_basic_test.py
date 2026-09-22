@@ -13,7 +13,7 @@ import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
 
-from .common import clone_tensor, open_source
+from .common import clone_tensor, device_types, open_source
 
 if open_source:
     # pyre-ignore[21]
@@ -30,7 +30,7 @@ class JaggedFlashAttentionBasicTest(unittest.TestCase):
         D=st.integers(16, 64),
         use_mask=st.booleans(),
         allow_tf32=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     # pyrefly: ignore [bad-argument-type]
     @unittest.skipIf(*gpu_unavailable)

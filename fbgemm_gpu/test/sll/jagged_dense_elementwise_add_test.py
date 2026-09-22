@@ -14,7 +14,7 @@ import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
 
-from .common import open_source
+from .common import device_types, open_source
 
 if open_source:
     # pyre-ignore[21]
@@ -30,7 +30,7 @@ class JaggedDenseElementwiseAddTest(unittest.TestCase):
         D=st.integers(1, 100),
         N=st.integers(1, 200),
         use_fbgemm_kernel=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     # pyrefly: ignore [bad-argument-type]
     @unittest.skipIf(*gpu_unavailable)

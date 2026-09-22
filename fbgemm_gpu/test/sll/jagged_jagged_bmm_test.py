@@ -12,7 +12,7 @@ import fbgemm_gpu.sll  # noqa F401
 import torch
 from hypothesis import given, settings, strategies as st
 
-from .common import open_source  # noqa
+from .common import device_types, open_source  # noqa
 
 if open_source:
     # pyre-ignore[21]
@@ -32,7 +32,7 @@ class JaggedJaggedBMMTest(unittest.TestCase):
         T=st.integers(1, 256),
         use_fbgemm_kernel=st.booleans(),
         allow_tf32=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_triton_jagged_jagged_bmm(
@@ -86,7 +86,7 @@ class JaggedJaggedBMMTest(unittest.TestCase):
         T=st.integers(1, 256),
         use_fbgemm_kernel=st.booleans(),
         allow_tf32=st.booleans(),
-        device_type=st.sampled_from(["cpu", "cuda"]),
+        device_type=st.sampled_from(device_types),
     )
     @settings(deadline=None)
     def test_triton_jagged_jagged_bmm_with_grad(
