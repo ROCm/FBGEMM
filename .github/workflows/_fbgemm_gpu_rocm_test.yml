@@ -83,7 +83,9 @@ jobs:
     - name: Setup Build Container
       run: |
         apt update -y
-        apt install -y git jq pciutils sudo wget
+        # g++ supplies the host libstdc++ headers. ROCm's clang looks for them
+        # on the system; the plain Ubuntu image does not install them.
+        apt install -y g++ git jq pciutils sudo wget
         git config --global --add safe.directory '*'
 
     - name: Merge Extra Environment Variables
@@ -109,9 +111,6 @@ jobs:
     - name: Display System Info
       run: . $PRELUDE; print_system_info
 
-    - name: Display GPU Info
-      run: . $PRELUDE; print_gpu_info
-
     - name: Free Disk Space
       run: . $PRELUDE; free_disk_space
 
@@ -129,12 +128,21 @@ jobs:
       # NOTE: Need to install build tools to set up libtbb
       run: . $PRELUDE; install_build_tools $BUILD_ENV
 
-    # ROCm itself is provided by the container image
+    # Torch pulls the ROCm runtime for this channel. The devel install below
+    # pins rocm[devel] to that same patch.
+    - name: Install PyTorch-ROCm (${{ inputs.pytorch-channel-version }})
+      run: . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ inputs.pytorch-channel-version }} rocm/${{ matrix.rocm-version }}
+
+    - name: Install ROCm (${{ matrix.rocm-version }})
+      run: . $PRELUDE; install_rocm_pip $BUILD_ENV ${{ matrix.rocm-version }} ${{ inputs.pytorch-channel-version }}
+
     - name: Install ROCm AMD-SMI
       run: . $PRELUDE; install_rocm_amdsmi_ubuntu $BUILD_ENV
 
-    - name: Install PyTorch-ROCm (${{ inputs.pytorch-channel-version }})
-      run: . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ inputs.pytorch-channel-version }} rocm/${{ matrix.rocm-version }}
+    # amd-smi comes from the wheel install above. ENFORCE_ROCM_DEVICE fails
+    # the job when that binary is missing, so this cannot run any earlier.
+    - name: Display GPU Info
+      run: . $PRELUDE; print_gpu_info
 
     - name: Collect PyTorch Environment Info
       if: ${{ success() || failure() }}

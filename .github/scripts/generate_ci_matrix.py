@@ -41,13 +41,10 @@ REFS_MAIN = "refs/heads/main"
 
 EVENT_NAME_PUSH = "push"
 
-# The ROCm versions used in CI, oldest to newest, and the container image that
-# provides each version.  This is the only place where ROCm versions and images
-# need to be updated.  The images are listed explicitly because their tags do
-# not follow a fixed pattern across ROCm releases.
+ROCM_BASE_IMAGE = "ubuntu:22.04"
 ROCM_CONTAINER_IMAGES = {
-    "7.14": "rocm/dev-ubuntu-22.04:7.14.1-full",
-    "10.0": "rocm/dev-ubuntu-22.04:10.0.0-full",
+    "7.14": ROCM_BASE_IMAGE,
+    "10.0": ROCM_BASE_IMAGE,
 }
 
 
