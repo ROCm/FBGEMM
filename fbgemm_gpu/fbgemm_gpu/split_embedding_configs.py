@@ -24,7 +24,11 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
 @functools.lru_cache(maxsize=None)
 def _nfp8_dtype_for_device_index(device_index: int) -> torch.dtype:
     arch = torch.cuda.get_device_properties(device_index).gcnArchName
-    return torch.float8_e4m3fnuz if "gfx94" in arch else torch.float8_e4m3fn
+    return (
+        torch.float8_e4m3fnuz
+        if "gfx94" in arch or "gfx90a" in arch
+        else torch.float8_e4m3fn
+    )
 
 
 @torch.jit.ignore
@@ -32,8 +36,7 @@ def nfp8_dtype(device: torch.device | int | None = None) -> torch.dtype:
     """
     Return the native FP8 (e4m3) torch dtype for the target runtime device.
 
-    gfx94x (MI300), whose FP8 hardware is fnuz-only, uses "fnuz"; every other
-    arch (including gfx90a, which has no native FP8) and CUDA use OCP "fn". An
+    gfx94x (MI300) and gfx90a use "fnuz"; gfx950 and CUDA use OCP "fn". An
     explicit CUDA device is resolved per architecture. Without one, or for
     CPU/meta storage on a ROCm host, the current GPU determines the physical
     encoding. Callers without a ROCm GPU use "fn". Mirrors getNFP8ScalarType()

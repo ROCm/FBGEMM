@@ -52,9 +52,9 @@ enum class BoundsCheckMode : uint8_t {
 // NFP8 (FP8 e4m3) dtype flow on ROCm -- read this first
 //
 //   1. Allocation     getNFP8ScalarType() (C++) and nfp8_dtype() (Python) label
-//                     the weight buffer per-arch: fnuz on gfx94x, OCP fn on
-//                     every other arch and CUDA. This is the label Python sees,
-//                     and it is never changed.
+//                     the weight buffer per-arch: fnuz on gfx94x/gfx90a, OCP fn
+//                     on gfx950 and CUDA. This is the label Python sees, and it
+//                     is never changed.
 //   2. Host boundary  relabel_nfp8_for_dispatch() takes a *view* labeled fnuz
 //                     immediately before the tensor enters a kernel, because
 //                     only the fnuz emb_t variant is instantiated. Metadata
@@ -78,10 +78,8 @@ enum class BoundsCheckMode : uint8_t {
 // A negative device index selects the current device.
 //
 // The FP8 encoding is hardware-specific: the gfx94x family (gfx940/941/942,
-// MI300) implements the "fnuz" encoding natively, while gfx950 and CUDA use the
-// OCP "fn" encoding. Archs without native FP8 (e.g. gfx90a) emulate it in
-// software and use OCP fn, so fnuz is confined to the hardware that requires
-// it. Because a ROCm build can be a fat binary spanning multiple
+// MI300) and gfx90a use the "fnuz" encoding, while gfx950 and CUDA use the OCP
+// "fn" encoding. Because a ROCm build can be a fat binary spanning multiple
 // archs, this cannot be a compile-time decision on the host: it must query the
 // device actually in use at runtime so the host-allocated tensor dtype matches
 // what device kernels (whose format is selected per-arch at device-compile
@@ -89,13 +87,13 @@ enum class BoundsCheckMode : uint8_t {
 inline at::ScalarType getNFP8ScalarType(
     [[maybe_unused]] const c10::DeviceIndex device_index = -1) {
 #ifdef USE_ROCM
-  // fnuz archs: the gfx94x family (gfx940/941/942, MI300). The substring match
-  // mirrors split_embedding_configs.py:nfp8_dtype and the __nv_fp8_e4m3 alias
-  // in utils/float.cuh; keep the three in sync. Query goes through the ATen-cpu
-  // CUDA hooks so this header is safe to compile into the CPU/meta libraries
-  // (no ATen/cuda/CUDAContext.h).
+  // fnuz archs: the gfx94x family (gfx940/941/942, MI300) and gfx90a. The
+  // substring match mirrors split_embedding_configs.py:nfp8_dtype and the
+  // __nv_fp8_e4m3 alias in utils/float.cuh; keep the three in sync. Query goes through the ATen-cpu CUDA hooks so this header is
+  // safe to compile into the CPU/meta libraries (no ATen/cuda/CUDAContext.h).
   const auto& cuda_hooks = at::detail::getCUDAHooks();
-  if (cuda_hooks.hasCUDA() && cuda_hooks.isGPUArch({"gfx94"}, device_index)) {
+  if (cuda_hooks.hasCUDA() &&
+      cuda_hooks.isGPUArch({"gfx94", "gfx90a"}, device_index)) {
     return at::kFloat8_e4m3fnuz;
   }
 #endif

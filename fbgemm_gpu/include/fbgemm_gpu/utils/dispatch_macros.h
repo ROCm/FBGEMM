@@ -304,7 +304,7 @@ decltype(auto) dispatch_float_and_double(
 #if defined(USE_ROCM)
 
 // Both FP8 labels are dispatchable on ROCm because getNFP8ScalarType() picks
-// fnuz on gfx94x and fn on every other arch.
+// fnuz on gfx94x/gfx90a and fn on gfx950.
 #define FBGEMM_DISPATCH_FLOAT_HALF_AND_FP8_CASE(...)             \
   AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)           \
   AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)            \
