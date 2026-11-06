@@ -29,8 +29,10 @@
 // identifies the encoding. Name the fnuz archs explicitly instead; this list
 // must match getNFP8ScalarType() (embedding_common.h) and nfp8_dtype()
 // (split_embedding_configs.py), which label the weights the kernels decode.
+// Headers that predate HIP_FP8_TYPE_OCP (ROCm 6.2) provide only the fnuz
+// types, so use fnuz when it is undefined.
 #if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
-    defined(__gfx942__) || !HIP_FP8_TYPE_OCP
+    defined(__gfx942__) || !defined(HIP_FP8_TYPE_OCP) || !HIP_FP8_TYPE_OCP
 using __nv_fp8_e4m3 = __hip_fp8_e4m3_fnuz;
 using __nv_fp8x2_e4m3 = __hip_fp8x2_e4m3_fnuz;
 using __nv_fp8x4_e4m3 = __hip_fp8x4_e4m3_fnuz;

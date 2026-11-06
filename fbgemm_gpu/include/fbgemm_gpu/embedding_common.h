@@ -89,8 +89,9 @@ inline at::ScalarType getNFP8ScalarType(
 #ifdef USE_ROCM
   // fnuz archs: the gfx94x family (gfx940/941/942, MI300) and gfx90a. The
   // substring match mirrors split_embedding_configs.py:nfp8_dtype and the
-  // __nv_fp8_e4m3 alias in utils/float.cuh; keep the three in sync. Query goes through the ATen-cpu CUDA hooks so this header is
-  // safe to compile into the CPU/meta libraries (no ATen/cuda/CUDAContext.h).
+  // __nv_fp8_e4m3 alias in utils/float.cuh; keep the three in sync. Query goes
+  // through the ATen-cpu CUDA hooks so this header is safe to compile into the
+  // CPU/meta libraries (no ATen/cuda/CUDAContext.h).
   const auto& cuda_hooks = at::detail::getCUDAHooks();
   if (cuda_hooks.hasCUDA() &&
       cuda_hooks.isGPUArch({"gfx94", "gfx90a"}, device_index)) {
