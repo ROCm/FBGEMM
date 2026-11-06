@@ -46,7 +46,7 @@ class NFP8DtypeTest(unittest.TestCase):
     def test_nfp8_dtype_uses_target_device_architecture(self) -> None:
         for device_index, (arch, expected_dtype) in enumerate(
             (
-                ("gfx90a:sramecc+", torch.float8_e4m3fnuz),
+                ("gfx90a:sramecc+", torch.float8_e4m3fn),
                 ("gfx942:sramecc+", torch.float8_e4m3fnuz),
                 ("gfx950:sramecc+", torch.float8_e4m3fn),
                 ("gfx1250:sramecc+", torch.float8_e4m3fn),
@@ -102,7 +102,7 @@ class NFP8DtypeTest(unittest.TestCase):
             patch.object(
                 torch.cuda,
                 "get_device_properties",
-                return_value=MagicMock(gcnArchName="gfx90a:sramecc+"),
+                return_value=MagicMock(gcnArchName="gfx942:sramecc+"),
             ) as get_properties,
         ):
             self.assertIs(nfp8_dtype(), torch.float8_e4m3fnuz)

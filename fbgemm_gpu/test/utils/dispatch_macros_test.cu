@@ -38,9 +38,8 @@ namespace {
 at::ScalarType expectedNFP8TypeForDevice(const c10::DeviceIndex device_index) {
   const std::string arch =
       at::cuda::getDeviceProperties(device_index)->gcnArchName;
-  return arch.starts_with("gfx94") || arch.starts_with("gfx90a")
-      ? at::kFloat8_e4m3fnuz
-      : at::kFloat8_e4m3fn;
+  return arch.starts_with("gfx94") ? at::kFloat8_e4m3fnuz
+                                   : at::kFloat8_e4m3fn;
 }
 
 } // namespace

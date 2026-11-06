@@ -25,12 +25,13 @@
 
 #if defined(USE_ROCM)
 // The HIP header defines both HIP_FP8_TYPE_OCP and HIP_FP8_TYPE_FNUZ for every
-// arch it does not single out (gfx90a, for one), so neither macro alone
-// identifies the encoding. Name the fnuz archs explicitly instead; this list
-// must match getNFP8ScalarType() (embedding_common.h) and nfp8_dtype()
-// (split_embedding_configs.py), which label the weights the kernels decode.
-#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
-    defined(__gfx942__) || !HIP_FP8_TYPE_OCP
+// arch it does not single out (gfx90a, gfx940 and gfx941 among them), so
+// neither macro alone identifies the encoding. Name the fnuz archs explicitly
+// instead; this list must match getNFP8ScalarType() (embedding_common.h) and
+// nfp8_dtype() (split_embedding_configs.py), which label the weights the
+// kernels decode.
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    !HIP_FP8_TYPE_OCP
 using __nv_fp8_e4m3 = __hip_fp8_e4m3_fnuz;
 using __nv_fp8x2_e4m3 = __hip_fp8x2_e4m3_fnuz;
 using __nv_fp8x4_e4m3 = __hip_fp8x4_e4m3_fnuz;
